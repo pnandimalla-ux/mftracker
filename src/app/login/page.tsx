@@ -62,7 +62,7 @@ export default function LoginPage() {
         </div>
 
         <p className="text-sm text-slate-400">
-          Praveen · YE7266&nbsp;&nbsp;|&nbsp;&nbsp;Geetha · WKT509
+          Praveen · YE7266&nbsp;&nbsp;|&nbsp;&nbsp;Geetha · EKT509
         </p>
       </div>
 
