@@ -1,8 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter } from "next/navigation";
-import { createClient } from "@/lib/supabase/client";
+import AppHeader from "@/components/AppHeader";
 
 type Owner = "family" | "praveen" | "geetha";
 
@@ -22,8 +21,6 @@ export default function DashboardClient({
 }: {
   userEmail: string;
 }) {
-  const router = useRouter();
-
   const [owner, setOwner] = useState<Owner>("family");
   const [loading, setLoading] = useState(true);
   const [kpis, setKpis] = useState<Kpi[]>([]);
@@ -43,52 +40,29 @@ export default function DashboardClient({
     return () => clearTimeout(timer);
   }, [owner]);
 
-  const handleSignOut = async () => {
-    const supabase = createClient();
-    await supabase.auth.signOut();
-    router.push("/login");
-    router.refresh();
-  };
-
   return (
     <div className="min-h-screen bg-slate-50">
-      <header className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-6xl items-center justify-between px-4 py-4">
-          <div className="flex items-center gap-6">
-            <span className="text-xl font-bold text-blue-600">MFTracker</span>
+      <AppHeader userEmail={userEmail} />
 
-            <div className="flex rounded-lg border border-slate-200 bg-slate-100 p-1">
-              {OWNERS.map((o) => (
-                <button
-                  key={o.id}
-                  onClick={() => setOwner(o.id)}
-                  className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
-                    owner === o.id
-                      ? "bg-white text-blue-600 shadow-sm"
-                      : "text-slate-500 hover:text-slate-700"
-                  }`}
-                >
-                  {o.label}
-                </button>
-              ))}
-            </div>
-          </div>
-
-          <div className="flex items-center gap-4">
-            {userEmail && (
-              <span className="hidden text-sm text-slate-500 sm:inline">
-                {userEmail}
-              </span>
-            )}
-            <button
-              onClick={handleSignOut}
-              className="rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100"
-            >
-              Sign out
-            </button>
+      <div className="border-b border-slate-200 bg-white">
+        <div className="mx-auto max-w-6xl px-4 py-3">
+          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1">
+            {OWNERS.map((o) => (
+              <button
+                key={o.id}
+                onClick={() => setOwner(o.id)}
+                className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+                  owner === o.id
+                    ? "bg-white text-blue-600 shadow-sm"
+                    : "text-slate-500 hover:text-slate-700"
+                }`}
+              >
+                {o.label}
+              </button>
+            ))}
           </div>
         </div>
-      </header>
+      </div>
 
       <main className="mx-auto max-w-6xl px-4 py-8">
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
