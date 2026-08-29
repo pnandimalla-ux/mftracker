@@ -12,6 +12,41 @@ export interface MfapiLatestNav {
   navDate: string; // ISO yyyy-mm-dd
 }
 
+export interface MfapiSchemeMatch {
+  scheme_code: string;
+  scheme_name: string;
+}
+
+// Searches mfapi.in for a fund name and returns the first Direct Plan +
+// Growth option result — used when importing holdings from a source (Coin
+// CSV, CAS) whose ISIN isn't in a known local mapping. Falls back to the
+// first result of any kind if no Direct+Growth match is found.
+export async function searchDirectGrowthScheme(query: string): Promise<MfapiSchemeMatch | null> {
+  try {
+    const res = await fetchWithTimeout(`https://api.mfapi.in/mf/search?q=${encodeURIComponent(query)}`);
+    if (!res.ok) return null;
+
+    const results = await res.json();
+    if (!Array.isArray(results) || results.length === 0) return null;
+
+    const directGrowth = results.find(
+      (r: { schemeName?: string }) =>
+        typeof r.schemeName === "string" &&
+        /direct/i.test(r.schemeName) &&
+        /growth/i.test(r.schemeName) &&
+        !/idcw|dividend/i.test(r.schemeName)
+    );
+
+    const match = directGrowth ?? results[0];
+    if (!match || typeof match.schemeCode === "undefined") return null;
+
+    return { scheme_code: String(match.schemeCode), scheme_name: String(match.schemeName) };
+  } catch (err) {
+    console.error(`searchDirectGrowthScheme("${query}") failed:`, err);
+    return null;
+  }
+}
+
 // mfapi.in returns dates as "DD-MM-YYYY".
 function toIsoDate(mfapiDate: string): string {
   const [dd, mm, yyyy] = mfapiDate.split("-");

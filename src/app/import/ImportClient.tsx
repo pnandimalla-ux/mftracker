@@ -10,20 +10,20 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import AppHeader from "@/components/AppHeader";
-import {
-  parseCasCsv,
-  type Confidence,
-  type ParsedHolding,
-  type ParseRowError,
-} from "@/lib/parsers/casCsvParser";
+import type { CoinFund, CoinParseResult, ExcludedRow, SellRow } from "@/lib/parsers/coinCsvParser";
 import type { MFCASImport, Owner } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import { detectCategory, type DetectCategoryResult } from "@/lib/analysis/fundCategoriser";
 
-const STEPS = [
-  "Go to camsonline.com → Mailback Services",
-  "Request Consolidated Account Statement (enter both PANs)",
-  "Download CSV and upload below",
+type ConfidenceLevel = "high" | "medium" | "low";
+
+const COIN_STEPS = [
+  "Open Zerodha Coin app or coin.zerodha.com",
+  "Go to Orders → Order History",
+  "Set date range: All time",
+  "Click Download / Export CSV",
+  "Repeat for Geetha's account (WKT509) if needed",
+  "Upload both CSVs below (or one at a time)",
 ];
 
 interface SchemeSearchResult {
@@ -41,46 +41,23 @@ function daysAgoIso(days: number) {
   return d.toISOString().split("T")[0];
 }
 
-interface PreviewRow extends ParsedHolding {
+interface PreviewFund extends CoinFund {
   key: string;
   selected: boolean;
-  editing: boolean;
+  expanded: boolean;
 }
 
-function OwnerToggleCards({
-  value,
-  onChange,
-}: {
-  value: Owner;
-  onChange: (owner: Owner) => void;
-}) {
-  return (
-    <div className="grid grid-cols-2 gap-3">
-      {(["praveen", "geetha"] as Owner[]).map((o) => (
-        <button
-          key={o}
-          type="button"
-          onClick={() => onChange(o)}
-          className={`rounded-xl border-2 px-4 py-3 text-left transition ${
-            value === o
-              ? "border-blue-600 bg-blue-50"
-              : "border-slate-200 bg-white hover:border-slate-300"
-          }`}
-        >
-          <p className="text-sm font-semibold text-slate-800">
-            {o === "praveen" ? "Praveen" : "Geetha"}
-          </p>
-          <p className="text-xs text-slate-500">
-            {o === "praveen" ? "YE7266" : "WKT509"}
-          </p>
-        </button>
-      ))}
-    </div>
-  );
+interface DuplicateInfo {
+  scheme_name: string;
+  owner: Owner;
+  scheme_code: string | null;
+  existing_lot_count: number;
 }
 
-function ConfidenceBadge({ level }: { level: Confidence }) {
-  const styles: Record<Confidence, string> = {
+type DuplicateAction = "skip" | "add_lots" | "replace";
+
+function ConfidenceBadge({ level }: { level: ConfidenceLevel }) {
+  const styles: Record<ConfidenceLevel, string> = {
     high: "bg-green-100 text-green-700",
     medium: "bg-amber-100 text-amber-700",
     low: "bg-red-100 text-red-700",
@@ -90,6 +67,10 @@ function ConfidenceBadge({ level }: { level: Confidence }) {
       {level[0].toUpperCase() + level.slice(1)}
     </span>
   );
+}
+
+function formatMoney(n: number) {
+  return `₹${Math.round(n).toLocaleString("en-IN")}`;
 }
 
 export default function ImportClient({
@@ -102,14 +83,19 @@ export default function ImportClient({
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // --- CAS import state ---
-  const [casOwner, setCasOwner] = useState<Owner>("praveen");
-  const [file, setFile] = useState<File | null>(null);
+  // --- Coin CSV import state ---
+  const [coinFiles, setCoinFiles] = useState<File[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
-  const [previewRows, setPreviewRows] = useState<PreviewRow[]>([]);
-  const [parseRowErrors, setParseRowErrors] = useState<ParseRowError[]>([]);
+  const [previewFunds, setPreviewFunds] = useState<PreviewFund[]>([]);
+  const [excludedEtfs, setExcludedEtfs] = useState<ExcludedRow[]>([]);
+  const [sellTransactions, setSellTransactions] = useState<SellRow[]>([]);
+  const [parseErrorRows, setParseErrorRows] = useState<string[]>([]);
+  const [etfsOpen, setEtfsOpen] = useState(false);
+  const [sellsOpen, setSellsOpen] = useState(false);
+  const [duplicates, setDuplicates] = useState<DuplicateInfo[]>([]);
+  const [duplicateAction, setDuplicateAction] = useState<DuplicateAction>("skip");
   const [importHistory] = useState<MFCASImport[]>(initialImportHistory);
   const [confirming, setConfirming] = useState(false);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
@@ -233,93 +219,184 @@ export default function ImportClient({
     };
   }, [mSchemeCode, mAsOnDate, mManualMode]);
 
-  // --- CAS upload handlers ---
+  // --- Coin CSV upload handlers ---
+
+  const addCoinFiles = (incoming: File[]) => {
+    const csvFiles = incoming.filter((f) => f.name.toLowerCase().endsWith(".csv"));
+    if (csvFiles.length === 0) {
+      setParseError("Please upload .csv file(s) exported from Coin's Order History.");
+      return;
+    }
+    setCoinFiles((prev) => [...prev, ...csvFiles]);
+    setPreviewFunds([]);
+    setExcludedEtfs([]);
+    setSellTransactions([]);
+    setParseErrorRows([]);
+    setDuplicates([]);
+    setParseError(null);
+    setImportSuccess(null);
+  };
 
   const handleFileInputChange = (e: ChangeEvent<HTMLInputElement>) => {
-    const selected = e.target.files?.[0];
-    if (selected) {
-      setFile(selected);
-      setPreviewRows([]);
-      setParseRowErrors([]);
-      setParseError(null);
-      setImportSuccess(null);
-    }
+    addCoinFiles(Array.from(e.target.files ?? []));
+    e.target.value = "";
   };
 
   const handleDrop = (e: DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setDragOver(false);
-    const dropped = e.dataTransfer.files?.[0];
-    if (!dropped) return;
-    if (!dropped.name.toLowerCase().endsWith(".csv")) {
-      setParseError("Please upload a .csv file.");
-      return;
+    addCoinFiles(Array.from(e.dataTransfer.files ?? []));
+  };
+
+  const removeCoinFile = (index: number) => {
+    setCoinFiles((prev) => prev.filter((_, i) => i !== index));
+  };
+
+  // Merges per-file parse results (a fund held in both accounts often shows
+  // up as two separate exports, or the same export uploaded alongside an
+  // older one) by isin + owner, summing lots rather than overwriting them.
+  const mergeCoinResults = (results: CoinParseResult[]): CoinParseResult => {
+    const fundMap = new Map<string, CoinFund>();
+    for (const result of results) {
+      for (const fund of result.funds) {
+        const key = `${fund.isin}::${fund.owner}`;
+        const existing = fundMap.get(key);
+        if (!existing) {
+          fundMap.set(key, { ...fund, lots: [...fund.lots] });
+          continue;
+        }
+        existing.lots = [...existing.lots, ...fund.lots].sort((a, b) =>
+          a.trade_date.localeCompare(b.trade_date)
+        );
+        existing.total_invested += fund.total_invested;
+        existing.total_units += fund.total_units;
+        existing.avg_nav = existing.total_units > 0 ? existing.total_invested / existing.total_units : 0;
+      }
     }
-    setFile(dropped);
-    setPreviewRows([]);
-    setParseRowErrors([]);
-    setParseError(null);
-    setImportSuccess(null);
+
+    const funds = Array.from(fundMap.values());
+    return {
+      funds,
+      excluded_etfs: results.flatMap((r) => r.excluded_etfs),
+      sell_transactions: results.flatMap((r) => r.sell_transactions),
+      total_invested: funds.reduce((s, f) => s + f.total_invested, 0),
+      owner_split: {
+        praveen: funds.filter((f) => f.owner === "praveen").reduce((s, f) => s + f.total_invested, 0),
+        geetha: funds.filter((f) => f.owner === "geetha").reduce((s, f) => s + f.total_invested, 0),
+      },
+      date_range: {
+        from: results.map((r) => r.date_range.from).filter(Boolean).sort()[0] ?? "",
+        to: results.map((r) => r.date_range.to).filter(Boolean).sort().at(-1) ?? "",
+      },
+      errors: results.flatMap((r) => r.errors),
+    };
   };
 
   const handleParsePreview = async () => {
-    if (!file) return;
+    if (coinFiles.length === 0) return;
     setParsing(true);
     setParseError(null);
-    setPreviewRows([]);
-    setParseRowErrors([]);
+    setPreviewFunds([]);
+    setExcludedEtfs([]);
+    setSellTransactions([]);
+    setParseErrorRows([]);
+    setDuplicates([]);
     try {
-      const text = await file.text();
-      const result = await parseCasCsv(text);
-      if (result.holdings.length === 0) {
-        setParseError("No importable holdings were found in this file.");
+      const results = await Promise.all(
+        coinFiles.map(async (f) => {
+          const formData = new FormData();
+          formData.append("file", f);
+          const res = await fetch("/api/mf/import/coin", { method: "POST", body: formData });
+          const json = await res.json();
+          if (!res.ok) throw new Error(json.error ?? `Failed to parse ${f.name}`);
+          return json as CoinParseResult;
+        })
+      );
+
+      const merged = mergeCoinResults(results);
+      if (merged.funds.length === 0) {
+        setParseError("No importable purchase lots were found in the uploaded file(s).");
       }
-      setPreviewRows(
-        result.holdings.map((h, i) => ({
-          ...h,
-          key: `${i}-${h.scheme_name}`,
+      setPreviewFunds(
+        merged.funds.map((f, i) => ({
+          ...f,
+          key: `${i}-${f.isin}-${f.owner}`,
           selected: true,
-          editing: false,
+          expanded: false,
         }))
       );
-      setParseRowErrors(result.errors);
+      setExcludedEtfs(merged.excluded_etfs);
+      setSellTransactions(merged.sell_transactions);
+      setParseErrorRows(merged.errors);
+
+      if (merged.funds.length > 0) {
+        const dupRes = await fetch("/api/mf/import/coin/confirm", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            check_only: true,
+            funds: merged.funds.map((f) => ({
+              isin: f.isin,
+              scheme_code: f.scheme_code,
+              scheme_name: f.scheme_name,
+              owner: f.owner,
+              category: f.category,
+              amc: f.amc,
+              lots: f.lots,
+            })),
+          }),
+        });
+        if (dupRes.ok) {
+          const dupJson = await dupRes.json();
+          setDuplicates(Array.isArray(dupJson.duplicates) ? dupJson.duplicates : []);
+        }
+      }
     } catch (err) {
-      console.error("CAS parse failed:", err);
+      console.error("Coin CSV parse failed:", err);
       setParseError(
-        "Could not parse this file. Please check it's a valid CAMS CAS CSV export."
+        err instanceof Error ? err.message : "Could not parse this file. Please check it's a valid Coin Order History export."
       );
     } finally {
       setParsing(false);
     }
   };
 
-  const updateRow = (key: string, patch: Partial<PreviewRow>) => {
-    setPreviewRows((prev) =>
-      prev.map((r) => (r.key === key ? { ...r, ...patch } : r))
-    );
+  const updateFund = (key: string, patch: Partial<PreviewFund>) => {
+    setPreviewFunds((prev) => prev.map((f) => (f.key === key ? { ...f, ...patch } : f)));
   };
 
-  const selectedRows = previewRows.filter((r) => r.selected);
-  const selectedTotal = selectedRows.reduce((sum, r) => sum + r.invested_amount, 0);
+  const isDuplicateFund = (f: PreviewFund) =>
+    !!f.scheme_code && duplicates.some((d) => d.owner === f.owner && d.scheme_code === f.scheme_code);
+
+  const selectedFunds = previewFunds.filter((f) => f.selected);
+  const selectedTotal = selectedFunds.reduce((sum, f) => sum + f.total_invested, 0);
+  const selectedLots = selectedFunds.reduce((sum, f) => sum + f.lots.length, 0);
+
+  const foundTotalInvested = previewFunds.reduce((s, f) => s + f.total_invested, 0);
+  const foundTotalLots = previewFunds.reduce((s, f) => s + f.lots.length, 0);
+  const foundOwnerSplit = {
+    praveen: previewFunds.filter((f) => f.owner === "praveen").reduce((s, f) => s + f.total_invested, 0),
+    geetha: previewFunds.filter((f) => f.owner === "geetha").reduce((s, f) => s + f.total_invested, 0),
+  };
 
   const handleConfirmImport = async () => {
-    if (selectedRows.length === 0) return;
+    if (selectedFunds.length === 0) return;
     setConfirming(true);
     setParseError(null);
     try {
-      const res = await fetch("/api/mf/import/cas", {
+      const res = await fetch("/api/mf/import/coin/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          owner: casOwner,
-          filename: file?.name ?? null,
-          rows: selectedRows.map((r) => ({
-            scheme_name: r.scheme_name,
-            scheme_code: r.scheme_code,
-            category: r.category,
-            units: r.units,
-            avg_nav: r.avg_nav,
-            invested_amount: r.invested_amount,
+          duplicate_action: duplicateAction,
+          funds: selectedFunds.map((f) => ({
+            isin: f.isin,
+            scheme_code: f.scheme_code,
+            scheme_name: f.scheme_name,
+            owner: f.owner,
+            category: f.category,
+            amc: f.amc,
+            lots: f.lots,
           })),
         }),
       });
@@ -329,13 +406,13 @@ export default function ImportClient({
         return;
       }
       setImportSuccess(
-        `${json.imported} fund${json.imported === 1 ? "" : "s"} imported successfully`
+        `${json.funds_imported} fund${json.funds_imported === 1 ? "" : "s"} imported (${json.lots_imported} lot${json.lots_imported === 1 ? "" : "s"} total)`
       );
       setTimeout(() => {
         router.push("/dashboard");
       }, 2000);
     } catch (err) {
-      console.error("CAS import failed:", err);
+      console.error("Coin CSV import failed:", err);
       setParseError("Import failed. Please try again.");
     } finally {
       setConfirming(false);
@@ -545,168 +622,127 @@ export default function ImportClient({
       <AppHeader userEmail={userEmail} />
 
       <main className="mx-auto max-w-6xl px-4 py-8">
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-          {/* Left card — CAMS CAS import */}
-          <div className="rounded-xl border border-slate-200 bg-white p-5">
+        <div className="mb-5">
+          <h1 className="text-lg font-semibold text-slate-800">Import holdings</h1>
+          <p className="mt-1 text-sm text-slate-500">
+            Import your holdings from Zerodha Coin order history. Works for both
+            Praveen (YE7266) and Geetha (WKT509).
+          </p>
+        </div>
+
+        {/* Primary — Zerodha Coin CSV import */}
+        <div className="rounded-xl border-2 border-blue-200 bg-white p-5">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2">
-              <span className="text-lg">📁</span>
+              <span className="text-lg">🪙</span>
               <h2 className="text-base font-semibold text-slate-800">
-                Import from CAMS CAS
+                Import from Zerodha Coin (Best option)
               </h2>
             </div>
-            <p className="mt-2 text-sm text-slate-500">
-              Download your Consolidated Account Statement from
-              camsonline.com → Mailback Services. Covers all AMCs for both
-              PANs in one file.
+            <span className="rounded-full bg-blue-600 px-2.5 py-1 text-xs font-bold text-white">
+              Recommended ★
+            </span>
+          </div>
+          <p className="mt-2 text-sm text-slate-500">
+            Your complete order history with exact purchase dates, amounts, and
+            NAV per transaction. Covers both accounts.
+          </p>
+
+          <div className="mt-3 rounded-lg bg-blue-50 px-3 py-2">
+            <p className="text-xs text-blue-800">
+              💡 Unlike CAMS/KFintech statements, Coin CSV has every purchase lot
+              with exact NAV and date — giving you precise cost basis per lot.
             </p>
-
-            <ol className="mt-4 space-y-3">
-              {STEPS.map((step, i) => (
-                <li key={i} className="flex items-start gap-3">
-                  <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-blue-100 text-xs font-semibold text-blue-700">
-                    {i + 1}
-                  </span>
-                  <span className="text-sm text-slate-600">{step}</span>
-                </li>
-              ))}
-            </ol>
-
-            <div className="mt-5">
-              <p className="mb-2 text-xs font-medium text-slate-700">Owner</p>
-              <OwnerToggleCards value={casOwner} onChange={setCasOwner} />
-            </div>
-
-            <div className="mt-5">
-              <div
-                onClick={() => fileInputRef.current?.click()}
-                onDragOver={(e) => {
-                  e.preventDefault();
-                  setDragOver(true);
-                }}
-                onDragLeave={() => setDragOver(false)}
-                onDrop={handleDrop}
-                className={`cursor-pointer rounded-xl border-2 border-dashed px-6 py-8 text-center transition ${
-                  dragOver
-                    ? "border-blue-500 bg-blue-50"
-                    : "border-slate-300 bg-slate-50 hover:border-slate-400"
-                }`}
-              >
-                <input
-                  ref={fileInputRef}
-                  type="file"
-                  accept=".csv"
-                  className="hidden"
-                  onChange={handleFileInputChange}
-                />
-                <p className="text-sm font-medium text-slate-600">
-                  Drop CSV here or click to browse
-                </p>
-                <p className="mt-1 text-xs text-slate-400">
-                  CAMS CAS export (.csv)
-                </p>
-              </div>
-
-              {file && (
-                <div className="mt-3 flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2">
-                  <div>
-                    <p className="text-sm font-medium text-slate-700">
-                      {file.name}
-                    </p>
-                    <p className="text-xs text-slate-400">
-                      {(file.size / 1024).toFixed(1)} KB
-                    </p>
-                  </div>
-                  <button
-                    onClick={handleParsePreview}
-                    disabled={parsing}
-                    className="rounded-lg bg-blue-600 px-3 py-1.5 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {parsing ? "Parsing…" : "Parse & Preview"}
-                  </button>
-                </div>
-              )}
-
-              {parseError && (
-                <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600">
-                  {parseError}
-                </p>
-              )}
-
-              {importSuccess && (
-                <p className="mt-3 rounded-lg bg-green-50 px-3 py-2 text-sm text-green-700">
-                  {importSuccess} — redirecting to dashboard…
-                </p>
-              )}
-            </div>
-
-            <div className="mt-6">
-              <h3 className="mb-2 text-sm font-semibold text-slate-800">
-                Import history
-              </h3>
-              <div className="overflow-x-auto rounded-lg border border-slate-200">
-                <table className="w-full text-left text-sm">
-                  <thead>
-                    <tr className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
-                      <th className="px-3 py-2 font-medium">Date</th>
-                      <th className="px-3 py-2 font-medium">Owner</th>
-                      <th className="px-3 py-2 font-medium">File</th>
-                      <th className="px-3 py-2 font-medium">Rows</th>
-                      <th className="px-3 py-2 font-medium">Status</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {importHistory.length === 0 ? (
-                      <tr>
-                        <td colSpan={5} className="px-3 py-4 text-center text-slate-400">
-                          No imports yet.
-                        </td>
-                      </tr>
-                    ) : (
-                      importHistory.map((imp) => (
-                        <tr key={imp.id} className="border-b border-slate-100 last:border-0">
-                          <td className="px-3 py-2 text-slate-600">
-                            {new Date(imp.imported_at).toLocaleDateString("en-IN")}
-                          </td>
-                          <td className="px-3 py-2">
-                            <span
-                              className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold ${
-                                imp.owner === "praveen"
-                                  ? "bg-blue-100 text-blue-700"
-                                  : "bg-amber-100 text-amber-700"
-                              }`}
-                            >
-                              {imp.owner === "praveen" ? "P" : "G"}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2 text-slate-600">
-                            {imp.filename ?? "—"}
-                          </td>
-                          <td className="px-3 py-2 text-slate-600">
-                            {imp.rows_imported}
-                          </td>
-                          <td className="px-3 py-2">
-                            <span
-                              className={`rounded-full px-2 py-0.5 text-xs font-medium ${
-                                imp.status === "success"
-                                  ? "bg-green-100 text-green-700"
-                                  : imp.status === "partial"
-                                    ? "bg-amber-100 text-amber-700"
-                                    : "bg-red-100 text-red-700"
-                              }`}
-                            >
-                              {imp.status ?? "unknown"}
-                            </span>
-                          </td>
-                        </tr>
-                      ))
-                    )}
-                  </tbody>
-                </table>
-              </div>
-            </div>
           </div>
 
-          {/* Right card — Add fund manually */}
+          <ol className="mt-4 grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2">
+            {COIN_STEPS.map((step, i) => (
+              <li key={i} className="flex items-start gap-3">
+                <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-blue-100 text-xs font-semibold text-blue-700">
+                  {i + 1}
+                </span>
+                <span className="text-sm text-slate-600">{step}</span>
+              </li>
+            ))}
+          </ol>
+
+          <div className="mt-5">
+            <div
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
+              className={`cursor-pointer rounded-xl border-2 border-dashed px-6 py-8 text-center transition ${
+                dragOver
+                  ? "border-blue-500 bg-blue-50"
+                  : "border-slate-300 bg-slate-50 hover:border-slate-400"
+              }`}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".csv"
+                multiple
+                className="hidden"
+                onChange={handleFileInputChange}
+              />
+              <p className="text-sm font-medium text-slate-600">
+                Drop CSV(s) here or click to browse
+              </p>
+              <p className="mt-1 text-xs text-slate-400">
+                Supports both YE7266 and WKT509 — owner auto-detected from file
+              </p>
+            </div>
+
+            {coinFiles.length > 0 && (
+              <div className="mt-3 space-y-2">
+                {coinFiles.map((f, i) => (
+                  <div
+                    key={`${f.name}-${i}`}
+                    className="flex items-center justify-between rounded-lg border border-slate-200 bg-white px-3 py-2"
+                  >
+                    <div>
+                      <p className="text-sm font-medium text-slate-700">{f.name}</p>
+                      <p className="text-xs text-slate-400">{(f.size / 1024).toFixed(1)} KB</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => removeCoinFile(i)}
+                      className="text-xs font-medium text-slate-400 hover:text-red-600"
+                    >
+                      Remove
+                    </button>
+                  </div>
+                ))}
+                <button
+                  onClick={handleParsePreview}
+                  disabled={parsing}
+                  className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {parsing ? "Parsing…" : "Parse & Preview"}
+                </button>
+              </div>
+            )}
+
+            {parseError && (
+              <p className="mt-3 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600">
+                {parseError}
+              </p>
+            )}
+
+            {importSuccess && (
+              <p className="mt-3 rounded-lg bg-green-50 px-3 py-2 text-sm text-green-700">
+                {importSuccess} — redirecting to dashboard…
+              </p>
+            )}
+          </div>
+        </div>
+
+        <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
+          {/* Secondary — Add fund manually */}
           <div className="rounded-xl border border-slate-200 bg-white p-5">
             <h2 className="text-base font-semibold text-slate-800">
               Add fund manually
@@ -1078,143 +1114,339 @@ export default function ImportClient({
               </button>
             </form>
           </div>
+
+          {/* Tertiary — Other import options */}
+          <div className="rounded-xl border border-slate-200 bg-white p-5">
+            <h2 className="text-base font-semibold text-slate-800">
+              Other import options
+            </h2>
+            <p className="mt-2 text-sm text-slate-500">
+              Use Zerodha Coin CSV for best accuracy — these alternatives only
+              cover funds serviced by that RTA.
+            </p>
+
+            <ul className="mt-4 space-y-3">
+              <li className="rounded-lg border border-slate-200 px-3 py-2">
+                <p className="text-sm font-medium text-slate-700">CAMS CSV</p>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  camsonline.com → Mailback Services — CAMS-serviced funds only
+                </p>
+              </li>
+              <li className="rounded-lg border border-slate-200 px-3 py-2">
+                <p className="text-sm font-medium text-slate-700">KFintech CSV</p>
+                <p className="mt-0.5 text-xs text-slate-500">
+                  kfintech.com — KFintech-serviced funds only
+                </p>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        {/* Import history — full width */}
+        <div className="mt-6 rounded-xl border border-slate-200 bg-white p-5">
+          <h3 className="mb-2 text-sm font-semibold text-slate-800">
+            Import history
+          </h3>
+          <div className="overflow-x-auto rounded-lg border border-slate-200">
+            <table className="w-full text-left text-sm">
+              <thead>
+                <tr className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
+                  <th className="px-3 py-2 font-medium">Date</th>
+                  <th className="px-3 py-2 font-medium">Owner</th>
+                  <th className="px-3 py-2 font-medium">Source</th>
+                  <th className="px-3 py-2 font-medium">Rows</th>
+                  <th className="px-3 py-2 font-medium">Status</th>
+                </tr>
+              </thead>
+              <tbody>
+                {importHistory.length === 0 ? (
+                  <tr>
+                    <td colSpan={5} className="px-3 py-4 text-center text-slate-400">
+                      No imports yet.
+                    </td>
+                  </tr>
+                ) : (
+                  importHistory.map((imp) => (
+                    <tr key={imp.id} className="border-b border-slate-100 last:border-0">
+                      <td className="px-3 py-2 text-slate-600">
+                        {new Date(imp.imported_at).toLocaleDateString("en-IN")}
+                      </td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold ${
+                            imp.owner === "praveen"
+                              ? "bg-blue-100 text-blue-700"
+                              : "bg-amber-100 text-amber-700"
+                          }`}
+                        >
+                          {imp.owner === "praveen" ? "P" : "G"}
+                        </span>
+                      </td>
+                      <td className="px-3 py-2 text-slate-600">
+                        {imp.filename ?? "—"}
+                      </td>
+                      <td className="px-3 py-2 text-slate-600">
+                        {imp.rows_imported}
+                      </td>
+                      <td className="px-3 py-2">
+                        <span
+                          className={`rounded-full px-2 py-0.5 text-xs font-medium ${
+                            imp.status === "success"
+                              ? "bg-green-100 text-green-700"
+                              : imp.status === "partial"
+                                ? "bg-amber-100 text-amber-700"
+                                : "bg-red-100 text-red-700"
+                          }`}
+                        >
+                          {imp.status ?? "unknown"}
+                        </span>
+                      </td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
 
         {/* Preview & confirm — full width */}
-        {previewRows.length > 0 && (
+        {previewFunds.length > 0 && (
           <div className="mt-6 rounded-xl border border-slate-200 bg-white p-5">
-            <h3 className="mb-4 text-base font-semibold text-slate-800">
-              Preview import
+            <h3 className="mb-1 text-base font-semibold text-slate-800">
+              Found {previewFunds.length} mutual fund{previewFunds.length === 1 ? "" : "s"} · {foundTotalLots} purchase
+              lot{foundTotalLots === 1 ? "" : "s"} · {formatMoney(foundTotalInvested)} total
             </h3>
+            <p className="text-sm text-slate-500">
+              Praveen: {formatMoney(foundOwnerSplit.praveen)} · Geetha: {formatMoney(foundOwnerSplit.geetha)}
+              {excludedEtfs.length > 0 && ` · Excluded ${excludedEtfs.length} ETF${excludedEtfs.length === 1 ? "" : "s"}`}
+            </p>
 
-            <div className="overflow-x-auto rounded-lg border border-slate-200">
+            {duplicates.length > 0 && (
+              <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3">
+                <p className="text-sm font-semibold text-amber-800">
+                  ⚠️ {duplicates.length} fund{duplicates.length === 1 ? "" : "s"} already exist in MFTracker:
+                </p>
+                <ul className="mt-1.5 space-y-0.5 text-xs text-amber-700">
+                  {duplicates.map((d, i) => (
+                    <li key={i}>
+                      • {d.scheme_name} ({d.owner === "praveen" ? "Praveen" : "Geetha"}) — {d.existing_lot_count} existing lot
+                      {d.existing_lot_count === 1 ? "" : "s"}
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-3 text-xs font-medium text-amber-800">What would you like to do?</p>
+                <div className="mt-1.5 space-y-1.5">
+                  {(
+                    [
+                      ["skip", "Skip duplicates (only import new funds)"],
+                      ["add_lots", "Add as additional lots (if these are new purchases)"],
+                      ["replace", "Replace existing data (delete old, import fresh)"],
+                    ] as [DuplicateAction, string][]
+                  ).map(([value, label]) => (
+                    <label key={value} className="flex items-center gap-2 text-xs text-amber-800">
+                      <input
+                        type="radio"
+                        name="duplicate_action"
+                        checked={duplicateAction === value}
+                        onChange={() => setDuplicateAction(value)}
+                      />
+                      {label}
+                    </label>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            <div className="mt-4 overflow-x-auto rounded-lg border border-slate-200">
               <table className="w-full text-left text-sm">
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
                     <th className="px-3 py-2 font-medium">
                       <input
                         type="checkbox"
-                        checked={previewRows.every((r) => r.selected)}
+                        checked={previewFunds.every((f) => f.selected)}
                         onChange={(e) =>
-                          setPreviewRows((prev) =>
-                            prev.map((r) => ({ ...r, selected: e.target.checked }))
-                          )
+                          setPreviewFunds((prev) => prev.map((f) => ({ ...f, selected: e.target.checked })))
                         }
                       />
                     </th>
-                    <th className="px-3 py-2 font-medium">Fund name</th>
+                    <th className="px-3 py-2 font-medium">Fund</th>
+                    <th className="px-3 py-2 font-medium">Owner</th>
                     <th className="px-3 py-2 font-medium">Category</th>
-                    <th className="px-3 py-2 font-medium">Units</th>
+                    <th className="px-3 py-2 font-medium">Lots</th>
+                    <th className="px-3 py-2 font-medium">Total invested</th>
                     <th className="px-3 py-2 font-medium">Avg NAV</th>
-                    <th className="px-3 py-2 font-medium">Invested ₹</th>
-                    <th className="px-3 py-2 font-medium">Confidence</th>
-                    <th className="px-3 py-2 font-medium">Scheme code</th>
-                    <th className="px-3 py-2 font-medium">Edit</th>
+                    <th className="px-3 py-2 font-medium">Action</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {previewRows.map((row) => (
-                    <tr
-                      key={row.key}
-                      className={`border-b border-slate-100 last:border-0 ${
-                        row.confidence === "low" ? "bg-amber-50" : ""
-                      }`}
-                    >
-                      <td className="px-3 py-2">
-                        <input
-                          type="checkbox"
-                          checked={row.selected}
-                          onChange={(e) =>
-                            updateRow(row.key, { selected: e.target.checked })
-                          }
-                        />
-                      </td>
-                      <td className="px-3 py-2 text-slate-800">
-                        <div className="flex items-center gap-1.5">
-                          {row.confidence === "low" && <span title="Low confidence match">⚠️</span>}
-                          <span className="truncate">{row.scheme_name}</span>
-                        </div>
-                      </td>
-                      <td className="px-3 py-2">
-                        {row.editing ? (
-                          <select
-                            value={row.category}
-                            onChange={(e) =>
-                              updateRow(row.key, { category: e.target.value })
-                            }
-                            className="rounded border border-slate-300 px-2 py-1 text-xs"
-                          >
-                            {CATEGORY_OPTIONS.map((c) => (
-                              <option key={c} value={c}>
-                                {c}
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          <span className="text-slate-600">{row.category}</span>
-                        )}
-                      </td>
-                      <td className="px-3 py-2 text-slate-600">
-                        {row.units.toLocaleString("en-IN", { maximumFractionDigits: 4 })}
-                      </td>
-                      <td className="px-3 py-2 text-slate-600">
-                        ₹{row.avg_nav.toLocaleString("en-IN", { maximumFractionDigits: 4 })}
-                      </td>
-                      <td className="px-3 py-2 text-slate-800">
-                        ₹{Math.round(row.invested_amount).toLocaleString("en-IN")}
-                      </td>
-                      <td className="px-3 py-2">
-                        <ConfidenceBadge level={row.confidence} />
-                      </td>
-                      <td className="px-3 py-2">
-                        {row.editing ? (
+                  {previewFunds.map((f) => (
+                    <>
+                      <tr
+                        key={f.key}
+                        className={`border-b border-slate-100 last:border-0 ${
+                          isDuplicateFund(f) ? "bg-amber-50" : ""
+                        }`}
+                      >
+                        <td className="px-3 py-2">
                           <input
-                            type="text"
-                            value={row.scheme_code ?? ""}
-                            onChange={(e) =>
-                              updateRow(row.key, { scheme_code: e.target.value || null })
-                            }
-                            className="w-24 rounded border border-slate-300 px-2 py-1 text-xs"
+                            type="checkbox"
+                            checked={f.selected}
+                            onChange={(e) => updateFund(f.key, { selected: e.target.checked })}
                           />
-                        ) : (
-                          <span className={row.scheme_code ? "text-green-600" : "text-slate-400"}>
-                            {row.scheme_code ? "✓" : "?"}
+                        </td>
+                        <td className="px-3 py-2 text-slate-800">
+                          <div className="flex items-center gap-1.5">
+                            {isDuplicateFund(f) && <span title="Already in MFTracker">⚠️</span>}
+                            <span className="truncate">{f.scheme_name}</span>
+                          </div>
+                          {!f.scheme_code && (
+                            <p className="mt-0.5 text-xs text-slate-400">Scheme code not matched</p>
+                          )}
+                        </td>
+                        <td className="px-3 py-2">
+                          <span
+                            className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold ${
+                              f.owner === "praveen" ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700"
+                            }`}
+                          >
+                            {f.owner === "praveen" ? "P" : "G"}
                           </span>
-                        )}
-                      </td>
-                      <td className="px-3 py-2">
-                        <button
-                          type="button"
-                          onClick={() => updateRow(row.key, { editing: !row.editing })}
-                          className="text-xs font-medium text-blue-600 hover:underline"
-                        >
-                          {row.editing ? "Done" : "Edit"}
-                        </button>
-                      </td>
-                    </tr>
+                        </td>
+                        <td className="px-3 py-2">
+                          <div className="flex items-center gap-1.5">
+                            <select
+                              value={f.category}
+                              onChange={(e) => updateFund(f.key, { category: e.target.value })}
+                              className="rounded border border-slate-300 px-2 py-1 text-xs"
+                            >
+                              {CATEGORY_OPTIONS.map((c) => (
+                                <option key={c} value={c}>
+                                  {c}
+                                </option>
+                              ))}
+                            </select>
+                            <span title={f.category_confidence === "medium" ? "Please verify" : undefined}>
+                              <ConfidenceBadge level={f.category_confidence} />
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-3 py-2 text-slate-600">{f.lots.length}</td>
+                        <td className="px-3 py-2 text-slate-800">{formatMoney(f.total_invested)}</td>
+                        <td className="px-3 py-2 text-slate-600">
+                          ₹{f.avg_nav.toLocaleString("en-IN", { maximumFractionDigits: 4 })}
+                        </td>
+                        <td className="px-3 py-2">
+                          <button
+                            type="button"
+                            onClick={() => updateFund(f.key, { expanded: !f.expanded })}
+                            className="text-xs font-medium text-blue-600 hover:underline"
+                          >
+                            {f.expanded ? "Hide lots" : "Show lots"}
+                          </button>
+                        </td>
+                      </tr>
+                      {f.expanded && (
+                        <tr key={`${f.key}-lots`} className="border-b border-slate-100 last:border-0 bg-slate-50">
+                          <td />
+                          <td colSpan={7} className="px-3 py-2">
+                            <table className="w-full text-left text-xs">
+                              <thead>
+                                <tr className="text-slate-500">
+                                  <th className="py-1 pr-3 font-medium">Date</th>
+                                  <th className="py-1 pr-3 font-medium">Amount</th>
+                                  <th className="py-1 pr-3 font-medium">Units</th>
+                                  <th className="py-1 pr-3 font-medium">NAV</th>
+                                  <th className="py-1 pr-3 font-medium">Settlement ID</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {f.lots.map((lot, i) => (
+                                  <tr key={i} className="border-t border-slate-200">
+                                    <td className="py-1 pr-3 text-slate-600">{lot.trade_date}</td>
+                                    <td className="py-1 pr-3 text-slate-600">{formatMoney(lot.amount)}</td>
+                                    <td className="py-1 pr-3 text-slate-600">
+                                      {lot.units.toLocaleString("en-IN", { maximumFractionDigits: 4 })}
+                                    </td>
+                                    <td className="py-1 pr-3 text-slate-600">
+                                      ₹{lot.nav.toLocaleString("en-IN", { maximumFractionDigits: 4 })}
+                                    </td>
+                                    <td className="py-1 pr-3 text-slate-600">{lot.settlement_id || "—"}</td>
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </td>
+                        </tr>
+                      )}
+                    </>
                   ))}
                 </tbody>
               </table>
             </div>
 
-            {parseRowErrors.length > 0 && (
+            {parseErrorRows.length > 0 && (
               <p className="mt-3 text-xs text-slate-400">
-                {parseRowErrors.length} row{parseRowErrors.length === 1 ? "" : "s"}{" "}
-                could not be parsed and were skipped.
+                {parseErrorRows.length} row{parseErrorRows.length === 1 ? "" : "s"} could not be parsed and were
+                skipped.
               </p>
+            )}
+
+            {sellTransactions.length > 0 && (
+              <div className="mt-4 rounded-lg border border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setSellsOpen((v) => !v)}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm font-medium text-slate-700"
+                >
+                  <span>{sellsOpen ? "▼" : "▶"}</span>
+                  ℹ️ {sellTransactions.length} sell transaction{sellTransactions.length === 1 ? "" : "s"} found — not
+                  imported (redemptions reduce units)
+                </button>
+                {sellsOpen && (
+                  <ul className="space-y-1 border-t border-slate-100 px-3 py-2 text-xs text-slate-600">
+                    {sellTransactions.map((s, i) => (
+                      <li key={i}>
+                        {s.trade_date} · {s.scheme_name} · {formatMoney(s.amount)} ·{" "}
+                        {s.units.toLocaleString("en-IN", { maximumFractionDigits: 4 })} units
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+            )}
+
+            {excludedEtfs.length > 0 && (
+              <div className="mt-3 rounded-lg border border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => setEtfsOpen((v) => !v)}
+                  className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm font-medium text-slate-700"
+                >
+                  <span>{etfsOpen ? "▼" : "▶"}</span>
+                  {excludedEtfs.length} ETF{excludedEtfs.length === 1 ? "" : "s"} excluded — track in StockSense-AI
+                </button>
+                {etfsOpen && (
+                  <ul className="space-y-1 border-t border-slate-100 px-3 py-2 text-xs text-slate-600">
+                    {excludedEtfs.map((e, i) => (
+                      <li key={i}>{e.scheme_name}</li>
+                    ))}
+                  </ul>
+                )}
+              </div>
             )}
 
             <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <p className="text-sm text-slate-600">
-                {selectedRows.length} of {previewRows.length} funds selected · Total
-                invested: ₹{Math.round(selectedTotal).toLocaleString("en-IN")}
+                {selectedFunds.length} of {previewFunds.length} funds selected · Total invested:{" "}
+                {formatMoney(selectedTotal)}
               </p>
               <button
                 onClick={handleConfirmImport}
-                disabled={confirming || selectedRows.length === 0}
+                disabled={confirming || selectedFunds.length === 0}
                 className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-bold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {confirming ? "Importing…" : "Confirm Import"}
+                {confirming ? "Importing…" : `Import ${selectedFunds.length} fund${selectedFunds.length === 1 ? "" : "s"} (${selectedLots} lot${selectedLots === 1 ? "" : "s"}) →`}
               </button>
             </div>
           </div>
