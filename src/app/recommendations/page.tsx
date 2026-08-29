@@ -1,13 +1,13 @@
 import { redirect } from "next/navigation";
-import { createClient } from "@/lib/supabase/server";
+import { getAuthedUser } from "@/lib/supabase/getAuthedUser";
 import AppHeader from "@/components/AppHeader";
 
 export default async function RecommendationsPage() {
-  const supabase = createClient();
+  const { user, failed } = await getAuthedUser();
 
-  const {
-    data: { user },
-  } = await supabase.auth.getUser();
+  if (failed) {
+    redirect("/login?error=session");
+  }
 
   if (!user) {
     redirect("/login");

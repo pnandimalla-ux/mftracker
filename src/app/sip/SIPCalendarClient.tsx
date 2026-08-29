@@ -293,23 +293,31 @@ export default function SIPCalendarClient({
   };
 
   const toggleActive = async (sip: MFSIPSchedule) => {
-    const res = await fetch(`/api/mf/sip/${sip.id}`, {
-      method: "PATCH",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ is_active: !sip.is_active }),
-    });
-    if (res.ok) {
-      const json = await res.json();
-      setSips((prev) =>
-        prev.map((s) => (s.id === sip.id ? (json.data as MFSIPSchedule) : s))
-      );
+    try {
+      const res = await fetch(`/api/mf/sip/${sip.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ is_active: !sip.is_active }),
+      });
+      if (res.ok) {
+        const json = await res.json();
+        setSips((prev) =>
+          prev.map((s) => (s.id === sip.id ? (json.data as MFSIPSchedule) : s))
+        );
+      }
+    } catch (err) {
+      console.error("Failed to toggle SIP:", err);
     }
   };
 
   const deleteSip = async (id: string) => {
-    const res = await fetch(`/api/mf/sip/${id}`, { method: "DELETE" });
-    if (res.ok) {
-      setSips((prev) => prev.filter((s) => s.id !== id));
+    try {
+      const res = await fetch(`/api/mf/sip/${id}`, { method: "DELETE" });
+      if (res.ok) {
+        setSips((prev) => prev.filter((s) => s.id !== id));
+      }
+    } catch (err) {
+      console.error("Failed to delete SIP:", err);
     }
   };
 
