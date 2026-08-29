@@ -123,24 +123,90 @@ export default function ImportClient({
   const [mUnits, setMUnits] = useState("");
   const [mAvgNav, setMAvgNav] = useState("");
   const [mInvested, setMInvested] = useState("");
-  const [mInvestedTouched, setMInvestedTouched] = useState(false);
   const [mAsOnDate, setMAsOnDate] = useState(() =>
     new Date().toISOString().slice(0, 10)
   );
+  const [mDateTouched, setMDateTouched] = useState(false);
+  const [mNavLoading, setMNavLoading] = useState(false);
+  const [mNavError, setMNavError] = useState<string | null>(null);
   const [mSearchResults, setMSearchResults] = useState<SchemeSearchResult[]>([]);
   const [mSearching, setMSearching] = useState(false);
   const [mSaving, setMSaving] = useState(false);
   const [mError, setMError] = useState<string | null>(null);
   const [mToast, setMToast] = useState(false);
 
+  // Units are always derived from invested amount ÷ auto-fetched NAV.
   useEffect(() => {
-    if (mInvestedTouched) return;
-    const u = Number(mUnits);
-    const n = Number(mAvgNav);
-    if (Number.isFinite(u) && Number.isFinite(n) && u > 0 && n > 0) {
-      setMInvested((u * n).toFixed(2));
+    const amt = Number(mInvested);
+    const nav = Number(mAvgNav);
+    if (Number.isFinite(amt) && amt > 0 && Number.isFinite(nav) && nav > 0) {
+      setMUnits((amt / nav).toFixed(4));
+    } else {
+      setMUnits("");
     }
-  }, [mUnits, mAvgNav, mInvestedTouched]);
+  }, [mInvested, mAvgNav]);
+
+  // Whenever both a fund and a date are picked, auto-fetch the NAV for that
+  // date, retrying prior trading days when the market was closed.
+  useEffect(() => {
+    if (!mSchemeCode || !mAsOnDate) {
+      setMNavError(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    const shiftDate = (iso: string, days: number) => {
+      const d = new Date(`${iso}T00:00:00Z`);
+      d.setUTCDate(d.getUTCDate() + days);
+      return d.toISOString().slice(0, 10);
+    };
+
+    const run = async () => {
+      setMNavLoading(true);
+      setMNavError(null);
+      setMAvgNav("");
+
+      for (let attempt = 0; attempt < 5 && !cancelled; attempt++) {
+        const tryDate = shiftDate(mAsOnDate, -attempt);
+        try {
+          const res = await fetch(`/api/mf/nav/${mSchemeCode}?date=${tryDate}`);
+          if (res.ok) {
+            const json = await res.json();
+            const nav = Number(json?.data?.nav);
+            if (Number.isFinite(nav) && nav > 0) {
+              if (!cancelled) {
+                setMAvgNav(String(nav));
+                setMNavError(null);
+                setMNavLoading(false);
+              }
+              return;
+            }
+          }
+        } catch {
+          // treat as a miss for this date and fall through to retry
+        }
+        if (!cancelled && attempt < 4) {
+          setMNavError(
+            "NAV not available for this date — trying nearest trading day…"
+          );
+        }
+      }
+
+      if (!cancelled) {
+        setMNavError(
+          "Could not fetch NAV for this fund near this date. Please try a different date."
+        );
+        setMNavLoading(false);
+      }
+    };
+
+    run();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [mSchemeCode, mAsOnDate]);
 
   // --- CAS upload handlers ---
 
@@ -305,8 +371,10 @@ export default function ImportClient({
     setMUnits("");
     setMAvgNav("");
     setMInvested("");
-    setMInvestedTouched(false);
     setMAsOnDate(new Date().toISOString().slice(0, 10));
+    setMDateTouched(false);
+    setMNavError(null);
+    setMNavLoading(false);
     setMSearchResults([]);
   };
 
@@ -640,34 +708,6 @@ export default function ImportClient({
 
                 <div>
                   <label className="mb-1 block text-xs font-medium text-slate-700">
-                    Units
-                  </label>
-                  <input
-                    type="number"
-                    step="0.0001"
-                    min={0}
-                    value={mUnits}
-                    onChange={(e) => setMUnits(e.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  />
-                </div>
-
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-slate-700">
-                    Average NAV (₹)
-                  </label>
-                  <input
-                    type="number"
-                    step="0.0001"
-                    min={0}
-                    value={mAvgNav}
-                    onChange={(e) => setMAvgNav(e.target.value)}
-                    className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
-                  />
-                </div>
-
-                <div>
-                  <label className="mb-1 block text-xs font-medium text-slate-700">
                     Invested amount (₹)
                   </label>
                   <input
@@ -675,10 +715,7 @@ export default function ImportClient({
                     step="0.01"
                     min={0}
                     value={mInvested}
-                    onChange={(e) => {
-                      setMInvested(e.target.value);
-                      setMInvestedTouched(true);
-                    }}
+                    onChange={(e) => setMInvested(e.target.value)}
                     className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                   />
                 </div>
@@ -690,8 +727,65 @@ export default function ImportClient({
                   <input
                     type="date"
                     value={mAsOnDate}
-                    onChange={(e) => setMAsOnDate(e.target.value)}
+                    onChange={(e) => {
+                      setMAsOnDate(e.target.value);
+                      setMDateTouched(true);
+                    }}
                     className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                  {mSchemeCode ? (
+                    <p className="mt-1 text-xs text-slate-400">
+                      NAV will be auto-fetched for the selected date
+                    </p>
+                  ) : (
+                    mDateTouched && (
+                      <p className="mt-1 text-xs text-amber-600">
+                        Select a fund first to fetch NAV
+                      </p>
+                    )
+                  )}
+                </div>
+
+                <div>
+                  <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-700">
+                    <span aria-hidden="true">🔒</span> Avg NAV (₹)
+                  </label>
+                  <div className="relative">
+                    <input
+                      type="text"
+                      readOnly
+                      value={
+                        mNavLoading
+                          ? "Fetching…"
+                          : mAvgNav
+                            ? `₹${mAvgNav}`
+                            : ""
+                      }
+                      placeholder="Auto-filled"
+                      className="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-sm text-slate-600"
+                    />
+                    {mNavLoading && (
+                      <span
+                        className="absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600"
+                        aria-hidden="true"
+                      />
+                    )}
+                  </div>
+                  {mNavError && (
+                    <p className="mt-1 text-xs text-amber-600">{mNavError}</p>
+                  )}
+                </div>
+
+                <div>
+                  <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-700">
+                    <span aria-hidden="true">🔒</span> Units
+                  </label>
+                  <input
+                    type="text"
+                    readOnly
+                    value={mUnits}
+                    placeholder="Auto-calculated"
+                    className="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-sm text-slate-600"
                   />
                 </div>
               </div>
@@ -704,10 +798,10 @@ export default function ImportClient({
 
               <button
                 type="submit"
-                disabled={mSaving}
+                disabled={mSaving || mNavLoading}
                 className="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {mSaving ? "Adding…" : "Add Fund"}
+                {mSaving ? "Adding…" : mNavLoading ? "Fetching NAV…" : "Add Fund"}
               </button>
             </form>
           </div>

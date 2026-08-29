@@ -1,11 +1,11 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { refreshNavCache } from "@/lib/mfapi";
+import { refreshNavCache, fetchNavForDate } from "@/lib/mfapi";
 
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 
 export async function GET(
-  _request: Request,
+  request: Request,
   { params }: { params: { scheme_code: string } }
 ) {
   try {
@@ -20,6 +20,18 @@ export async function GET(
     }
 
     const schemeCode = params.scheme_code;
+    const date = new URL(request.url).searchParams.get("date");
+
+    if (date) {
+      const result = await fetchNavForDate(schemeCode, date);
+      if (!result) {
+        return NextResponse.json(
+          { error: "NAV not found for this scheme on this date" },
+          { status: 404 }
+        );
+      }
+      return NextResponse.json({ data: result });
+    }
 
     const { data: cached } = await supabase
       .from("mf_nav_cache")

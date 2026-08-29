@@ -44,6 +44,48 @@ export async function fetchLatestNav(
   }
 }
 
+export interface MfapiNavForDate {
+  scheme_code: string;
+  scheme_name: string;
+  nav: number;
+  nav_date: string; // ISO yyyy-mm-dd, matches the requested date
+}
+
+// Looks up a scheme's full NAV history from mfapi.in and returns the entry
+// matching the given ISO date, if any (mfapi.in only has entries for actual
+// trading days, so callers should retry on prior days for weekends/holidays).
+export async function fetchNavForDate(
+  schemeCode: string,
+  isoDate: string
+): Promise<MfapiNavForDate | null> {
+  try {
+    const res = await fetch(`https://api.mfapi.in/mf/${schemeCode}`, {
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+
+    const json = await res.json();
+    const rows: Array<{ date: string; nav: string }> = Array.isArray(json?.data)
+      ? json.data
+      : [];
+    const match = rows.find((row) => toIsoDate(row.date) === isoDate);
+    if (!match) return null;
+
+    const nav = Number(match.nav);
+    if (!Number.isFinite(nav)) return null;
+
+    return {
+      scheme_code: schemeCode,
+      scheme_name: typeof json?.meta?.scheme_name === "string" ? json.meta.scheme_name : "",
+      nav,
+      nav_date: isoDate,
+    };
+  } catch (err) {
+    console.error(`fetchNavForDate(${schemeCode}, ${isoDate}) failed:`, err);
+    return null;
+  }
+}
+
 // Best-effort: fetches the latest NAV for a scheme and upserts it into the
 // shared mf_nav_cache table (via the service-role client, since regular
 // users only have SELECT access to that table). Never throws.
