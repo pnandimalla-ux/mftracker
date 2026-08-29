@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { refreshNavCache } from "@/lib/mfapi";
+import { refreshNavCache, searchDirectGrowthScheme } from "@/lib/mfapi";
 import { syncNewFund } from "@/lib/peers/tier3Sync";
 import { isRealSchemeCode } from "@/lib/peers/peerSync";
 
@@ -53,6 +53,16 @@ export async function GET() {
       const current_value = Number(h.units) * currentNav;
       const pnl = current_value - invested;
       const pnl_pct = invested > 0 ? (pnl / invested) * 100 : 0;
+
+      if (process.env.NODE_ENV !== "production") {
+        console.log("NAV lookup:", {
+          scheme_code: h.scheme_code,
+          current_nav: currentNav,
+          units: Number(h.units),
+          current_value,
+          pnl,
+        });
+      }
 
       return {
         ...h,
@@ -177,10 +187,21 @@ export async function POST(request: Request) {
       cleanAsOnDate = as_on_date;
     }
 
-    const cleanSchemeCode =
+    let cleanSchemeCode =
       typeof scheme_code === "string" && scheme_code.trim()
         ? scheme_code.trim()
         : null;
+
+    // The scheme wasn't picked from mfapi.in search (user typed the name
+    // directly) — try harder to resolve a real code by fund name before
+    // giving up and falling back to a manual-* placeholder, since a manual
+    // code never gets NAV updates or a peer rank.
+    if (!cleanSchemeCode) {
+      const match = await searchDirectGrowthScheme(scheme_name.trim());
+      if (match) {
+        cleanSchemeCode = match.scheme_code;
+      }
+    }
 
     const { data, error } = await supabase
       .from("mf_holdings")

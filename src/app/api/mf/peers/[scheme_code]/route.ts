@@ -65,20 +65,36 @@ export async function GET(
 
     const schemeCode = params.scheme_code;
 
-    // Resolve category: prefer the hardcoded universe (works even before the
-    // fund is held), fall back to the user's own holding record — this is
-    // what lets a fund outside the curated universe (e.g. a sectoral pick)
-    // still get ranked against its real category instead of 404-ing.
-    let category = getCategoryForCode(schemeCode);
+    // Resolve category: prefer the category the USER assigned on their own
+    // holding — that's the one source of truth that can't silently drift.
+    // Falling back to the static universe (or worse, mf_peer_data) FIRST is
+    // what caused a held Flexi Cap fund to get ranked against Small Cap
+    // peers whenever its scheme_code happened to collide with a wrong entry
+    // elsewhere in the universe — see categoryUniverse.ts's audit note.
+    // The universe is only consulted for a fund the user doesn't hold yet
+    // (e.g. browsing before adding it), and mf_peer_data.category is a last
+    // resort for a fund that's neither held nor in the curated universe.
+    const { data: holding } = await supabase
+      .from("mf_holdings")
+      .select("category")
+      .eq("scheme_code", schemeCode)
+      .eq("user_id", user.id)
+      .limit(1)
+      .maybeSingle();
+
+    let category = (holding?.category as string | undefined) ?? null;
+
     if (!category) {
-      const { data: holding } = await supabase
-        .from("mf_holdings")
+      category = getCategoryForCode(schemeCode);
+    }
+
+    if (!category) {
+      const { data: peerRow } = await supabase
+        .from("mf_peer_data")
         .select("category")
         .eq("scheme_code", schemeCode)
-        .eq("user_id", user.id)
-        .limit(1)
         .maybeSingle();
-      category = (holding?.category as string | undefined) ?? null;
+      category = (peerRow?.category as string | undefined) ?? null;
     }
 
     if (!category) {

@@ -58,14 +58,22 @@ export const CATEGORY_UNIVERSE: Record<string, CategoryFund[]> = {
     { code: "141328", name: "Canara Robeco Small Cap Fund - Direct - Growth (unverified)", amc: "Canara Robeco" },
   ],
 
+  // Re-audited live against mfapi.in — three of the original codes here were
+  // wrong (120828 is actually Quant SMALL CAP, not Flexi Cap; 100163 and
+  // 101835 are dead/nonexistent scheme codes), which is what caused a held
+  // Flexi Cap fund to get compared against Small Cap peers. All 9 codes
+  // below were confirmed against mfapi.in's meta.scheme_category before
+  // being added.
   "Flexi Cap": [
     { code: "122639", name: "Parag Parikh Flexi Cap Fund - Direct Plan - Growth", amc: "PPFAS" },
-    { code: "120828", name: "Quant Flexi Cap Fund - Direct - Growth (unverified)", amc: "Quant" },
+    { code: "120843", name: "Quant Flexi Cap Fund - Direct Plan - Growth", amc: "Quant" },
     { code: "118955", name: "HDFC Flexi Cap Fund - Direct Plan - Growth Option", amc: "HDFC" },
-    { code: "100163", name: "UTI Flexi Cap Fund - Direct - Growth (unverified)", amc: "UTI" },
-    { code: "101835", name: "Canara Robeco Flexi Cap - Direct - Growth (unverified)", amc: "Canara Robeco" },
+    { code: "120662", name: "UTI Flexi Cap Fund - Direct Plan - Growth", amc: "UTI" },
+    { code: "118275", name: "Canara Robeco Flexi Cap Fund - Direct Plan - Growth", amc: "Canara Robeco" },
     { code: "119718", name: "SBI Flexicap Fund - Direct Plan - Growth", amc: "SBI" },
-    { code: "125358", name: "Axis Flexi Cap Fund - Direct - Growth (unverified)", amc: "Axis" },
+    { code: "141925", name: "Axis Flexi Cap Fund - Direct Plan - Growth", amc: "Axis" },
+    { code: "129046", name: "Motilal Oswal Flexi Cap Fund - Direct Plan - Growth", amc: "Motilal Oswal" },
+    { code: "148481", name: "Invesco India Focused Fund - Direct Plan - Growth", amc: "Invesco" },
   ],
 
   ELSS: [
@@ -148,8 +156,17 @@ export const CATEGORY_UNIVERSE: Record<string, CategoryFund[]> = {
 
 export const ALL_CATEGORIES: string[] = Object.keys(CATEGORY_UNIVERSE);
 
+// The "(unverified)" suffix on some names above is an internal data-quality
+// marker for maintainers (see the note at the top of this file) — it should
+// never reach the UI, where it just confuses users into thinking something
+// is broken. Stripped here so every consumer of getCategoryFunds gets a
+// clean, presentable name automatically.
+function displayName(name: string): string {
+  return name.replace(/\s*\(unverified\)\s*$/i, "").trim();
+}
+
 export function getCategoryFunds(category: string): CategoryFund[] {
-  return CATEGORY_UNIVERSE[category] ?? [];
+  return (CATEGORY_UNIVERSE[category] ?? []).map((f) => ({ ...f, name: displayName(f.name) }));
 }
 
 export function getAllSchemeCodes(): string[] {
