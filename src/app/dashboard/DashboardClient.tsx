@@ -91,6 +91,20 @@ function daysAgoIso(days: number) {
   return d.toISOString().split("T")[0];
 }
 
+// A hung request (no response, no error — just silence) never resolves or
+// rejects on its own, so without a timeout an `await fetch(...)` can block
+// the calling async function forever, which in turn leaves `loading` stuck
+// at true — the dashboard's "stuck in skeleton state" bug.
+async function fetchWithTimeout(url: string, ms = 8000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function shiftDate(iso: string, days: number) {
   const d = new Date(`${iso}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
@@ -552,17 +566,50 @@ export default function DashboardClient({
   const loadHoldings = useCallback(async () => {
     setLoading(true);
     setLoadError(null);
+
+    let base: EnrichedMFHolding[];
     try {
-      const res = await fetch("/api/mf/holdings");
+      const res = await fetchWithTimeout("/api/mf/holdings");
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Failed to load holdings");
-      const base: EnrichedMFHolding[] = Array.isArray(json.data) ? json.data : [];
+      base = Array.isArray(json.data) ? json.data : [];
+    } catch (err) {
+      console.error("Failed to load holdings:", err);
+      setHoldings([]);
+      setLoadError("Unable to load holdings right now.");
+      setLoading(false);
+      return;
+    }
 
-      const schemeCodes = Array.from(new Set(base.map((h) => h.scheme_code)));
+    // Holdings are the must-have — show them immediately and unblock the
+    // skeleton. Peer comparison (1Y return, peer rank) is nice-to-have and
+    // fetched below in the background; it renders "—" until it arrives, and
+    // a failure there must never wipe out the holdings already on screen.
+    setHoldings(base.map((h) => ({ ...h, peer: null })));
+    setLoading(false);
 
+    const schemeCodes = Array.from(new Set(base.map((h) => h.scheme_code)));
+    if (schemeCodes.length === 0) return;
+
+    const supabase = createClient();
+    (async () => {
+      try {
+        const { data: navRows } = await supabase
+          .from("mf_nav_cache")
+          .select("fetched_at")
+          .in("scheme_code", schemeCodes)
+          .order("fetched_at", { ascending: false })
+          .limit(1);
+        setLastSynced(navRows?.[0]?.fetched_at ?? null);
+      } catch (err) {
+        console.error("Failed to load last-synced timestamp:", err);
+      }
+    })();
+
+    try {
       const peerResults = await Promise.allSettled(
         schemeCodes.map(async (code) => {
-          const r = await fetch(`/api/mf/peers/${code}`);
+          const r = await fetchWithTimeout(`/api/mf/peers/${code}`);
           if (!r.ok) return [code, null] as const;
           const j = await r.json();
           return [code, j.data as { scheme: PeerInfo; category_avg: PeerInfo["category_avg"] } | undefined] as const;
@@ -591,34 +638,34 @@ export default function DashboardClient({
         });
       }
 
-      const merged: HoldingWithPeer[] = base.map((h) => ({
-        ...h,
-        peer: peerMap.get(h.scheme_code) ?? null,
-      }));
-
-      setHoldings(merged);
-
-      if (schemeCodes.length > 0) {
-        const supabase = createClient();
-        const { data: navRows } = await supabase
-          .from("mf_nav_cache")
-          .select("fetched_at")
-          .in("scheme_code", schemeCodes)
-          .order("fetched_at", { ascending: false })
-          .limit(1);
-        setLastSynced(navRows?.[0]?.fetched_at ?? null);
-      }
+      setHoldings((prev) => prev.map((h) => ({ ...h, peer: peerMap.get(h.scheme_code) ?? null })));
     } catch (err) {
-      console.error("Failed to load holdings:", err);
-      setHoldings([]);
-      setLoadError("Unable to load holdings right now.");
-    } finally {
-      setLoading(false);
+      // Non-fatal — holdings are already showing; peer columns just stay "—".
+      console.error("Failed to load peer comparison data:", err);
     }
   }, []);
 
+  // Safety net: if loadHoldings somehow never settles (a hang the fetch
+  // timeouts above don't catch), force the skeleton to clear after 15s
+  // rather than leave the dashboard stuck indefinitely.
   useEffect(() => {
-    loadHoldings();
+    let settled = false;
+    const safetyTimer = setTimeout(() => {
+      if (!settled) {
+        setLoading(false);
+        setLoadError("Loading timed out. Check your connection and try again.");
+      }
+    }, 15000);
+
+    loadHoldings().finally(() => {
+      settled = true;
+      clearTimeout(safetyTimer);
+    });
+
+    return () => {
+      settled = true;
+      clearTimeout(safetyTimer);
+    };
   }, [loadHoldings]);
 
   const filteredHoldings = useMemo(() => {
@@ -1449,9 +1496,16 @@ export default function DashboardClient({
 
       <main className="mx-auto max-w-6xl px-4 py-8">
         {loadError && (
-          <p className="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-600">
-            {loadError}
-          </p>
+          <div className="mb-4 flex items-center justify-between gap-3 rounded-lg bg-red-50 px-3 py-2">
+            <p className="text-sm text-red-600">{loadError}</p>
+            <button
+              type="button"
+              onClick={() => loadHoldings()}
+              className="shrink-0 text-sm font-medium text-blue-600 underline hover:text-blue-700"
+            >
+              Try again
+            </button>
+          </div>
         )}
 
         <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
@@ -1505,7 +1559,7 @@ export default function DashboardClient({
           </div>
         )}
 
-        {!loading && !hasAnyHoldings && (
+        {!loading && !hasAnyHoldings && !loadError && (
           <div className="mt-8 flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center">
             <p className="text-sm font-medium text-slate-700">
               No holdings yet — import your CAMS CAS statement
