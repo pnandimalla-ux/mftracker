@@ -1,29 +1,44 @@
 import { redirect } from "next/navigation";
 import { getAuthedUser } from "@/lib/supabase/getAuthedUser";
-import AppHeader from "@/components/AppHeader";
+import ImportClient from "./ImportClient";
+import type { MFCASImport } from "@/types/mf";
 
 export default async function ImportPage() {
-  const { user, failed } = await getAuthedUser();
+  const { supabase, user, failed } = await getAuthedUser();
 
-  if (failed) {
-    redirect("/login?error=session");
+  if (failed || !supabase) {
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 px-4">
+        <div className="max-w-sm rounded-xl border border-slate-200 bg-white p-6 text-center shadow-sm">
+          <p className="text-sm font-medium text-slate-700">
+            Unable to connect to the database right now.
+          </p>
+        </div>
+      </div>
+    );
   }
 
   if (!user) {
     redirect("/login");
   }
 
-  return (
-    <div className="min-h-screen bg-slate-50">
-      <AppHeader userEmail={user.email ?? ""} />
+  let importHistory: MFCASImport[] = [];
 
-      <main className="mx-auto max-w-6xl px-4 py-8">
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center">
-          <p className="text-sm font-medium text-slate-700">
-            CAS import is coming soon
-          </p>
-        </div>
-      </main>
-    </div>
+  try {
+    const { data, error } = await supabase
+      .from("mf_cas_imports")
+      .select("*")
+      .eq("user_id", user.id)
+      .order("imported_at", { ascending: false });
+
+    if (error) throw error;
+    importHistory = (data ?? []) as MFCASImport[];
+  } catch (err) {
+    console.error("Import page: failed to load import history", err);
+    importHistory = [];
+  }
+
+  return (
+    <ImportClient userEmail={user.email ?? ""} initialImportHistory={importHistory} />
   );
 }

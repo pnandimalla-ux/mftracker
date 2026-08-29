@@ -15,6 +15,14 @@ export interface MFHolding {
   created_at: string;
 }
 
+export interface EnrichedMFHolding extends MFHolding {
+  current_nav: number;
+  nav_date: string | null;
+  current_value: number;
+  pnl: number;
+  pnl_pct: number;
+}
+
 export interface MFNavCache {
   scheme_code: string;
   scheme_name: string | null;
