@@ -23,8 +23,16 @@ const PERIODS: { id: Period; label: string }[] = [
   { id: "5y", label: "5Y" },
 ];
 
-const GRID_COLS =
-  "grid grid-cols-[24px_minmax(220px,2fr)_60px_110px_120px_120px_160px_100px_90px_90px_90px_110px]";
+// Main grouped-fund row: 4 columns on mobile (<md), 9 on md+. The 5 desktop-only
+// columns (Owner, Category, Current ₹, {period} Return, Peer rank) are hidden
+// via `hidden md:...` on the cells themselves — they sit in DOM order between
+// Fund name and Invested ₹/P&L/Actions, so hiding them still leaves the 4
+// mobile columns lining up against the 4-track mobile grid.
+const MAIN_GRID =
+  "grid grid-cols-[minmax(0,1fr)_92px_140px_84px] md:grid-cols-[minmax(200px,2fr)_56px_96px_96px_96px_140px_76px_76px_150px]";
+
+// Individual lot sub-row: Date | Owner | Invested ₹ | Current ₹ | P&L | Avg NAV | Units | Actions
+const SUB_GRID = "grid grid-cols-[90px_56px_96px_96px_140px_84px_84px_96px]";
 
 interface PeerInfo {
   r6m: number | null;
@@ -109,6 +117,14 @@ function formatDateDMY(iso: string): string {
   const [y, m, d] = iso.split("-");
   if (y && m && d) return `${d}-${m}-${y}`;
   return iso;
+}
+
+function formatNav(n: number): string {
+  return n.toFixed(2);
+}
+
+function formatUnits(n: number): string {
+  return parseFloat(n.toFixed(3)).toString();
 }
 
 // Manually-added funds without a real mfapi.in code get a `manual-<ts>`
@@ -1132,20 +1148,17 @@ export default function DashboardClient({
             )}
 
             <div className="mt-3 overflow-x-auto rounded-xl border border-slate-200 bg-white">
-              <div className="min-w-[1320px]">
-                <div className={`${GRID_COLS} items-center border-b border-slate-200 px-4 py-2 text-xs text-slate-500`}>
-                  <span />
+              <div>
+                <div className={`${MAIN_GRID} items-center gap-2 border-b border-slate-200 px-4 py-2 text-xs text-slate-500`}>
                   <span className="font-medium">Fund name</span>
-                  <span className="font-medium">Owner</span>
-                  <span className="font-medium">Category</span>
+                  <span className="hidden font-medium md:block">Owner</span>
+                  <span className="hidden font-medium md:block">Category</span>
                   <span className="font-medium">Invested ₹</span>
-                  <span className="font-medium">Current ₹</span>
+                  <span className="hidden font-medium md:block">Current ₹</span>
                   <span className="font-medium">P&L</span>
-                  <span className="font-medium">Avg NAV</span>
-                  <span className="font-medium">Units</span>
-                  <span className="font-medium">{periodLabel} Return</span>
-                  <span className="font-medium">Peer rank</span>
-                  <span />
+                  <span className="hidden font-medium md:block">{periodLabel} Return</span>
+                  <span className="hidden font-medium md:block">Peer rank</span>
+                  <span className="text-right font-medium">Actions</span>
                 </div>
 
                 {groupedHoldings.map((group) => {
@@ -1160,63 +1173,66 @@ export default function DashboardClient({
 
                   return (
                     <div key={group.key} className="border-b border-slate-100 last:border-0">
-                      <div className={`${GRID_COLS} group items-center px-4 py-3 hover:bg-slate-50`}>
-                        <button
-                          type="button"
-                          onClick={() => toggleGroup(group.key)}
-                          aria-label={isExpanded ? "Collapse" : "Expand"}
-                          className="flex h-5 w-5 items-center justify-center rounded text-slate-400 transition hover:bg-slate-200 hover:text-slate-600"
-                        >
-                          <span
-                            className={`inline-block transition-transform duration-200 ${
-                              isExpanded ? "rotate-90" : "rotate-0"
-                            }`}
-                          >
-                            <ChevronIcon />
-                          </span>
-                        </button>
-
-                        <div className="flex min-w-0 items-center gap-1.5">
+                      <div
+                        className={`${MAIN_GRID} items-center gap-2 px-4 py-3 transition-colors hover:bg-slate-50`}
+                      >
+                        <div className="flex min-w-0 items-start gap-1.5" title={group.scheme_name}>
                           <button
                             type="button"
                             onClick={() => toggleGroup(group.key)}
-                            className="truncate text-left font-semibold text-slate-800 hover:text-blue-600"
-                            title={group.scheme_name}
+                            aria-label={isExpanded ? "Collapse" : "Expand"}
+                            className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 transition hover:bg-slate-200 hover:text-slate-600"
                           >
-                            {group.scheme_name}
-                          </button>
-                          {group.scheme_code && (
-                            <Link
-                              href={`/fund/${group.scheme_code}`}
-                              onClick={(e) => e.stopPropagation()}
-                              aria-label="View fund details"
-                              className="shrink-0 text-slate-300 hover:text-blue-600"
+                            <span
+                              className={`inline-block transition-transform duration-200 ${
+                                isExpanded ? "rotate-90" : "rotate-0"
+                              }`}
                             >
-                              <ExternalLinkIcon />
-                            </Link>
-                          )}
-                          {group.lot_count > 1 && (
-                            <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
-                              {group.lot_count} lots
+                              <ChevronIcon />
                             </span>
-                          )}
+                          </button>
+
+                          <div className="min-w-0">
+                            <button
+                              type="button"
+                              onClick={() => toggleGroup(group.key)}
+                              className="line-clamp-2 text-left text-sm font-semibold text-slate-800 hover:text-blue-600"
+                            >
+                              {group.scheme_name}
+                            </button>
+                            <div className="mt-0.5 flex items-center gap-1.5">
+                              {group.scheme_code && (
+                                <Link
+                                  href={`/fund/${group.scheme_code}`}
+                                  onClick={(e) => e.stopPropagation()}
+                                  aria-label="View fund details"
+                                  className="shrink-0 text-slate-300 hover:text-blue-600"
+                                >
+                                  <ExternalLinkIcon />
+                                </Link>
+                              )}
+                              {group.lot_count > 1 && (
+                                <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
+                                  {group.lot_count} lots
+                                </span>
+                              )}
+                            </div>
+                          </div>
                         </div>
 
-                        <OwnerBadge owner={group.owner} />
-                        <span className="truncate text-slate-600">{group.category}</span>
+                        <div className="hidden md:flex md:items-center">
+                          <OwnerBadge owner={group.owner} />
+                        </div>
+                        <span className="hidden truncate text-slate-600 md:block">{group.category}</span>
                         <span className="text-slate-800">{formatInr(group.total_invested)}</span>
-                        <span className="text-slate-800">{formatInr(group.current_value)}</span>
+                        <span className="hidden text-slate-800 md:block">{formatInr(group.current_value)}</span>
                         <span className={`font-medium ${group.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
                           {group.pnl >= 0 ? "+" : "-"}
                           {formatInr(Math.abs(group.pnl))} ({groupPnlPct >= 0 ? "+" : ""}
                           {groupPnlPct.toFixed(2)}%)
                         </span>
-                        <span className="text-slate-600">₹{group.avg_nav.toFixed(4)}</span>
-                        <span className="text-slate-600">
-                          {group.total_units.toLocaleString("en-IN", { maximumFractionDigits: 3 })}
-                        </span>
                         <span
-                          className={`font-medium ${
+                          className={`hidden font-medium md:block ${
                             returnValue === null
                               ? "text-slate-400"
                               : returnValue >= 0
@@ -1226,10 +1242,10 @@ export default function DashboardClient({
                         >
                           {formatPct(returnValue)}
                         </span>
-                        <span>
+                        <div className="hidden md:flex md:items-center">
                           {rankValue && peerCount ? (
                             <span
-                              className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${rankBadgeTone(
+                              className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${rankBadgeTone(
                                 rankValue,
                                 peerCount
                               )}`}
@@ -1237,46 +1253,54 @@ export default function DashboardClient({
                               #{rankValue}/{peerCount}
                             </span>
                           ) : (
-                            <span className="text-slate-400">—</span>
+                            <span
+                              className="text-slate-300"
+                              title="Click 'Sync peer data' to populate"
+                            >
+                              —
+                            </span>
                           )}
-                        </span>
-                        <div className="flex items-center justify-end gap-1 opacity-0 transition group-hover:opacity-100">
+                        </div>
+                        <div className="flex items-center justify-end gap-1">
                           <button
                             type="button"
                             onClick={() => handleEditGroup(group)}
                             aria-label="Edit most recent lot"
                             title="Edit most recent lot"
-                            className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                            className="flex h-7 items-center gap-1 rounded-md px-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
                           >
                             <PencilIcon />
+                            <span className="hidden text-xs font-medium lg:inline">Edit</span>
                           </button>
                           <button
                             type="button"
                             onClick={() => handleOpenAddLot(group)}
                             aria-label="Add lot"
                             title="Add lot"
-                            className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-blue-600"
+                            className="flex h-7 items-center gap-1 rounded-md px-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-blue-600"
                           >
                             <PlusIcon />
+                            <span className="hidden text-xs font-medium lg:inline">Add lot</span>
                           </button>
                           <button
                             type="button"
                             onClick={() => setDeleteGroupConfirmKey(group.key)}
                             aria-label="Delete all lots"
                             title="Delete all lots"
-                            className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-red-50 hover:text-red-600"
+                            className="flex h-7 items-center gap-1 rounded-md px-1.5 text-slate-400 transition hover:bg-red-50 hover:text-red-600"
                           >
                             <TrashIcon />
+                            <span className="hidden text-xs font-medium lg:inline">Delete</span>
                           </button>
                         </div>
                       </div>
 
                       <div
-                        className="grid transition-[grid-template-rows] duration-200 ease-in-out"
-                        style={{ gridTemplateRows: isExpanded ? "1fr" : "0fr" }}
+                        className={`overflow-hidden transition-all duration-200 ${
+                          isExpanded ? "max-h-[500px]" : "max-h-0"
+                        }`}
                       >
-                        <div className="overflow-hidden">
-                          <div className="ml-4 border-l-2 border-slate-200 py-1 pl-4">
+                        <div className="ml-4 border-l-2 border-slate-200 py-1 pl-4">
                             {sortedLots.map((lot) => {
                               const isEditingLot = editingId === lot.id;
                               const isSavedFlash = savedFlashId === lot.id;
@@ -1291,8 +1315,8 @@ export default function DashboardClient({
                                     className="my-1 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-red-50 px-3 py-2"
                                   >
                                     <p className="text-xs text-red-700">
-                                      Delete this lot ({formatInr(lot.invested_amount)} on{" "}
-                                      {formatDateDMY(lot.as_on_date)})?
+                                      Delete lot of {formatInr(lot.invested_amount)} from{" "}
+                                      {formatDateDMY(lot.as_on_date)}?
                                     </p>
                                     <div className="flex items-center gap-2">
                                       <button
@@ -1301,7 +1325,7 @@ export default function DashboardClient({
                                         disabled={deleteLotDeleting}
                                         className="rounded-md bg-red-600 px-2 py-1 text-xs font-semibold text-white transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
                                       >
-                                        Yes, delete
+                                        Confirm delete
                                       </button>
                                       <button
                                         type="button"
@@ -1319,11 +1343,10 @@ export default function DashboardClient({
                               return (
                                 <div
                                   key={lot.id}
-                                  className={`${GRID_COLS} items-center rounded py-2 pl-0 pr-2 text-sm transition-colors duration-700 ${
+                                  className={`${SUB_GRID} items-center gap-2 rounded py-2 pl-0 pr-2 text-sm transition-colors duration-700 ${
                                     isSavedFlash ? "bg-green-50" : ""
                                   }`}
                                 >
-                                  <span />
                                   <span className="truncate text-slate-500">
                                     {isEditingLot && editDraft ? (
                                       <input
@@ -1369,7 +1392,6 @@ export default function DashboardClient({
                                       <OwnerBadge owner={lot.owner} />
                                     )}
                                   </span>
-                                  <span className="text-slate-300">—</span>
                                   <span className="text-slate-700">
                                     {isEditingLot && editDraft ? (
                                       <input
@@ -1397,10 +1419,10 @@ export default function DashboardClient({
                                       editNavLoading ? (
                                         <span className="inline-block h-3 w-10 animate-pulse rounded bg-slate-200" />
                                       ) : (
-                                        `₹${Number(editDraft?.avg_nav ?? lot.avg_nav).toFixed(4)}`
+                                        `₹${formatNav(Number(editDraft?.avg_nav ?? lot.avg_nav))}`
                                       )
                                     ) : (
-                                      `₹${Number(lot.avg_nav).toFixed(4)}`
+                                      `₹${formatNav(Number(lot.avg_nav))}`
                                     )}
                                   </span>
                                   <span className="text-slate-500">
@@ -1408,16 +1430,12 @@ export default function DashboardClient({
                                       editNavLoading ? (
                                         <span className="inline-block h-3 w-10 animate-pulse rounded bg-slate-200" />
                                       ) : (
-                                        Number(editDraft?.units ?? lot.units).toLocaleString("en-IN", {
-                                          maximumFractionDigits: 3,
-                                        })
+                                        formatUnits(Number(editDraft?.units ?? lot.units))
                                       )
                                     ) : (
-                                      Number(lot.units).toLocaleString("en-IN", { maximumFractionDigits: 3 })
+                                      formatUnits(Number(lot.units))
                                     )}
                                   </span>
-                                  <span className="text-slate-300">—</span>
-                                  <span className="text-slate-300">—</span>
                                   <span className="flex items-center justify-end gap-1">
                                     {isEditingLot ? (
                                       <div className="flex flex-col items-end gap-1">
@@ -1558,7 +1576,7 @@ export default function DashboardClient({
                                       <input
                                         type="text"
                                         readOnly
-                                        value={addLotDraft.avg_nav ? `₹${addLotDraft.avg_nav}` : ""}
+                                        value={addLotDraft.avg_nav ? `₹${formatNav(Number(addLotDraft.avg_nav))}` : ""}
                                         placeholder="Auto-filled"
                                         className="w-24 cursor-not-allowed rounded border border-slate-200 bg-slate-100 px-2 py-1 text-xs text-slate-600"
                                       />
@@ -1587,7 +1605,7 @@ export default function DashboardClient({
                                       <input
                                         type="text"
                                         readOnly
-                                        value={addLotDraft.units}
+                                        value={addLotDraft.units ? formatUnits(Number(addLotDraft.units)) : ""}
                                         placeholder="Auto-calculated"
                                         className="w-24 cursor-not-allowed rounded border border-slate-200 bg-slate-100 px-2 py-1 text-xs text-slate-600"
                                       />
@@ -1630,7 +1648,6 @@ export default function DashboardClient({
                                 )}
                               </div>
                             )}
-                          </div>
                         </div>
                       </div>
                     </div>
