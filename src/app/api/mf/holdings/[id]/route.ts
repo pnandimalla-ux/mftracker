@@ -1,5 +1,8 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
+import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
+import { syncNewFund } from "@/lib/peers/tier3Sync";
+import { isRealSchemeCode } from "@/lib/peers/peerSync";
 
 export async function PUT(
   request: Request,
@@ -45,7 +48,14 @@ export async function PUT(
           { status: 400 }
         );
       }
-      update.category = category.trim();
+      const cleanCategory = category.trim();
+      if (!CATEGORY_OPTIONS.includes(cleanCategory)) {
+        return NextResponse.json(
+          { error: `category must be one of: ${CATEGORY_OPTIONS.join(", ")}` },
+          { status: 400 }
+        );
+      }
+      update.category = cleanCategory;
     }
     if (units !== undefined) {
       if (typeof units !== "number" || !Number.isFinite(units) || units <= 0) {
@@ -124,6 +134,15 @@ export async function PUT(
 
     if (error) {
       return NextResponse.json({ error: error.message }, { status: 500 });
+    }
+
+    // If the category changed, refresh this fund's peer data under its new
+    // category right away rather than waiting for the next scheduled sync.
+    // Fire-and-forget — never block the response on mfapi.in.
+    if (update.category && data && isRealSchemeCode(data.scheme_code as string)) {
+      syncNewFund(data.scheme_code as string, update.category as string).catch((err) =>
+        console.error(`Background syncNewFund failed for ${data.scheme_code}:`, err)
+      );
     }
 
     return NextResponse.json({ data });

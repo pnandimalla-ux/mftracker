@@ -1,12 +1,13 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/service";
-import { getCategoryForCode } from "@/lib/peers/categoryUniverse";
+import { getCategoryForCode, getCategoryFunds } from "@/lib/peers/categoryUniverse";
 import { fetchSchemeReturns, type PeriodReturns } from "@/lib/peers/peerSync";
 
 interface SchemeRow {
   code: string;
   name: string | null;
+  amc: string | null;
   r6m: number | null;
   r1y: number | null;
   r3y: number | null;
@@ -21,6 +22,8 @@ interface SchemeRow {
 
 interface PeerDataRow {
   scheme_code: string;
+  fund_name: string | null;
+  amc: string | null;
   r6m: number | null;
   r1y: number | null;
   r3y: number | null;
@@ -133,15 +136,53 @@ export async function GET(
       .select("scheme_code, scheme_name")
       .in("scheme_code", allCodes);
 
-    const nameMap = new Map(
+    const navNameMap = new Map(
       (navRows ?? []).map((n) => [n.scheme_code as string, n.scheme_name as string | null])
     );
+
+    // Curated-universe funds carry their real name/AMC even if this
+    // particular scheme_code hasn't been synced into mf_peer_data yet.
+    const universeNameMap = new Map(getCategoryFunds(category).map((f) => [f.code, f.name]));
+
+    const resolveName = (code: string): string | null => {
+      const p = peerDataMap.get(code);
+      return p?.fund_name || navNameMap.get(code) || universeNameMap.get(code) || null;
+    };
+
+    // Last resort: a handful of funds may still have no name anywhere (never
+    // synced by tier1/2/3 and not in the curated universe) — fetch their
+    // name from mfapi.in directly and best-effort persist it for next time.
+    const missingNameCodes = allCodes.filter((code) => !resolveName(code));
+    const liveNameMap = new Map<string, string>();
+    if (missingNameCodes.length > 0) {
+      await Promise.all(
+        missingNameCodes.map(async (code) => {
+          try {
+            const res = await fetch(`https://api.mfapi.in/mf/${code}`, { cache: "no-store" });
+            if (!res.ok) return;
+            const json = await res.json();
+            const name = typeof json?.meta?.scheme_name === "string" ? json.meta.scheme_name : null;
+            if (!name) return;
+            liveNameMap.set(code, name);
+            try {
+              const serviceClient = createServiceClient();
+              await serviceClient.from("mf_peer_data").update({ fund_name: name }).eq("scheme_code", code);
+            } catch (persistErr) {
+              console.error(`Failed to persist fund_name for ${code}:`, persistErr);
+            }
+          } catch (err) {
+            console.error(`Failed to fetch fund name for ${code}:`, err);
+          }
+        })
+      );
+    }
 
     const toSchemeRow = (code: string): SchemeRow => {
       const p = peerDataMap.get(code);
       return {
         code,
-        name: nameMap.get(code) ?? null,
+        name: resolveName(code) ?? liveNameMap.get(code) ?? null,
+        amc: p?.amc ?? null,
         r6m: p?.r6m ?? null,
         r1y: p?.r1y ?? null,
         r3y: p?.r3y ?? null,
@@ -180,7 +221,8 @@ export async function GET(
       const peerCount = peers.filter(hasAnyReturn).length + 1;
       scheme = {
         code: schemeCode,
-        name: nameMap.get(schemeCode) ?? null,
+        name: resolveName(schemeCode) ?? liveNameMap.get(schemeCode) ?? null,
+        amc: null,
         r6m: returns.r6m,
         r1y: returns.r1y,
         r3y: returns.r3y,

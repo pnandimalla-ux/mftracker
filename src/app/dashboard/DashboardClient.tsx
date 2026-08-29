@@ -8,6 +8,7 @@ import type { EnrichedMFHolding, MFHolding, Owner } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import { ALL_CATEGORIES } from "@/lib/peers/categoryUniverse";
 import AlternativesPanel, { type AlternativesData } from "@/components/AlternativesPanel";
+import { detectCategory } from "@/lib/analysis/fundCategoriser";
 
 type OwnerFilter = "family" | "praveen" | "geetha";
 type Period = "6m" | "1y" | "3y" | "5y";
@@ -1911,23 +1912,30 @@ export default function DashboardClient({
                                   </span>
                                 </div>
                                 {isEditingLot && editDraft && (
-                                  <div className="mb-1 flex items-center gap-2 pb-1 pl-1">
-                                    <label className="text-[10px] font-medium text-slate-500">
-                                      Category
-                                    </label>
-                                    <select
-                                      value={editDraft.category}
-                                      onChange={(e) =>
-                                        setEditDraft({ ...editDraft, category: e.target.value })
-                                      }
-                                      className="rounded border border-slate-300 px-2 py-1 text-xs"
-                                    >
-                                      {CATEGORY_OPTIONS.map((c) => (
-                                        <option key={c} value={c}>
-                                          {c}
-                                        </option>
-                                      ))}
-                                    </select>
+                                  <div className="mb-1 flex flex-col gap-1 pb-1 pl-1">
+                                    <div className="flex items-center gap-2">
+                                      <label className="text-[10px] font-medium text-slate-500">
+                                        Category
+                                      </label>
+                                      <select
+                                        value={editDraft.category}
+                                        onChange={(e) =>
+                                          setEditDraft({ ...editDraft, category: e.target.value })
+                                        }
+                                        className="rounded border border-slate-300 px-2 py-1 text-xs"
+                                      >
+                                        {CATEGORY_OPTIONS.map((c) => (
+                                          <option key={c} value={c}>
+                                            {c}
+                                          </option>
+                                        ))}
+                                      </select>
+                                    </div>
+                                    {editDraft.category !== lot.category && (
+                                      <p className="pl-1 text-[10px] text-blue-600">
+                                        Detected: {detectCategory(lot.scheme_name).category}
+                                      </p>
+                                    )}
                                   </div>
                                 )}
                                 </div>
@@ -1936,7 +1944,37 @@ export default function DashboardClient({
 
                             {addLotGroupKey === group.key && addLotDraft && (
                               <div className="my-1 rounded-lg bg-blue-50 p-3">
+                                {(() => {
+                                  const detected = detectCategory(group.scheme_name);
+                                  const mismatch =
+                                    detected.confidence !== "low" && detected.category !== group.category;
+                                  if (!mismatch) return null;
+                                  return (
+                                    <div className="mb-3 flex flex-wrap items-start justify-between gap-2 rounded-md bg-amber-50 px-2 py-1.5">
+                                      <p className="text-xs text-amber-700">
+                                        ⚠️ Category mismatch detected. This fund appears to be {detected.category} based
+                                        on its name. Edit the fund to correct it.
+                                      </p>
+                                      <button
+                                        type="button"
+                                        onClick={() => handleEditGroup(group)}
+                                        className="shrink-0 text-xs font-semibold text-blue-600 hover:underline"
+                                      >
+                                        Fix category
+                                      </button>
+                                    </div>
+                                  );
+                                })()}
                                 <div className="flex flex-wrap items-end gap-3">
+                                  <div>
+                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
+                                      Category
+                                    </label>
+                                    <div className="flex h-[30px] items-center rounded border border-slate-200 bg-white px-2 text-xs text-slate-600">
+                                      {group.category}
+                                    </div>
+                                  </div>
+
                                   <div>
                                     <label className="mb-1 block text-[10px] font-medium text-slate-600">
                                       Owner

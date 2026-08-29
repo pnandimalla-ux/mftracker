@@ -56,6 +56,14 @@ function formatInr(value: number) {
   return `₹${Math.round(value).toLocaleString("en-IN")}`;
 }
 
+function fundDisplayName(row: { code: string; name: string | null }): { text: string; title?: string } {
+  if (row.name) return { text: row.name };
+  return {
+    text: `Scheme #${row.code}`,
+    title: "Name not yet synced — run Sync peers to resolve",
+  };
+}
+
 function formatPct(value: number | null) {
   if (value === null) return "—";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
@@ -407,10 +415,16 @@ export default function FundDetailClient({
                         >
                           <td className="px-4 py-3 text-slate-800">
                             {isYou ? (
-                              <span className="font-semibold">{row.name ?? row.code}</span>
+                              <span className="font-semibold" title={fundDisplayName(row).title}>
+                                {fundDisplayName(row).text}
+                              </span>
                             ) : (
-                              <Link href={`/fund/${row.code}`} className="hover:text-blue-600 hover:underline">
-                                {row.name ?? row.code}
+                              <Link
+                                href={`/fund/${row.code}`}
+                                className="hover:text-blue-600 hover:underline"
+                                title={fundDisplayName(row).title}
+                              >
+                                {fundDisplayName(row).text}
                               </Link>
                             )}
                           </td>
