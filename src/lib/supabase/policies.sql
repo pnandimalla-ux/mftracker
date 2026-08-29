@@ -1,0 +1,32 @@
+-- Optional write policies for mf_peer_data / mf_sync_log / mf_nav_cache.
+--
+-- IMPORTANT: none of these should be needed for the peer sync to work today.
+-- Every write to these three tables goes through createServiceClient() /
+-- createServiceRoleClient() (see src/lib/supabase/service.ts and
+-- src/lib/supabase/serviceRoleClient.ts), which uses the Supabase service-role
+-- key. Service-role requests bypass Row Level Security entirely — that's the
+-- whole point of the key — so no policy change is required for the sync API
+-- routes, the cron jobs, or the NAV cache to be able to write.
+--
+-- The policies below would instead grant write access to every authenticated
+-- (or, if applied without restriction, anon) API caller, not just the
+-- service-role key. For these three tables that's a real risk: mf_peer_data,
+-- mf_nav_cache, and mf_sync_log are shared, non-user-owned caches — any
+-- authenticated user could overwrite another fund's NAV/peer numbers or spam
+-- the sync log. If you were seeing "silent" sync failures, the more likely
+-- causes are covered in src/lib/peers/peerSync.ts (mfapi.in timeouts, request
+-- timeouts on the old "sync everything in one call" endpoint) rather than a
+-- missing write policy — the service-role client was already able to write.
+--
+-- Only run the statements below if you have a concrete reason a
+-- non-service-role caller needs to write to these tables, and prefer scoping
+-- them to a specific role rather than `USING (true) WITH CHECK (true)`.
+
+-- CREATE POLICY "Service role can write peer data" ON mf_peer_data
+--   FOR ALL USING (true) WITH CHECK (true);
+
+-- CREATE POLICY "Service role can write sync log" ON mf_sync_log
+--   FOR ALL USING (true) WITH CHECK (true);
+
+-- CREATE POLICY "Service role can write nav cache" ON mf_nav_cache
+--   FOR ALL USING (true) WITH CHECK (true);

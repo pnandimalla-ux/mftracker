@@ -1,10 +1,14 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { createServiceRoleClient } from "@/lib/supabase/serviceRoleClient";
-import { syncAllPeerData } from "@/lib/peers/peerSync";
+import { createServiceClient } from "@/lib/supabase/service";
+import { CATEGORY_UNIVERSE } from "@/lib/peers/categoryUniverse";
 
 const SEED_THRESHOLD = 10;
 
+// This route does NOT run the sync itself — syncing all ~70 funds across 7
+// categories in one request takes minutes, far past a serverless timeout.
+// It just checks whether seeding is needed and hands back the category list;
+// the frontend calls POST /api/mf/peers/sync once per category, sequentially.
 export async function POST() {
   try {
     const supabase = createClient();
@@ -13,16 +17,19 @@ export async function POST() {
       data: { user },
     } = await supabase.auth.getUser();
 
+    console.log("POST /api/mf/peers/seed auth user id:", user?.id ?? null);
+
     if (!user) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const serviceClient = createServiceRoleClient();
+    const serviceClient = createServiceClient();
     const { count, error: countError } = await serviceClient
       .from("mf_peer_data")
       .select("scheme_code", { count: "exact", head: true });
 
     if (countError) {
+      console.error("POST /api/mf/peers/seed count query failed:", countError.message);
       return NextResponse.json({ error: countError.message }, { status: 500 });
     }
 
@@ -36,27 +43,17 @@ export async function POST() {
       );
     }
 
-    const result = await syncAllPeerData();
-    const status = result.failed === 0 ? "success" : result.processed === 0 ? "failed" : "partial";
+    const categories = Object.keys(CATEGORY_UNIVERSE);
+    console.log("POST /api/mf/peers/seed — categories to sync:", categories);
 
-    await serviceClient.from("mf_sync_log").insert({
-      cron_name: "mf-peers-seed",
-      status,
-      rows_updated: result.processed,
-      error_message: result.errors.length > 0 ? result.errors.join("; ") : null,
-    });
-
-    return NextResponse.json({
-      status,
-      processed: result.processed,
-      failed: result.failed,
-      errors: result.errors,
-      byCategory: result.byCategory,
-    });
+    return NextResponse.json({ categories });
   } catch (err) {
     console.error("POST /api/mf/peers/seed failed:", err);
     return NextResponse.json(
-      { error: "Internal server error" },
+      {
+        error: "Internal server error",
+        detail: err instanceof Error ? err.message : String(err),
+      },
       { status: 500 }
     );
   }

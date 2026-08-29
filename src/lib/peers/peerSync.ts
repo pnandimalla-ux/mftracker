@@ -1,7 +1,8 @@
-import { createServiceRoleClient } from "@/lib/supabase/serviceRoleClient";
+import { createServiceClient } from "@/lib/supabase/service";
 import { CATEGORY_UNIVERSE } from "./categoryUniverse";
 
-const MFAPI_DELAY_MS = 200;
+const MFAPI_DELAY_MS = 150;
+const MFAPI_TIMEOUT_MS = 5000;
 const MATCH_TOLERANCE_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -9,15 +10,27 @@ function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function fetchWithTimeout(url: string, timeoutMs = MFAPI_TIMEOUT_MS): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { cache: "no-store", signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 export interface NavHistoryEntry {
   date: string; // "DD-MM-YYYY", as returned by mfapi.in
   nav: string;
 }
 
-// mfapi.in dates are "DD-MM-YYYY" — not ISO, so new Date() would misparse them.
-function parseMfapiDate(mfapiDate: string): Date {
-  const [dd, mm, yyyy] = mfapiDate.split("-").map(Number);
-  return new Date(Date.UTC(yyyy, mm - 1, dd));
+// mfapi.in dates are "DD-MM-YYYY" — not ISO, so new Date(dateStr) would
+// misparse them (or silently produce "Invalid Date"). Parse the parts out
+// and construct the Date explicitly instead.
+function parseMFDate(dateStr: string): Date {
+  const [day, month, year] = dateStr.split("-").map(Number);
+  return new Date(year, month - 1, day);
 }
 
 export interface PeriodReturns {
@@ -59,7 +72,7 @@ export function calculateReturns(navHistory: NavHistoryEntry[]): PeriodReturns {
 
   const parsed = navHistory
     .map((entry) => ({
-      date: parseMfapiDate(entry.date),
+      date: parseMFDate(entry.date),
       nav: Number(entry.nav),
     }))
     .filter((entry) => Number.isFinite(entry.nav));
@@ -106,12 +119,15 @@ export interface SyncPeerDataResult {
 }
 
 export async function syncPeerData(category: string): Promise<SyncPeerDataResult> {
+  console.log("Starting peer sync for category:", category);
+
   const schemeCodes = CATEGORY_UNIVERSE[category];
   if (!schemeCodes) {
+    console.error("Unknown category:", category);
     return { processed: 0, failed: 0, errors: [`Unknown category: ${category}`] };
   }
 
-  const supabase = createServiceRoleClient();
+  const supabase = createServiceClient();
 
   let processed = 0;
   let failed = 0;
@@ -120,24 +136,37 @@ export async function syncPeerData(category: string): Promise<SyncPeerDataResult
 
   for (let i = 0; i < schemeCodes.length; i++) {
     const schemeCode = schemeCodes[i];
+    console.log("Fetching scheme:", schemeCode);
     try {
-      const res = await fetch(`https://api.mfapi.in/mf/${schemeCode}`, {
-        cache: "no-store",
-      });
+      const res = await fetchWithTimeout(`https://api.mfapi.in/mf/${schemeCode}`);
       if (!res.ok) {
         throw new Error(`mfapi.in returned ${res.status}`);
       }
+
       const json = await res.json();
-      const history: NavHistoryEntry[] = Array.isArray(json?.data) ? json.data : [];
+
+      // mfapi.in wraps history under `data`; some mirrors add a `status`
+      // field ("SUCCESS"/"ERROR") — treat an explicit non-success as a miss.
+      if (typeof json?.status === "string" && json.status !== "SUCCESS") {
+        throw new Error(`mfapi.in status: ${json.status}`);
+      }
+      if (!json?.data || !Array.isArray(json.data)) {
+        throw new Error("mfapi.in response missing data array");
+      }
+
+      const history: NavHistoryEntry[] = json.data;
+      console.log("NAV history length:", history.length, "for scheme:", schemeCode);
+
       const returns = calculateReturns(history);
+      console.log("Calculated returns:", returns, "for scheme:", schemeCode);
 
       computed.push({ scheme_code: schemeCode, ...returns });
       processed++;
     } catch (err) {
       failed++;
-      errors.push(
-        `${schemeCode}: ${err instanceof Error ? err.message : String(err)}`
-      );
+      const message = err instanceof Error ? err.message : String(err);
+      console.error("Failed scheme:", schemeCode, message);
+      errors.push(`${schemeCode}: ${message}`);
     }
 
     if (i < schemeCodes.length - 1) {
@@ -146,10 +175,13 @@ export async function syncPeerData(category: string): Promise<SyncPeerDataResult
   }
 
   if (computed.length === 0) {
+    console.error("No schemes synced successfully for category:", category);
     return { processed, failed, errors };
   }
 
   const now = new Date().toISOString();
+
+  console.log("Upserting to mf_peer_data:", computed.map((c) => c.scheme_code).join(", "));
 
   const { error: upsertError } = await supabase.from("mf_peer_data").upsert(
     computed.map((c) => ({
@@ -160,10 +192,12 @@ export async function syncPeerData(category: string): Promise<SyncPeerDataResult
       r3y: c.r3y,
       r5y: c.r5y,
       updated_at: now,
-    }))
+    })),
+    { onConflict: "scheme_code" }
   );
 
   if (upsertError) {
+    console.error("Upsert to mf_peer_data failed:", upsertError.message);
     errors.push(`Upsert failed: ${upsertError.message}`);
     return { processed, failed, errors };
   }
@@ -202,9 +236,14 @@ export async function syncPeerData(category: string): Promise<SyncPeerDataResult
       .update(updates)
       .eq("scheme_code", schemeCode);
     if (error) {
+      console.error("Rank update failed for", schemeCode, error.message);
       errors.push(`Rank update failed for ${schemeCode}: ${error.message}`);
     }
   }
+
+  console.log(
+    `Finished peer sync for category: ${category} — processed=${processed} failed=${failed}`
+  );
 
   return { processed, failed, errors };
 }

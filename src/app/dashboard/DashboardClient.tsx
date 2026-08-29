@@ -328,7 +328,11 @@ export default function DashboardClient({
   const [toast, setToast] = useState<string | null>(null);
 
   const [peerDataEmpty, setPeerDataEmpty] = useState(false);
-  const [seedingPeers, setSeedingPeers] = useState(false);
+  const [peerSyncing, setPeerSyncing] = useState(false);
+  const [peerSyncTotal, setPeerSyncTotal] = useState(0);
+  const [peerSyncCompleted, setPeerSyncCompleted] = useState(0);
+  const [peerSyncCurrent, setPeerSyncCurrent] = useState<string | null>(null);
+  const [peerSyncErrors, setPeerSyncErrors] = useState<string[]>([]);
 
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
@@ -550,18 +554,59 @@ export default function DashboardClient({
     }
   };
 
-  const handleSeedPeers = async () => {
-    setSeedingPeers(true);
+  const handleStartPeerSync = async () => {
+    setPeerSyncing(true);
+    setPeerSyncErrors([]);
+    setPeerSyncCompleted(0);
+    setPeerSyncTotal(0);
+    setPeerSyncCurrent(null);
+
     try {
-      const res = await fetch("/api/mf/peers/seed", { method: "POST" });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.error ?? "Peer sync failed");
-      window.location.reload();
+      const seedRes = await fetch("/api/mf/peers/seed", { method: "POST" });
+      const seedJson = await seedRes.json();
+      if (!seedRes.ok) throw new Error(seedJson.error ?? "Failed to start peer sync");
+
+      const categories: string[] = Array.isArray(seedJson.categories) ? seedJson.categories : [];
+      setPeerSyncTotal(categories.length);
+
+      const errors: string[] = [];
+      for (let i = 0; i < categories.length; i++) {
+        const category = categories[i];
+        setPeerSyncCurrent(category);
+        try {
+          const res = await fetch("/api/mf/peers/sync", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ category }),
+          });
+          const json = await res.json();
+          if (!res.ok) throw new Error(json.error ?? `Failed to sync ${category}`);
+          if (json.failed > 0) {
+            errors.push(`${category}: ${json.failed} fund(s) failed`);
+          }
+        } catch (err) {
+          console.error(`Peer sync failed for ${category}:`, err);
+          errors.push(`${category}: sync failed`);
+        }
+        setPeerSyncCompleted(i + 1);
+      }
+
+      setPeerSyncErrors(errors);
+      showToast(errors.length === 0 ? "Peer data synced!" : `Peer data synced with ${errors.length} warning(s)`);
+      await loadHoldings();
     } catch (err) {
-      console.error("Peer seed failed:", err);
-      showToast("Peer data sync failed");
-      setSeedingPeers(false);
+      console.error("Peer sync failed:", err);
+      showToast(err instanceof Error ? err.message : "Peer data sync failed");
+    } finally {
+      setPeerSyncCurrent(null);
+      setPeerSyncing(false);
     }
+  };
+
+  const handleResetPeerSync = () => {
+    setPeerSyncTotal(0);
+    setPeerSyncCompleted(0);
+    setPeerSyncErrors([]);
   };
 
   const toggleGroup = (key: string) => {
@@ -1659,14 +1704,53 @@ export default function DashboardClient({
         )}
 
         {!loading && hasAnyHoldings && peerDataEmpty && (
-          <div className="mt-6 flex items-center justify-center">
-            <button
-              onClick={handleSeedPeers}
-              disabled={seedingPeers}
-              className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-500 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {seedingPeers ? "Syncing peer data... this takes ~2 minutes" : "Sync peer data"}
-            </button>
+          <div className="mt-6 rounded-xl border border-slate-200 bg-white p-4">
+            {peerSyncTotal === 0 ? (
+              <div className="flex items-center justify-center">
+                <button
+                  onClick={handleStartPeerSync}
+                  disabled={peerSyncing}
+                  className="rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-500 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Sync peer data
+                </button>
+              </div>
+            ) : (
+              <div>
+                <p className="text-sm font-medium text-slate-700">
+                  Syncing peer data — this fetches returns for ~70 funds across {peerSyncTotal} categories
+                </p>
+                <div className="mt-2 h-2 w-full overflow-hidden rounded-full bg-slate-100">
+                  <div
+                    className="h-full rounded-full bg-blue-600 transition-all duration-300"
+                    style={{ width: `${(peerSyncCompleted / peerSyncTotal) * 100}%` }}
+                  />
+                </div>
+                <p className="mt-2 text-xs text-slate-500">
+                  {peerSyncing
+                    ? `Syncing ${peerSyncCurrent}... (${peerSyncCompleted}/${peerSyncTotal})`
+                    : peerSyncErrors.length === 0
+                      ? "Peer data synced! Refreshing..."
+                      : `Peer data synced with ${peerSyncErrors.length} warning(s).`}
+                </p>
+                {peerSyncErrors.length > 0 && (
+                  <ul className="mt-2 space-y-0.5 text-xs text-amber-600">
+                    {peerSyncErrors.map((e) => (
+                      <li key={e}>⚠ {e}</li>
+                    ))}
+                  </ul>
+                )}
+                {!peerSyncing && (
+                  <button
+                    type="button"
+                    onClick={handleResetPeerSync}
+                    className="mt-2 text-xs font-medium text-blue-600 hover:underline"
+                  >
+                    Try again
+                  </button>
+                )}
+              </div>
+            )}
           </div>
         )}
       </main>
