@@ -1,13 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import Link from "next/link";
 import AppHeader from "@/components/AppHeader";
 import { createClient } from "@/lib/supabase/client";
-import type { EnrichedMFHolding, Owner } from "@/types/mf";
+import type { EnrichedMFHolding, MFHolding, Owner } from "@/types/mf";
 
 type OwnerFilter = "family" | "praveen" | "geetha";
 type Period = "6m" | "1y" | "3y" | "5y";
+type GroupOwner = Owner | "mixed";
 
 const OWNERS: { id: OwnerFilter; label: string }[] = [
   { id: "family", label: "Family" },
@@ -21,6 +22,9 @@ const PERIODS: { id: Period; label: string }[] = [
   { id: "3y", label: "3Y" },
   { id: "5y", label: "5Y" },
 ];
+
+const GRID_COLS =
+  "grid grid-cols-[24px_minmax(220px,2fr)_60px_110px_120px_120px_160px_100px_90px_90px_90px_110px]";
 
 interface PeerInfo {
   r6m: number | null;
@@ -44,6 +48,42 @@ interface HoldingWithPeer extends EnrichedMFHolding {
   peer: PeerInfo | null;
 }
 
+interface HoldingGroup {
+  key: string;
+  scheme_code: string | null;
+  scheme_name: string;
+  category: string;
+  amc: string | null;
+  owner: GroupOwner;
+  lots: HoldingWithPeer[];
+  total_invested: number;
+  total_units: number;
+  avg_nav: number;
+  current_value: number;
+  pnl: number;
+  pnl_pct: number;
+  lot_count: number;
+  earliest_date: string;
+  latest_date: string;
+  peer: PeerInfo | null;
+}
+
+function todayIso() {
+  return new Date().toISOString().split("T")[0];
+}
+
+function daysAgoIso(days: number) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toISOString().split("T")[0];
+}
+
+function shiftDate(iso: string, days: number) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
 function periodReturnKey(period: Period) {
   return (
     { "6m": "r6m", "1y": "r1y", "3y": "r3y", "5y": "r5y" } as const
@@ -63,6 +103,26 @@ function formatInr(value: number) {
 function formatPct(value: number | null) {
   if (value === null) return "—";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function formatDateDMY(iso: string): string {
+  const [y, m, d] = iso.split("-");
+  if (y && m && d) return `${d}-${m}-${y}`;
+  return iso;
+}
+
+// Manually-added funds without a real mfapi.in code get a `manual-<ts>`
+// placeholder from the API (see POST /api/mf/holdings) — every new lot gets
+// its own placeholder, so grouping by scheme_code would never merge them.
+// Fall back to grouping by scheme name for those instead.
+function hasRealSchemeCode(schemeCode: string | null | undefined): schemeCode is string {
+  return !!schemeCode && !schemeCode.startsWith("manual-");
+}
+
+function groupKeyFor(h: EnrichedMFHolding): string {
+  return hasRealSchemeCode(h.scheme_code)
+    ? `code:${h.scheme_code}`
+    : `name:${h.scheme_name.trim().toLowerCase()}`;
 }
 
 function rankBadgeTone(rank: number, peerCount: number) {
@@ -115,10 +175,92 @@ function XIcon() {
   );
 }
 
+function ChevronIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+      <path
+        d="M7 4l6 6-6 6"
+        stroke="currentColor"
+        strokeWidth={1.7}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function PlusIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+      <path d="M10 4v12M4 10h12" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function TrashIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+      <path
+        d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10"
+        stroke="currentColor"
+        strokeWidth={1.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function ExternalLinkIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+      <path
+        d="M8 5H5a1 1 0 00-1 1v9a1 1 0 001 1h9a1 1 0 001-1v-3M11 4h5v5M9 11l6.5-6.5"
+        stroke="currentColor"
+        strokeWidth={1.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function OwnerBadge({ owner }: { owner: GroupOwner }) {
+  if (owner === "mixed") {
+    return (
+      <span className="inline-flex h-6 items-center rounded-full bg-slate-200 px-2 text-[10px] font-semibold text-slate-700">
+        P+G
+      </span>
+    );
+  }
+  return (
+    <span
+      className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
+        owner === "praveen" ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700"
+      }`}
+    >
+      {owner === "praveen" ? "P" : "G"}
+    </span>
+  );
+}
+
 interface EditDraft {
   owner: Owner;
   invested_amount: string;
   as_on_date: string;
+  avg_nav: string;
+  units: string;
+}
+
+interface AddLotDraft {
+  owner: Owner;
+  invested_amount: string;
+  as_on_date: string;
+  avg_nav: string;
+  units: string;
+  manualMode: boolean;
+  navLoading: boolean;
+  navError: string | null;
 }
 
 function KpiCard({
@@ -172,11 +314,31 @@ export default function DashboardClient({
   const [peerDataEmpty, setPeerDataEmpty] = useState(false);
   const [seedingPeers, setSeedingPeers] = useState(false);
 
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+
+  // --- Edit lot ---
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
   const [editSaving, setEditSaving] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+  const [editNavLoading, setEditNavLoading] = useState(false);
   const [savedFlashId, setSavedFlashId] = useState<string | null>(null);
+  const editOriginalRef = useRef<{ date: string; avg_nav: string; units: string } | null>(null);
+
+  // --- Add lot ---
+  const [addLotGroupKey, setAddLotGroupKey] = useState<string | null>(null);
+  const [addLotDraft, setAddLotDraft] = useState<AddLotDraft | null>(null);
+  const [addLotSaving, setAddLotSaving] = useState(false);
+  const [addLotError, setAddLotError] = useState<string | null>(null);
+
+  // --- Delete lot ---
+  const [deleteLotConfirmId, setDeleteLotConfirmId] = useState<string | null>(null);
+  const [deleteLotDeleting, setDeleteLotDeleting] = useState(false);
+
+  // --- Delete group ---
+  const [deleteGroupConfirmKey, setDeleteGroupConfirmKey] = useState<string | null>(null);
+  const [deleteGroupProgress, setDeleteGroupProgress] = useState<{ current: number; total: number } | null>(null);
+  const [deleteGroupDeleting, setDeleteGroupDeleting] = useState(false);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -266,6 +428,60 @@ export default function DashboardClient({
     return [...list].sort((a, b) => b.invested_amount - a.invested_amount);
   }, [holdings, owner]);
 
+  const groupedHoldings = useMemo<HoldingGroup[]>(() => {
+    const map = new Map<string, HoldingGroup>();
+
+    for (const h of filteredHoldings) {
+      const key = groupKeyFor(h);
+      let g = map.get(key);
+      if (!g) {
+        g = {
+          key,
+          scheme_code: hasRealSchemeCode(h.scheme_code) ? h.scheme_code : null,
+          scheme_name: h.scheme_name,
+          category: h.category,
+          amc: h.amc,
+          owner: h.owner,
+          lots: [],
+          total_invested: 0,
+          total_units: 0,
+          avg_nav: 0,
+          current_value: 0,
+          pnl: 0,
+          pnl_pct: 0,
+          lot_count: 0,
+          earliest_date: h.as_on_date,
+          latest_date: h.as_on_date,
+          peer: h.peer,
+        };
+        map.set(key, g);
+      }
+      g.lots.push(h);
+      if (g.owner !== "mixed" && g.owner !== h.owner) g.owner = "mixed";
+      if (h.as_on_date < g.earliest_date) g.earliest_date = h.as_on_date;
+      if (h.as_on_date > g.latest_date) g.latest_date = h.as_on_date;
+    }
+
+    return Array.from(map.values())
+      .map((g) => {
+        const total_invested = g.lots.reduce((s, l) => s + Number(l.invested_amount), 0);
+        const total_units = g.lots.reduce((s, l) => s + Number(l.units), 0);
+        const current_value = g.lots.reduce((s, l) => s + Number(l.current_value), 0);
+        const pnl = current_value - total_invested;
+        return {
+          ...g,
+          total_invested,
+          total_units,
+          avg_nav: total_units > 0 ? total_invested / total_units : 0,
+          current_value,
+          pnl,
+          pnl_pct: total_invested > 0 ? (pnl / total_invested) * 100 : 0,
+          lot_count: g.lots.length,
+        };
+      })
+      .sort((a, b) => b.total_invested - a.total_invested);
+  }, [filteredHoldings]);
+
   const kpis = useMemo(() => {
     const totalInvested = filteredHoldings.reduce(
       (sum, h) => sum + Number(h.invested_amount),
@@ -332,32 +548,140 @@ export default function DashboardClient({
     }
   };
 
+  const toggleGroup = (key: string) => {
+    setExpandedGroups((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const expandGroup = (key: string) => {
+    setExpandedGroups((prev) => (prev.has(key) ? prev : new Set(prev).add(key)));
+  };
+
+  // --- Edit lot handlers ---
+
   const handleStartEdit = (h: HoldingWithPeer) => {
     setEditingId(h.id);
     setEditDraft({
       owner: h.owner,
       invested_amount: String(h.invested_amount),
       as_on_date: h.as_on_date,
+      avg_nav: String(h.avg_nav),
+      units: String(h.units),
     });
+    editOriginalRef.current = {
+      date: h.as_on_date,
+      avg_nav: String(h.avg_nav),
+      units: String(h.units),
+    };
     setEditError(null);
+    setEditNavLoading(false);
+  };
+
+  const handleEditGroup = (group: HoldingGroup) => {
+    expandGroup(group.key);
+    const mostRecent = [...group.lots].sort((a, b) => (a.as_on_date < b.as_on_date ? 1 : -1))[0];
+    if (mostRecent) handleStartEdit(mostRecent);
   };
 
   const handleCancelEdit = () => {
     setEditingId(null);
     setEditDraft(null);
     setEditError(null);
+    setEditNavLoading(false);
+    editOriginalRef.current = null;
   };
+
+  // Recalculate NAV (and thus units) whenever the edited lot's date changes
+  // away from its original value.
+  useEffect(() => {
+    if (!editingId || !editDraft) return;
+    const lot = holdings.find((h) => h.id === editingId);
+    if (!lot || !hasRealSchemeCode(lot.scheme_code)) return;
+
+    const original = editOriginalRef.current;
+    if (original && editDraft.as_on_date === original.date) {
+      if (editDraft.avg_nav !== original.avg_nav || editDraft.units !== original.units) {
+        setEditDraft((prev) =>
+          prev ? { ...prev, avg_nav: original.avg_nav, units: original.units } : prev
+        );
+      }
+      return;
+    }
+
+    let cancelled = false;
+    const schemeCode = lot.scheme_code;
+    const targetDate = editDraft.as_on_date;
+
+    const run = async () => {
+      setEditNavLoading(true);
+      for (let attempt = 0; attempt < 5 && !cancelled; attempt++) {
+        const tryDate = shiftDate(targetDate, -attempt);
+        try {
+          const res = await fetch(`/api/mf/nav/${schemeCode}?date=${tryDate}`);
+          if (res.ok) {
+            const json = await res.json();
+            const nav = Number(json?.data?.nav);
+            if (Number.isFinite(nav) && nav > 0 && !cancelled) {
+              setEditDraft((prev) => (prev ? { ...prev, avg_nav: String(nav) } : prev));
+              setEditNavLoading(false);
+              return;
+            }
+          }
+        } catch {
+          // try an earlier date
+        }
+      }
+      if (!cancelled) setEditNavLoading(false);
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editingId, editDraft?.as_on_date]);
+
+  // Derive units from invested amount ÷ NAV while editing.
+  useEffect(() => {
+    if (!editDraft) return;
+    const amt = Number(editDraft.invested_amount);
+    const nav = Number(editDraft.avg_nav);
+    if (Number.isFinite(amt) && amt > 0 && Number.isFinite(nav) && nav > 0) {
+      const computed = (amt / nav).toFixed(4);
+      setEditDraft((prev) => (prev && prev.units !== computed ? { ...prev, units: computed } : prev));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [editDraft?.invested_amount, editDraft?.avg_nav]);
 
   const handleSaveEdit = async (h: HoldingWithPeer) => {
     if (!editDraft) return;
 
     const investedAmount = Number(editDraft.invested_amount);
+    const avgNav = Number(editDraft.avg_nav);
+    const units = Number(editDraft.units);
+
     if (!Number.isFinite(investedAmount) || investedAmount <= 0) {
       setEditError("Invested amount must be a positive number");
       return;
     }
     if (!editDraft.as_on_date) {
       setEditError("As on date is required");
+      return;
+    }
+    if (editDraft.as_on_date > todayIso()) {
+      setEditError("Purchase date cannot be in the future");
+      return;
+    }
+    if (!Number.isFinite(avgNav) || avgNav <= 0) {
+      setEditError("NAV must be a positive number");
+      return;
+    }
+    if (!Number.isFinite(units) || units <= 0) {
+      setEditError("Units must be a positive number");
       return;
     }
 
@@ -371,24 +695,31 @@ export default function DashboardClient({
           owner: editDraft.owner,
           invested_amount: investedAmount,
           as_on_date: editDraft.as_on_date,
+          avg_nav: avgNav,
+          units,
         }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Failed to save");
 
-      const updated = json.data as { owner: Owner; invested_amount: number; as_on_date: string };
+      const updated = json.data as MFHolding;
 
       setHoldings((prev) =>
         prev.map((row) => {
           if (row.id !== h.id) return row;
           const newInvested = Number(updated.invested_amount);
-          const newPnl = row.current_value - newInvested;
+          const newUnits = Number(updated.units);
+          const newCurrentValue = newUnits * row.current_nav;
+          const newPnl = newCurrentValue - newInvested;
           const newPnlPct = newInvested > 0 ? (newPnl / newInvested) * 100 : 0;
           return {
             ...row,
             owner: updated.owner,
             invested_amount: newInvested,
             as_on_date: updated.as_on_date,
+            avg_nav: Number(updated.avg_nav),
+            units: newUnits,
+            current_value: newCurrentValue,
             pnl: newPnl,
             pnl_pct: newPnlPct,
           };
@@ -397,6 +728,7 @@ export default function DashboardClient({
 
       setEditingId(null);
       setEditDraft(null);
+      editOriginalRef.current = null;
       setSavedFlashId(h.id);
       setTimeout(() => setSavedFlashId(null), 1500);
     } catch (err) {
@@ -406,6 +738,229 @@ export default function DashboardClient({
       setEditSaving(false);
     }
   };
+
+  // --- Add lot handlers ---
+
+  const handleOpenAddLot = (group: HoldingGroup) => {
+    expandGroup(group.key);
+    const canAutoFetch = !!group.scheme_code;
+    setAddLotGroupKey(group.key);
+    setAddLotDraft({
+      owner: group.owner !== "mixed" ? group.owner : "praveen",
+      invested_amount: "",
+      as_on_date: daysAgoIso(30),
+      avg_nav: "",
+      units: "",
+      manualMode: !canAutoFetch,
+      navLoading: false,
+      navError: null,
+    });
+    setAddLotError(null);
+  };
+
+  const handleCancelAddLot = () => {
+    setAddLotGroupKey(null);
+    setAddLotDraft(null);
+    setAddLotError(null);
+  };
+
+  const switchAddLotToManual = () => {
+    setAddLotDraft((prev) =>
+      prev ? { ...prev, manualMode: true, navLoading: false, navError: null } : prev
+    );
+  };
+
+  const switchAddLotToAutoFetch = () => {
+    setAddLotDraft((prev) =>
+      prev ? { ...prev, manualMode: false, avg_nav: "", units: "", navError: null } : prev
+    );
+  };
+
+  // Auto-fetch NAV for the add-lot form whenever the fund or date changes.
+  useEffect(() => {
+    if (!addLotGroupKey || !addLotDraft || addLotDraft.manualMode) return;
+    const group = groupedHoldings.find((g) => g.key === addLotGroupKey);
+    if (!group || !group.scheme_code) return;
+    if (addLotDraft.as_on_date > todayIso()) return;
+
+    let cancelled = false;
+    const schemeCode = group.scheme_code;
+    const targetDate = addLotDraft.as_on_date;
+
+    const run = async () => {
+      setAddLotDraft((prev) => (prev ? { ...prev, navLoading: true, navError: null, avg_nav: "" } : prev));
+      for (let attempt = 0; attempt < 5 && !cancelled; attempt++) {
+        const tryDate = shiftDate(targetDate, -attempt);
+        try {
+          const res = await fetch(`/api/mf/nav/${schemeCode}?date=${tryDate}`);
+          if (res.ok) {
+            const json = await res.json();
+            const nav = Number(json?.data?.nav);
+            if (Number.isFinite(nav) && nav > 0 && !cancelled) {
+              setAddLotDraft((prev) =>
+                prev ? { ...prev, avg_nav: String(nav), navLoading: false, navError: null } : prev
+              );
+              return;
+            }
+          }
+        } catch {
+          // try an earlier date
+        }
+      }
+      if (!cancelled) {
+        setAddLotDraft((prev) =>
+          prev ? { ...prev, navLoading: false, navError: "NAV not found nearby — enter manually" } : prev
+        );
+      }
+    };
+
+    run();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addLotGroupKey, addLotDraft?.as_on_date, addLotDraft?.manualMode]);
+
+  // Derive units for the add-lot form from invested amount ÷ NAV.
+  useEffect(() => {
+    if (!addLotDraft || addLotDraft.manualMode) return;
+    const amt = Number(addLotDraft.invested_amount);
+    const nav = Number(addLotDraft.avg_nav);
+    if (Number.isFinite(amt) && amt > 0 && Number.isFinite(nav) && nav > 0) {
+      const computed = (amt / nav).toFixed(4);
+      setAddLotDraft((prev) => (prev && prev.units !== computed ? { ...prev, units: computed } : prev));
+    } else {
+      setAddLotDraft((prev) => (prev && prev.units !== "" ? { ...prev, units: "" } : prev));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [addLotDraft?.invested_amount, addLotDraft?.avg_nav, addLotDraft?.manualMode]);
+
+  const handleSaveAddLot = async (group: HoldingGroup) => {
+    if (!addLotDraft) return;
+
+    const invested = Number(addLotDraft.invested_amount);
+    const avgNav = Number(addLotDraft.avg_nav);
+    const units = Number(addLotDraft.units);
+
+    if (!Number.isFinite(invested) || invested <= 0) {
+      setAddLotError("Invested amount must be a positive number");
+      return;
+    }
+    if (!addLotDraft.as_on_date) {
+      setAddLotError("As on date is required");
+      return;
+    }
+    if (addLotDraft.as_on_date > todayIso()) {
+      setAddLotError("Purchase date cannot be in the future");
+      return;
+    }
+    if (!Number.isFinite(avgNav) || avgNav <= 0) {
+      setAddLotError("NAV must be a positive number");
+      return;
+    }
+    if (!Number.isFinite(units) || units <= 0) {
+      setAddLotError("Units must be a positive number");
+      return;
+    }
+
+    setAddLotSaving(true);
+    setAddLotError(null);
+    try {
+      const res = await fetch("/api/mf/holdings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          owner: addLotDraft.owner,
+          scheme_code: group.scheme_code,
+          scheme_name: group.scheme_name,
+          category: group.category,
+          amc: group.amc,
+          units,
+          avg_nav: avgNav,
+          invested_amount: invested,
+          as_on_date: addLotDraft.as_on_date,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Failed to add lot");
+
+      const created = json.data as MFHolding;
+      const currentValue = units * avgNav;
+      const newLot: HoldingWithPeer = {
+        ...created,
+        current_nav: avgNav,
+        nav_date: created.as_on_date,
+        current_value: currentValue,
+        pnl: currentValue - invested,
+        pnl_pct: invested > 0 ? ((currentValue - invested) / invested) * 100 : 0,
+        peer: group.peer,
+      };
+
+      setHoldings((prev) => [...prev, newLot]);
+      handleCancelAddLot();
+      showToast("Lot added");
+    } catch (err) {
+      console.error("Failed to add lot:", err);
+      setAddLotError("Failed to add lot");
+    } finally {
+      setAddLotSaving(false);
+    }
+  };
+
+  // --- Delete lot handlers ---
+
+  const handleConfirmDeleteLot = async (h: HoldingWithPeer) => {
+    setDeleteLotDeleting(true);
+    try {
+      const res = await fetch(`/api/mf/holdings/${h.id}`, { method: "DELETE" });
+      if (!res.ok) {
+        const json = await res.json().catch(() => ({}));
+        throw new Error(json.error ?? "Failed to delete");
+      }
+      setHoldings((prev) => prev.filter((row) => row.id !== h.id));
+      setDeleteLotConfirmId(null);
+      showToast("Lot deleted");
+    } catch (err) {
+      console.error("Failed to delete lot:", err);
+      showToast("Failed to delete lot");
+    } finally {
+      setDeleteLotDeleting(false);
+    }
+  };
+
+  // --- Delete group handlers ---
+
+  const handleConfirmDeleteGroup = async (group: HoldingGroup) => {
+    setDeleteGroupDeleting(true);
+    const ids = group.lots.map((l) => l.id);
+    const deletedIds: string[] = [];
+
+    for (let i = 0; i < ids.length; i++) {
+      setDeleteGroupProgress({ current: i + 1, total: ids.length });
+      try {
+        const res = await fetch(`/api/mf/holdings/${ids[i]}`, { method: "DELETE" });
+        if (res.ok) deletedIds.push(ids[i]);
+      } catch (err) {
+        console.error(`Failed to delete lot ${ids[i]}:`, err);
+      }
+    }
+
+    setHoldings((prev) => prev.filter((row) => !deletedIds.includes(row.id)));
+    setDeleteGroupConfirmKey(null);
+    setDeleteGroupProgress(null);
+    setDeleteGroupDeleting(false);
+    showToast(
+      deletedIds.length === ids.length
+        ? "All lots deleted"
+        : `Deleted ${deletedIds.length} of ${ids.length} lots`
+    );
+  };
+
+  const deleteGroupTarget = groupedHoldings.find((g) => g.key === deleteGroupConfirmKey) ?? null;
+
+  const periodLabel = PERIODS.find((p) => p.id === period)?.label ?? "1Y";
+  const returnKey = periodReturnKey(period);
+  const rankKey = periodRankKey(period);
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -546,125 +1101,122 @@ export default function DashboardClient({
               </div>
             </div>
 
-            <div className="mt-3 overflow-x-auto rounded-xl border border-slate-200 bg-white">
-              <table className="w-full text-left text-sm">
-                <thead>
-                  <tr className="border-b border-slate-200 text-xs text-slate-500">
-                    <th className="px-4 py-2 font-medium">Fund name</th>
-                    <th className="px-4 py-2 font-medium">Owner</th>
-                    <th className="px-4 py-2 font-medium">Category</th>
-                    <th className="px-4 py-2 font-medium">Invested ₹</th>
-                    <th className="px-4 py-2 font-medium">Current ₹</th>
-                    <th className="px-4 py-2 font-medium">P&L</th>
-                    <th className="px-4 py-2 font-medium">Units</th>
-                    <th className="px-4 py-2 font-medium">{PERIODS.find((p) => p.id === period)?.label} Return</th>
-                    <th className="px-4 py-2 font-medium">Peer rank</th>
-                    <th className="px-4 py-2 font-medium">NAV date</th>
-                    <th className="px-4 py-2 font-medium"></th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredHoldings.map((h) => {
-                    const rowPnlPct =
-                      h.invested_amount > 0 ? (h.pnl / h.invested_amount) * 100 : 0;
-                    const returnKey = periodReturnKey(period);
-                    const rankKey = periodRankKey(period);
-                    const returnValue = h.peer ? h.peer[returnKey] : null;
-                    const rankValue = h.peer ? h.peer[rankKey] : null;
-                    const peerCount = h.peer?.peer_count ?? null;
-                    const isEditing = editingId === h.id;
-                    const isSavedFlash = savedFlashId === h.id;
+            {deleteGroupTarget && (
+              <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3">
+                <p className="text-sm text-red-700">
+                  Delete all {deleteGroupTarget.lot_count} lots of{" "}
+                  <span className="font-semibold">{deleteGroupTarget.scheme_name}</span> totalling{" "}
+                  {formatInr(deleteGroupTarget.total_invested)}? This cannot be undone.
+                </p>
+                <div className="mt-2 flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleConfirmDeleteGroup(deleteGroupTarget)}
+                    disabled={deleteGroupDeleting}
+                    className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {deleteGroupDeleting && deleteGroupProgress
+                      ? `Deleting ${deleteGroupProgress.current} of ${deleteGroupProgress.total}...`
+                      : "Yes, delete all"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDeleteGroupConfirmKey(null)}
+                    disabled={deleteGroupDeleting}
+                    className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
 
-                    return (
-                      <tr
-                        key={h.id}
-                        className={`group border-b border-slate-100 last:border-0 transition-colors duration-700 ${
-                          isSavedFlash ? "bg-green-50" : ""
-                        }`}
-                      >
-                        <td className="px-4 py-3 text-slate-800">
-                          <Link
-                            href={`/fund/${h.scheme_code}`}
-                            className="hover:text-blue-600 hover:underline"
+            <div className="mt-3 overflow-x-auto rounded-xl border border-slate-200 bg-white">
+              <div className="min-w-[1320px]">
+                <div className={`${GRID_COLS} items-center border-b border-slate-200 px-4 py-2 text-xs text-slate-500`}>
+                  <span />
+                  <span className="font-medium">Fund name</span>
+                  <span className="font-medium">Owner</span>
+                  <span className="font-medium">Category</span>
+                  <span className="font-medium">Invested ₹</span>
+                  <span className="font-medium">Current ₹</span>
+                  <span className="font-medium">P&L</span>
+                  <span className="font-medium">Avg NAV</span>
+                  <span className="font-medium">Units</span>
+                  <span className="font-medium">{periodLabel} Return</span>
+                  <span className="font-medium">Peer rank</span>
+                  <span />
+                </div>
+
+                {groupedHoldings.map((group) => {
+                  const isExpanded = expandedGroups.has(group.key);
+                  const returnValue = group.peer ? group.peer[returnKey] : null;
+                  const rankValue = group.peer ? group.peer[rankKey] : null;
+                  const peerCount = group.peer?.peer_count ?? null;
+                  const groupPnlPct = group.pnl_pct;
+                  const sortedLots = [...group.lots].sort((a, b) =>
+                    a.as_on_date < b.as_on_date ? -1 : a.as_on_date > b.as_on_date ? 1 : 0
+                  );
+
+                  return (
+                    <div key={group.key} className="border-b border-slate-100 last:border-0">
+                      <div className={`${GRID_COLS} group items-center px-4 py-3 hover:bg-slate-50`}>
+                        <button
+                          type="button"
+                          onClick={() => toggleGroup(group.key)}
+                          aria-label={isExpanded ? "Collapse" : "Expand"}
+                          className="flex h-5 w-5 items-center justify-center rounded text-slate-400 transition hover:bg-slate-200 hover:text-slate-600"
+                        >
+                          <span
+                            className={`inline-block transition-transform duration-200 ${
+                              isExpanded ? "rotate-90" : "rotate-0"
+                            }`}
                           >
-                            {h.scheme_name}
-                          </Link>
-                        </td>
-                        <td className="px-4 py-3">
-                          {isEditing && editDraft ? (
-                            <div className="inline-flex rounded-md border border-slate-200 p-0.5">
-                              <button
-                                type="button"
-                                onClick={() => setEditDraft({ ...editDraft, owner: "praveen" })}
-                                className={`rounded px-2 py-0.5 text-xs font-semibold transition ${
-                                  editDraft.owner === "praveen"
-                                    ? "bg-blue-600 text-white"
-                                    : "text-slate-500 hover:bg-slate-100"
-                                }`}
-                              >
-                                P
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setEditDraft({ ...editDraft, owner: "geetha" })}
-                                className={`rounded px-2 py-0.5 text-xs font-semibold transition ${
-                                  editDraft.owner === "geetha"
-                                    ? "bg-amber-500 text-white"
-                                    : "text-slate-500 hover:bg-slate-100"
-                                }`}
-                              >
-                                G
-                              </button>
-                            </div>
-                          ) : (
-                            <span
-                              className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
-                                h.owner === "praveen"
-                                  ? "bg-blue-100 text-blue-700"
-                                  : "bg-amber-100 text-amber-700"
-                              }`}
+                            <ChevronIcon />
+                          </span>
+                        </button>
+
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => toggleGroup(group.key)}
+                            className="truncate text-left font-semibold text-slate-800 hover:text-blue-600"
+                            title={group.scheme_name}
+                          >
+                            {group.scheme_name}
+                          </button>
+                          {group.scheme_code && (
+                            <Link
+                              href={`/fund/${group.scheme_code}`}
+                              onClick={(e) => e.stopPropagation()}
+                              aria-label="View fund details"
+                              className="shrink-0 text-slate-300 hover:text-blue-600"
                             >
-                              {h.owner === "praveen" ? "P" : "G"}
+                              <ExternalLinkIcon />
+                            </Link>
+                          )}
+                          {group.lot_count > 1 && (
+                            <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
+                              {group.lot_count} lots
                             </span>
                           )}
-                        </td>
-                        <td className="px-4 py-3 text-slate-600">{h.category}</td>
-                        <td className="px-4 py-3 text-slate-800">
-                          {isEditing && editDraft ? (
-                            <input
-                              type="number"
-                              min="0"
-                              step="0.01"
-                              value={editDraft.invested_amount}
-                              onChange={(e) =>
-                                setEditDraft({ ...editDraft, invested_amount: e.target.value })
-                              }
-                              className="w-24 rounded border border-slate-300 px-2 py-1 text-sm"
-                            />
-                          ) : (
-                            formatInr(Number(h.invested_amount))
-                          )}
-                        </td>
-                        <td className="px-4 py-3 text-slate-800">
-                          {formatInr(Number(h.current_value))}
-                        </td>
-                        <td
-                          className={`px-4 py-3 font-medium ${
-                            h.pnl >= 0 ? "text-green-600" : "text-red-600"
-                          }`}
-                        >
-                          {h.pnl >= 0 ? "+" : "-"}
-                          {formatInr(Math.abs(h.pnl))} (
-                          {rowPnlPct >= 0 ? "+" : ""}
-                          {rowPnlPct.toFixed(2)}%)
-                        </td>
-                        <td className="px-4 py-3 text-slate-600">
-                          {Number(h.units).toLocaleString("en-IN", {
-                            maximumFractionDigits: 3,
-                          })}
-                        </td>
-                        <td
-                          className={`px-4 py-3 font-medium ${
+                        </div>
+
+                        <OwnerBadge owner={group.owner} />
+                        <span className="truncate text-slate-600">{group.category}</span>
+                        <span className="text-slate-800">{formatInr(group.total_invested)}</span>
+                        <span className="text-slate-800">{formatInr(group.current_value)}</span>
+                        <span className={`font-medium ${group.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
+                          {group.pnl >= 0 ? "+" : "-"}
+                          {formatInr(Math.abs(group.pnl))} ({groupPnlPct >= 0 ? "+" : ""}
+                          {groupPnlPct.toFixed(2)}%)
+                        </span>
+                        <span className="text-slate-600">₹{group.avg_nav.toFixed(4)}</span>
+                        <span className="text-slate-600">
+                          {group.total_units.toLocaleString("en-IN", { maximumFractionDigits: 3 })}
+                        </span>
+                        <span
+                          className={`font-medium ${
                             returnValue === null
                               ? "text-slate-400"
                               : returnValue >= 0
@@ -673,8 +1225,8 @@ export default function DashboardClient({
                           }`}
                         >
                           {formatPct(returnValue)}
-                        </td>
-                        <td className="px-4 py-3">
+                        </span>
+                        <span>
                           {rankValue && peerCount ? (
                             <span
                               className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold ${rankBadgeTone(
@@ -687,65 +1239,404 @@ export default function DashboardClient({
                           ) : (
                             <span className="text-slate-400">—</span>
                           )}
-                        </td>
-                        <td className="px-4 py-3 text-slate-600">
-                          {isEditing && editDraft ? (
-                            <input
-                              type="date"
-                              value={editDraft.as_on_date}
-                              max={new Date().toISOString().slice(0, 10)}
-                              onChange={(e) =>
-                                setEditDraft({ ...editDraft, as_on_date: e.target.value })
+                        </span>
+                        <div className="flex items-center justify-end gap-1 opacity-0 transition group-hover:opacity-100">
+                          <button
+                            type="button"
+                            onClick={() => handleEditGroup(group)}
+                            aria-label="Edit most recent lot"
+                            title="Edit most recent lot"
+                            className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                          >
+                            <PencilIcon />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenAddLot(group)}
+                            aria-label="Add lot"
+                            title="Add lot"
+                            className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-blue-600"
+                          >
+                            <PlusIcon />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setDeleteGroupConfirmKey(group.key)}
+                            aria-label="Delete all lots"
+                            title="Delete all lots"
+                            className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-red-50 hover:text-red-600"
+                          >
+                            <TrashIcon />
+                          </button>
+                        </div>
+                      </div>
+
+                      <div
+                        className="grid transition-[grid-template-rows] duration-200 ease-in-out"
+                        style={{ gridTemplateRows: isExpanded ? "1fr" : "0fr" }}
+                      >
+                        <div className="overflow-hidden">
+                          <div className="ml-4 border-l-2 border-slate-200 py-1 pl-4">
+                            {sortedLots.map((lot) => {
+                              const isEditingLot = editingId === lot.id;
+                              const isSavedFlash = savedFlashId === lot.id;
+                              const isDeleteConfirming = deleteLotConfirmId === lot.id;
+                              const lotPnlPct =
+                                lot.invested_amount > 0 ? (lot.pnl / lot.invested_amount) * 100 : 0;
+
+                              if (isDeleteConfirming) {
+                                return (
+                                  <div
+                                    key={lot.id}
+                                    className="my-1 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-red-50 px-3 py-2"
+                                  >
+                                    <p className="text-xs text-red-700">
+                                      Delete this lot ({formatInr(lot.invested_amount)} on{" "}
+                                      {formatDateDMY(lot.as_on_date)})?
+                                    </p>
+                                    <div className="flex items-center gap-2">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleConfirmDeleteLot(lot)}
+                                        disabled={deleteLotDeleting}
+                                        className="rounded-md bg-red-600 px-2 py-1 text-xs font-semibold text-white transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                      >
+                                        Yes, delete
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setDeleteLotConfirmId(null)}
+                                        disabled={deleteLotDeleting}
+                                        className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                      >
+                                        Cancel
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
                               }
-                              className="rounded border border-slate-300 px-2 py-1 text-sm"
-                            />
-                          ) : (
-                            h.nav_date ?? "—"
-                          )}
-                        </td>
-                        <td className="px-4 py-3">
-                          {isEditing ? (
-                            <div className="flex flex-col items-end gap-1">
-                              <div className="flex items-center gap-1.5">
-                                <button
-                                  type="button"
-                                  onClick={() => handleSaveEdit(h)}
-                                  disabled={editSaving}
-                                  aria-label="Save"
-                                  className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-600 text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+
+                              return (
+                                <div
+                                  key={lot.id}
+                                  className={`${GRID_COLS} items-center rounded py-2 pl-0 pr-2 text-sm transition-colors duration-700 ${
+                                    isSavedFlash ? "bg-green-50" : ""
+                                  }`}
                                 >
-                                  <CheckIcon />
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={handleCancelEdit}
-                                  disabled={editSaving}
-                                  aria-label="Cancel"
-                                  className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-200 text-slate-600 transition hover:bg-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
-                                >
-                                  <XIcon />
-                                </button>
+                                  <span />
+                                  <span className="truncate text-slate-500">
+                                    {isEditingLot && editDraft ? (
+                                      <input
+                                        type="date"
+                                        value={editDraft.as_on_date}
+                                        max={todayIso()}
+                                        onChange={(e) =>
+                                          setEditDraft({ ...editDraft, as_on_date: e.target.value })
+                                        }
+                                        className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+                                      />
+                                    ) : (
+                                      formatDateDMY(lot.as_on_date)
+                                    )}
+                                  </span>
+                                  <span>
+                                    {isEditingLot && editDraft ? (
+                                      <div className="inline-flex rounded-md border border-slate-200 p-0.5">
+                                        <button
+                                          type="button"
+                                          onClick={() => setEditDraft({ ...editDraft, owner: "praveen" })}
+                                          className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
+                                            editDraft.owner === "praveen"
+                                              ? "bg-blue-600 text-white"
+                                              : "text-slate-500 hover:bg-slate-100"
+                                          }`}
+                                        >
+                                          P
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => setEditDraft({ ...editDraft, owner: "geetha" })}
+                                          className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
+                                            editDraft.owner === "geetha"
+                                              ? "bg-amber-500 text-white"
+                                              : "text-slate-500 hover:bg-slate-100"
+                                          }`}
+                                        >
+                                          G
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <OwnerBadge owner={lot.owner} />
+                                    )}
+                                  </span>
+                                  <span className="text-slate-300">—</span>
+                                  <span className="text-slate-700">
+                                    {isEditingLot && editDraft ? (
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        step="0.01"
+                                        value={editDraft.invested_amount}
+                                        onChange={(e) =>
+                                          setEditDraft({ ...editDraft, invested_amount: e.target.value })
+                                        }
+                                        className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+                                      />
+                                    ) : (
+                                      formatInr(Number(lot.invested_amount))
+                                    )}
+                                  </span>
+                                  <span className="text-slate-700">{formatInr(Number(lot.current_value))}</span>
+                                  <span className={`font-medium ${lot.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
+                                    {lot.pnl >= 0 ? "+" : "-"}
+                                    {formatInr(Math.abs(lot.pnl))} ({lotPnlPct >= 0 ? "+" : ""}
+                                    {lotPnlPct.toFixed(2)}%)
+                                  </span>
+                                  <span className="text-slate-500">
+                                    {isEditingLot ? (
+                                      editNavLoading ? (
+                                        <span className="inline-block h-3 w-10 animate-pulse rounded bg-slate-200" />
+                                      ) : (
+                                        `₹${Number(editDraft?.avg_nav ?? lot.avg_nav).toFixed(4)}`
+                                      )
+                                    ) : (
+                                      `₹${Number(lot.avg_nav).toFixed(4)}`
+                                    )}
+                                  </span>
+                                  <span className="text-slate-500">
+                                    {isEditingLot ? (
+                                      editNavLoading ? (
+                                        <span className="inline-block h-3 w-10 animate-pulse rounded bg-slate-200" />
+                                      ) : (
+                                        Number(editDraft?.units ?? lot.units).toLocaleString("en-IN", {
+                                          maximumFractionDigits: 3,
+                                        })
+                                      )
+                                    ) : (
+                                      Number(lot.units).toLocaleString("en-IN", { maximumFractionDigits: 3 })
+                                    )}
+                                  </span>
+                                  <span className="text-slate-300">—</span>
+                                  <span className="text-slate-300">—</span>
+                                  <span className="flex items-center justify-end gap-1">
+                                    {isEditingLot ? (
+                                      <div className="flex flex-col items-end gap-1">
+                                        <div className="flex items-center gap-1">
+                                          <button
+                                            type="button"
+                                            onClick={() => handleSaveEdit(lot)}
+                                            disabled={editSaving || editNavLoading}
+                                            aria-label="Save"
+                                            className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-600 text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                          >
+                                            <CheckIcon />
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={handleCancelEdit}
+                                            disabled={editSaving}
+                                            aria-label="Cancel"
+                                            className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-200 text-slate-600 transition hover:bg-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
+                                          >
+                                            <XIcon />
+                                          </button>
+                                        </div>
+                                        {editError && (
+                                          <span className="text-[10px] font-medium text-red-600">{editError}</span>
+                                        )}
+                                      </div>
+                                    ) : (
+                                      <>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleStartEdit(lot)}
+                                          aria-label="Edit lot"
+                                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                                        >
+                                          <PencilIcon />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => setDeleteLotConfirmId(lot.id)}
+                                          aria-label="Delete lot"
+                                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-red-50 hover:text-red-600"
+                                        >
+                                          <TrashIcon />
+                                        </button>
+                                      </>
+                                    )}
+                                  </span>
+                                </div>
+                              );
+                            })}
+
+                            {addLotGroupKey === group.key && addLotDraft && (
+                              <div className="my-1 rounded-lg bg-blue-50 p-3">
+                                <div className="flex flex-wrap items-end gap-3">
+                                  <div>
+                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
+                                      Owner
+                                    </label>
+                                    <div className="inline-flex rounded-md border border-slate-200 bg-white p-0.5">
+                                      <button
+                                        type="button"
+                                        onClick={() => setAddLotDraft({ ...addLotDraft, owner: "praveen" })}
+                                        className={`rounded px-2 py-1 text-xs font-semibold transition ${
+                                          addLotDraft.owner === "praveen"
+                                            ? "bg-blue-600 text-white"
+                                            : "text-slate-500 hover:bg-slate-100"
+                                        }`}
+                                      >
+                                        P
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setAddLotDraft({ ...addLotDraft, owner: "geetha" })}
+                                        className={`rounded px-2 py-1 text-xs font-semibold transition ${
+                                          addLotDraft.owner === "geetha"
+                                            ? "bg-amber-500 text-white"
+                                            : "text-slate-500 hover:bg-slate-100"
+                                        }`}
+                                      >
+                                        G
+                                      </button>
+                                    </div>
+                                  </div>
+
+                                  <div>
+                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
+                                      Invested ₹
+                                    </label>
+                                    <input
+                                      type="number"
+                                      min="0"
+                                      step="0.01"
+                                      value={addLotDraft.invested_amount}
+                                      onChange={(e) =>
+                                        setAddLotDraft({ ...addLotDraft, invested_amount: e.target.value })
+                                      }
+                                      className="w-28 rounded border border-slate-300 px-2 py-1 text-xs"
+                                    />
+                                  </div>
+
+                                  <div>
+                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
+                                      As on date
+                                    </label>
+                                    <input
+                                      type="date"
+                                      value={addLotDraft.as_on_date}
+                                      max={todayIso()}
+                                      onChange={(e) =>
+                                        setAddLotDraft({ ...addLotDraft, as_on_date: e.target.value })
+                                      }
+                                      className="rounded border border-slate-300 px-2 py-1 text-xs"
+                                    />
+                                  </div>
+
+                                  <div>
+                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
+                                      Avg NAV (₹)
+                                    </label>
+                                    {addLotDraft.navLoading ? (
+                                      <div className="flex h-[30px] w-24 items-center rounded border border-slate-200 bg-slate-100 px-2">
+                                        <div className="h-3 w-12 animate-pulse rounded bg-slate-300" />
+                                      </div>
+                                    ) : addLotDraft.manualMode ? (
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        step="0.0001"
+                                        value={addLotDraft.avg_nav}
+                                        onChange={(e) =>
+                                          setAddLotDraft({ ...addLotDraft, avg_nav: e.target.value })
+                                        }
+                                        placeholder="Enter NAV"
+                                        className="w-24 rounded border border-slate-300 px-2 py-1 text-xs"
+                                      />
+                                    ) : (
+                                      <input
+                                        type="text"
+                                        readOnly
+                                        value={addLotDraft.avg_nav ? `₹${addLotDraft.avg_nav}` : ""}
+                                        placeholder="Auto-filled"
+                                        className="w-24 cursor-not-allowed rounded border border-slate-200 bg-slate-100 px-2 py-1 text-xs text-slate-600"
+                                      />
+                                    )}
+                                  </div>
+
+                                  <div>
+                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
+                                      Units
+                                    </label>
+                                    {addLotDraft.navLoading ? (
+                                      <div className="flex h-[30px] w-24 items-center rounded border border-slate-200 bg-slate-100 px-2">
+                                        <div className="h-3 w-12 animate-pulse rounded bg-slate-300" />
+                                      </div>
+                                    ) : addLotDraft.manualMode ? (
+                                      <input
+                                        type="number"
+                                        min="0"
+                                        step="0.0001"
+                                        value={addLotDraft.units}
+                                        onChange={(e) => setAddLotDraft({ ...addLotDraft, units: e.target.value })}
+                                        placeholder="Enter units"
+                                        className="w-24 rounded border border-slate-300 px-2 py-1 text-xs"
+                                      />
+                                    ) : (
+                                      <input
+                                        type="text"
+                                        readOnly
+                                        value={addLotDraft.units}
+                                        placeholder="Auto-calculated"
+                                        className="w-24 cursor-not-allowed rounded border border-slate-200 bg-slate-100 px-2 py-1 text-xs text-slate-600"
+                                      />
+                                    )}
+                                  </div>
+
+                                  {group.scheme_code && (
+                                    <button
+                                      type="button"
+                                      onClick={addLotDraft.manualMode ? switchAddLotToAutoFetch : switchAddLotToManual}
+                                      className="text-xs font-medium text-blue-600 hover:underline"
+                                    >
+                                      {addLotDraft.manualMode ? "Auto-fetch" : "Enter manually"}
+                                    </button>
+                                  )}
+
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSaveAddLot(group)}
+                                      disabled={addLotSaving || addLotDraft.navLoading}
+                                      className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                    >
+                                      {addLotSaving ? "Saving…" : "Save"}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={handleCancelAddLot}
+                                      disabled={addLotSaving}
+                                      className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                                    >
+                                      Cancel
+                                    </button>
+                                  </div>
+                                </div>
+                                {(addLotError || addLotDraft.navError) && (
+                                  <p className="mt-2 text-xs text-red-600">
+                                    {addLotError ?? addLotDraft.navError}
+                                  </p>
+                                )}
                               </div>
-                              {editError && (
-                                <span className="text-xs font-medium text-red-600">{editError}</span>
-                              )}
-                            </div>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => handleStartEdit(h)}
-                              aria-label="Edit"
-                              className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 opacity-0 transition hover:bg-slate-100 hover:text-slate-600 group-hover:opacity-100"
-                            >
-                              <PencilIcon />
-                            </button>
-                          )}
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
             </div>
           </>
         )}

@@ -142,6 +142,21 @@ export async function DELETE(
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
+    // RLS already scopes this to the caller's own rows, but double-check
+    // ownership explicitly before deleting rather than relying on it alone.
+    const { data: existing, error: fetchError } = await supabase
+      .from("mf_holdings")
+      .select("id, user_id")
+      .eq("id", params.id)
+      .maybeSingle();
+
+    if (fetchError) {
+      return NextResponse.json({ error: fetchError.message }, { status: 500 });
+    }
+    if (!existing || existing.user_id !== user.id) {
+      return NextResponse.json({ error: "Holding not found" }, { status: 404 });
+    }
+
     const { error } = await supabase
       .from("mf_holdings")
       .delete()
