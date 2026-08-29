@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { refreshNavCache } from "@/lib/mfapi";
+import { syncNewFund } from "@/lib/peers/tier3Sync";
+import { isRealSchemeCode } from "@/lib/peers/peerSync";
 
 export async function GET() {
   try {
@@ -204,6 +206,17 @@ export async function POST(request: Request) {
     if (cleanSchemeCode) {
       // Best-effort — don't fail the request if mfapi.in is unreachable.
       await refreshNavCache(cleanSchemeCode);
+
+      // Tier 3: fire-and-forget so the fund's peer rank is ready almost
+      // immediately instead of waiting for the next weekly/monthly sync.
+      // Don't await — if this doesn't finish before the function is torn
+      // down, the live fallback in GET /api/mf/peers/[scheme_code] computes
+      // and caches the same data the first time it's requested anyway.
+      if (isRealSchemeCode(cleanSchemeCode)) {
+        syncNewFund(cleanSchemeCode, category).catch((err) =>
+          console.error(`Tier3 syncNewFund failed for ${cleanSchemeCode}:`, err)
+        );
+      }
     }
 
     return NextResponse.json({ data }, { status: 201 });

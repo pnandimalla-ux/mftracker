@@ -1,17 +1,18 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/service";
-import { syncPeerData, calculateReturns, type NavHistoryEntry } from "@/lib/peers/peerSync";
+import { calculateReturns, type NavHistoryEntry } from "@/lib/peers/peerSync";
+import { syncTier1Category } from "@/lib/peers/tier1Sync";
+import { syncTier2Category } from "@/lib/peers/tier2Sync";
 import { CATEGORY_UNIVERSE } from "@/lib/peers/categoryUniverse";
 
-// Syncing all ~70 funds across 7 categories in one request can take minutes —
-// well past a typical serverless timeout. Each call here only processes ONE
-// category (~10-12 funds), so the frontend loops over categories sequentially
-// instead of asking the server to do it all in a single request.
+// A single category's tier1 sync is ~10-12 funds; tier2 is the same funds
+// plus category-stats rollup. Either fits well inside this budget — the
+// frontend still loops one category per request so progress is visible.
 export const maxDuration = 60;
 
 async function runTestMode(category: string) {
-  const schemeCode = CATEGORY_UNIVERSE[category][0];
+  const schemeCode = CATEGORY_UNIVERSE[category][0].code;
   console.log("Test mode — fetching scheme:", schemeCode);
 
   let mfapiResponseStatus: "SUCCESS" | "error" = "error";
@@ -96,6 +97,7 @@ export async function POST(request: Request) {
 
     const category = typeof body?.category === "string" ? body.category : undefined;
     const test = body?.test === true;
+    const tier = body?.tier === 2 ? 2 : 1;
 
     if (!category) {
       return NextResponse.json(
@@ -115,13 +117,13 @@ export async function POST(request: Request) {
       return NextResponse.json(debugInfo);
     }
 
-    const result = await syncPeerData(category);
+    const result = tier === 2 ? await syncTier2Category(category) : await syncTier1Category(category);
     const status = result.failed === 0 ? "success" : result.processed === 0 ? "failed" : "partial";
 
     try {
       const serviceClient = createServiceClient();
       await serviceClient.from("mf_sync_log").insert({
-        cron_name: `mf-peers-sync:${category}`,
+        cron_name: `mf-peers-sync:tier${tier}:${category}`,
         status,
         rows_updated: result.processed,
         error_message: result.errors.length > 0 ? result.errors.join("; ") : null,
@@ -131,7 +133,7 @@ export async function POST(request: Request) {
       console.error("Failed to write mf_sync_log entry:", logErr);
     }
 
-    return NextResponse.json({ category, status, ...result });
+    return NextResponse.json({ category, tier, status, ...result });
   } catch (err) {
     console.error("POST /api/mf/peers/sync failed:", err);
     return NextResponse.json(

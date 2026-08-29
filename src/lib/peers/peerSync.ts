@@ -1,12 +1,10 @@
 import { createServiceClient } from "@/lib/supabase/service";
-import { CATEGORY_UNIVERSE } from "./categoryUniverse";
 
-const MFAPI_DELAY_MS = 150;
 const MFAPI_TIMEOUT_MS = 5000;
 const MATCH_TOLERANCE_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-function sleep(ms: number) {
+export function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -115,19 +113,22 @@ export function calculateReturns(navHistory: NavHistoryEntry[]): PeriodReturns {
 // mfapi.in-backed real scheme codes are always plain numeric strings.
 // Manually-added holdings without a real code get a `manual-<timestamp>`
 // placeholder (see POST /api/mf/holdings) — those can never resolve here.
-function isRealSchemeCode(code: string): boolean {
+export function isRealSchemeCode(code: string): boolean {
   return /^\d+$/.test(code);
 }
 
-export interface FetchReturnsResult {
+export interface FetchedScheme {
   history: NavHistoryEntry[];
-  returns: PeriodReturns;
+  schemeName: string | null;
 }
 
-// Fetches a scheme's full NAV history from mfapi.in and calculates its
-// period returns. Throws on any failure (timeout, non-2xx, malformed body)
-// so callers can decide how to record/skip it.
-export async function fetchSchemeReturns(schemeCode: string): Promise<FetchReturnsResult> {
+// Fetches a scheme's full NAV history from mfapi.in. Throws on any failure
+// (timeout, non-2xx, malformed body) so callers can decide how to
+// record/skip it. Callers that only need ~5 years of history for return
+// calculations should slice the result (see tier1Sync's sliceToFiveYears)
+// before running calculateReturns, to avoid needlessly holding decades of
+// daily NAV entries in memory.
+export async function fetchSchemeHistory(schemeCode: string): Promise<FetchedScheme> {
   const res = await fetchWithTimeout(`https://api.mfapi.in/mf/${schemeCode}`);
   if (!res.ok) {
     throw new Error(`mfapi.in returned ${res.status}`);
@@ -144,110 +145,109 @@ export async function fetchSchemeReturns(schemeCode: string): Promise<FetchRetur
     throw new Error("mfapi.in response missing data array");
   }
 
-  const history: NavHistoryEntry[] = json.data;
-  const returns = calculateReturns(history);
-  return { history, returns };
+  return {
+    history: json.data,
+    schemeName: typeof json?.meta?.scheme_name === "string" ? json.meta.scheme_name : null,
+  };
 }
 
-export interface SyncPeerDataResult {
-  processed: number;
-  failed: number;
-  errors: string[];
+export interface FetchReturnsResult {
+  history: NavHistoryEntry[];
+  returns: PeriodReturns;
 }
 
-export async function syncPeerData(category: string): Promise<SyncPeerDataResult> {
-  console.log("Starting peer sync for category:", category);
+// Convenience wrapper for one-off single-fund lookups (e.g. the live
+// on-demand fallback in /api/mf/peers/[scheme_code]) that don't need the
+// 5-year slice a bulk tier1/tier2 sync applies before calculating.
+export async function fetchSchemeReturns(schemeCode: string): Promise<FetchReturnsResult> {
+  const { history } = await fetchSchemeHistory(schemeCode);
+  return { history, returns: calculateReturns(history) };
+}
 
-  const baseCodes = CATEGORY_UNIVERSE[category];
-  if (!baseCodes) {
-    console.error("Unknown category:", category);
-    return { processed: 0, failed: 0, errors: [`Unknown category: ${category}`] };
+// Ensures mf_peer_data has the tier/amc/fund_name columns and that
+// mf_category_stats exists, via the same lazy-once-per-warm-instance
+// exec_sql RPC pattern used for mf_nav_cache.nav_history (see src/lib/mfapi.ts).
+// See also src/lib/supabase/tier2-schema.sql for the same statements to run
+// by hand in the Supabase SQL editor.
+let ensurePeerSchemaPromise: Promise<void> | null = null;
+
+export function ensurePeerDataSchema(): Promise<void> {
+  if (!ensurePeerSchemaPromise) {
+    ensurePeerSchemaPromise = (async () => {
+      try {
+        const supabase = createServiceClient();
+        await supabase.rpc("exec_sql", {
+          sql: `
+            alter table mf_peer_data add column if not exists tier text default 'tier1';
+            alter table mf_peer_data add column if not exists amc text;
+            alter table mf_peer_data add column if not exists fund_name text;
+
+            create table if not exists mf_category_stats (
+              category text primary key,
+              avg_r6m numeric(8,2),
+              avg_r1y numeric(8,2),
+              avg_r3y numeric(8,2),
+              avg_r5y numeric(8,2),
+              best_fund_code text,
+              best_fund_name text,
+              best_fund_r1y numeric(8,2),
+              worst_fund_code text,
+              worst_fund_name text,
+              worst_fund_r1y numeric(8,2),
+              benchmark_r1y numeric(8,2),
+              category_vs_benchmark numeric(8,2),
+              trend text,
+              fund_count integer,
+              tier text default 'tier2',
+              updated_at timestamptz default now()
+            );
+            alter table mf_category_stats enable row level security;
+            drop policy if exists "Auth read category stats" on mf_category_stats;
+            create policy "Auth read category stats" on mf_category_stats for select using (auth.role() = 'authenticated');
+          `,
+        });
+      } catch (err) {
+        console.error("Failed to ensure mf_peer_data/mf_category_stats schema:", err);
+      }
+    })();
   }
+  return ensurePeerSchemaPromise;
+}
 
+interface PeerRankRow {
+  scheme_code: string;
+  r6m: number | null;
+  r1y: number | null;
+  r3y: number | null;
+  r5y: number | null;
+}
+
+function hasAnyReturn(row: PeerRankRow): boolean {
+  return row.r6m !== null || row.r1y !== null || row.r3y !== null || row.r5y !== null;
+}
+
+// Recalculates peer_rank_6m/1y/3y/5y and peer_count for every fund currently
+// in mf_peer_data under `category`, ranking against the FULL current set for
+// that category (not just whichever funds a particular sync pass touched) —
+// this keeps ranks consistent regardless of which tier last updated which
+// specific fund. Rank 1 = best (highest) return for that period.
+export async function recalculateCategoryRanks(category: string): Promise<{ errors: string[] }> {
   const supabase = createServiceClient();
+  const errors: string[] = [];
 
-  // Fold in any held funds whose category matches but whose scheme_code
-  // isn't in the hardcoded universe (e.g. a sectoral/thematic pick outside
-  // our curated list) — this is the "auto-add held funds" step, done here
-  // so the newly-added fund is ranked in the SAME pass as everyone else in
-  // its category, rather than left with a stale/orphaned rank.
-  const { data: heldRows, error: heldError } = await supabase
-    .from("mf_holdings")
-    .select("scheme_code")
+  const { data: rows, error } = await supabase
+    .from("mf_peer_data")
+    .select("scheme_code, r6m, r1y, r3y, r5y")
     .eq("category", category);
 
-  if (heldError) {
-    console.error("Failed to look up held funds for category:", category, heldError.message);
+  if (error) {
+    return { errors: [error.message] };
+  }
+  if (!rows || rows.length === 0) {
+    return { errors: [] };
   }
 
-  const heldCodes = (heldRows ?? [])
-    .map((r) => r.scheme_code as string)
-    .filter(isRealSchemeCode);
-
-  const schemeCodes = Array.from(new Set([...baseCodes, ...heldCodes]));
-  const addedFromHoldings = schemeCodes.length - baseCodes.length;
-  if (addedFromHoldings > 0) {
-    console.log(
-      `Auto-adding ${addedFromHoldings} held fund(s) not in the hardcoded universe for category:`,
-      category
-    );
-  }
-
-  let processed = 0;
-  let failed = 0;
-  const errors: string[] = [];
-  const computed: Array<{ scheme_code: string } & PeriodReturns> = [];
-
-  for (let i = 0; i < schemeCodes.length; i++) {
-    const schemeCode = schemeCodes[i];
-    console.log("Fetching scheme:", schemeCode);
-    try {
-      const { history, returns } = await fetchSchemeReturns(schemeCode);
-      console.log("NAV history length:", history.length, "for scheme:", schemeCode);
-      console.log("Calculated returns:", returns, "for scheme:", schemeCode);
-
-      computed.push({ scheme_code: schemeCode, ...returns });
-      processed++;
-    } catch (err) {
-      failed++;
-      const message = err instanceof Error ? err.message : String(err);
-      console.error("Failed scheme:", schemeCode, message);
-      errors.push(`${schemeCode}: ${message}`);
-    }
-
-    if (i < schemeCodes.length - 1) {
-      await sleep(MFAPI_DELAY_MS);
-    }
-  }
-
-  if (computed.length === 0) {
-    console.error("No schemes synced successfully for category:", category);
-    return { processed, failed, errors };
-  }
-
-  const now = new Date().toISOString();
-
-  console.log("Upserting to mf_peer_data:", computed.map((c) => c.scheme_code).join(", "));
-
-  const { error: upsertError } = await supabase.from("mf_peer_data").upsert(
-    computed.map((c) => ({
-      scheme_code: c.scheme_code,
-      category,
-      r6m: c.r6m,
-      r1y: c.r1y,
-      r3y: c.r3y,
-      r5y: c.r5y,
-      updated_at: now,
-    })),
-    { onConflict: "scheme_code" }
-  );
-
-  if (upsertError) {
-    console.error("Upsert to mf_peer_data failed:", upsertError.message);
-    errors.push(`Upsert failed: ${upsertError.message}`);
-    return { processed, failed, errors };
-  }
-
+  const peerCount = rows.filter(hasAnyReturn).length;
   const periods: Array<{ key: keyof PeriodReturns; rankCol: string }> = [
     { key: "r6m", rankCol: "peer_rank_6m" },
     { key: "r1y", rankCol: "peer_rank_1y" },
@@ -255,146 +255,33 @@ export async function syncPeerData(category: string): Promise<SyncPeerDataResult
     { key: "r5y", rankCol: "peer_rank_5y" },
   ];
 
-  const peerCount = computed.filter((c) =>
-    periods.some((p) => c[p.key] !== null)
-  ).length;
-
   const rankUpdates = new Map<string, Record<string, number | null>>();
-  for (const c of computed) {
-    rankUpdates.set(c.scheme_code, { peer_count: peerCount });
+  for (const row of rows as PeerRankRow[]) {
+    rankUpdates.set(row.scheme_code, { peer_count: peerCount });
   }
 
   for (const { key, rankCol } of periods) {
-    const ranked = computed
-      .filter((c) => c[key] !== null)
+    const ranked = (rows as PeerRankRow[])
+      .filter((r) => r[key] !== null)
       .sort((a, b) => (b[key] as number) - (a[key] as number));
 
-    ranked.forEach((c, idx) => {
-      const existing = rankUpdates.get(c.scheme_code) ?? {};
+    ranked.forEach((r, idx) => {
+      const existing = rankUpdates.get(r.scheme_code) ?? {};
       existing[rankCol] = idx + 1;
-      rankUpdates.set(c.scheme_code, existing);
+      rankUpdates.set(r.scheme_code, existing);
     });
   }
 
   for (const [schemeCode, updates] of Array.from(rankUpdates.entries())) {
-    const { error } = await supabase
+    const { error: updateError } = await supabase
       .from("mf_peer_data")
       .update(updates)
       .eq("scheme_code", schemeCode);
-    if (error) {
-      console.error("Rank update failed for", schemeCode, error.message);
-      errors.push(`Rank update failed for ${schemeCode}: ${error.message}`);
+    if (updateError) {
+      console.error("Rank update failed for", schemeCode, updateError.message);
+      errors.push(`Rank update failed for ${schemeCode}: ${updateError.message}`);
     }
   }
 
-  console.log(
-    `Finished peer sync for category: ${category} — processed=${processed} failed=${failed}`
-  );
-
-  return { processed, failed, errors };
-}
-
-export interface SyncAllPeerDataResult {
-  processed: number;
-  failed: number;
-  errors: string[];
-  byCategory: Record<string, SyncPeerDataResult>;
-}
-
-export async function syncAllPeerData(): Promise<SyncAllPeerDataResult> {
-  const categories = Object.keys(CATEGORY_UNIVERSE);
-  const byCategory: Record<string, SyncPeerDataResult> = {};
-
-  let processed = 0;
-  let failed = 0;
-  const errors: string[] = [];
-
-  for (const category of categories) {
-    const result = await syncPeerData(category);
-    byCategory[category] = result;
-    processed += result.processed;
-    failed += result.failed;
-    errors.push(...result.errors.map((e) => `[${category}] ${e}`));
-  }
-
-  return { processed, failed, errors, byCategory };
-}
-
-export interface AutoAddResult {
-  added: number;
-  failed: number;
-  errors: string[];
-}
-
-// Ensures every given (scheme_code, category) pair has at least a basic
-// returns row in mf_peer_data, fetching + computing for any that are
-// missing. Unlike syncPeerData, this does NOT touch peer_rank_*/peer_count
-// — those columns only make sense once a full syncPeerData() pass ranks the
-// whole category together, which happens separately (manual "Sync peers" or
-// the weekly cron). This just guarantees a held fund is never left with no
-// row at all, e.g. right after it's added and before the next full sync.
-export async function autoAddMissingPeerData(
-  holdings: { scheme_code: string; category: string }[]
-): Promise<AutoAddResult> {
-  let added = 0;
-  let failed = 0;
-  const errors: string[] = [];
-
-  const categoryByCode = new Map<string, string>();
-  for (const h of holdings) {
-    if (isRealSchemeCode(h.scheme_code) && h.category) {
-      categoryByCode.set(h.scheme_code, h.category);
-    }
-  }
-  const uniqueCodes = Array.from(categoryByCode.keys());
-  if (uniqueCodes.length === 0) {
-    return { added, failed, errors };
-  }
-
-  const supabase = createServiceClient();
-  const { data: existing, error: existingError } = await supabase
-    .from("mf_peer_data")
-    .select("scheme_code")
-    .in("scheme_code", uniqueCodes);
-
-  if (existingError) {
-    console.error("autoAddMissingPeerData: failed to check existing rows:", existingError.message);
-    return { added: 0, failed: 0, errors: [existingError.message] };
-  }
-
-  const existingSet = new Set((existing ?? []).map((r) => r.scheme_code as string));
-  const missingCodes = uniqueCodes.filter((code) => !existingSet.has(code));
-
-  for (let i = 0; i < missingCodes.length; i++) {
-    const schemeCode = missingCodes[i];
-    try {
-      const { returns } = await fetchSchemeReturns(schemeCode);
-      const { error } = await supabase.from("mf_peer_data").upsert(
-        {
-          scheme_code: schemeCode,
-          category: categoryByCode.get(schemeCode),
-          r6m: returns.r6m,
-          r1y: returns.r1y,
-          r3y: returns.r3y,
-          r5y: returns.r5y,
-          updated_at: new Date().toISOString(),
-        },
-        { onConflict: "scheme_code" }
-      );
-      if (error) throw new Error(error.message);
-      added++;
-      console.log("Auto-added held fund to mf_peer_data:", schemeCode);
-    } catch (err) {
-      failed++;
-      const message = err instanceof Error ? err.message : String(err);
-      console.error("Failed to auto-add held fund:", schemeCode, message);
-      errors.push(`${schemeCode}: ${message}`);
-    }
-
-    if (i < missingCodes.length - 1) {
-      await sleep(MFAPI_DELAY_MS);
-    }
-  }
-
-  return { added, failed, errors };
+  return { errors };
 }

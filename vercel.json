@@ -7,6 +7,10 @@
     {
       "path": "/api/cron/mf-weekly",
       "schedule": "0 1 * * 0"
+    },
+    {
+      "path": "/api/cron/mf-monthly",
+      "schedule": "0 2 1 * *"
     }
   ]
 }

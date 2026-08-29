@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/service";
-import { getCategoryForScheme } from "@/lib/peers/categoryUniverse";
+import { getCategoryForCode } from "@/lib/peers/categoryUniverse";
 import { fetchSchemeReturns, type PeriodReturns } from "@/lib/peers/peerSync";
 
 interface SchemeRow {
@@ -66,7 +66,7 @@ export async function GET(
     // fund is held), fall back to the user's own holding record — this is
     // what lets a fund outside the curated universe (e.g. a sectoral pick)
     // still get ranked against its real category instead of 404-ing.
-    let category = getCategoryForScheme(schemeCode);
+    let category = getCategoryForCode(schemeCode);
     if (!category) {
       const { data: holding } = await supabase
         .from("mf_holdings")

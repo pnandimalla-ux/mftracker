@@ -6,6 +6,7 @@ import AppHeader from "@/components/AppHeader";
 import { createClient } from "@/lib/supabase/client";
 import type { EnrichedMFHolding, MFHolding, Owner } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
+import { ALL_CATEGORIES } from "@/lib/peers/categoryUniverse";
 
 type OwnerFilter = "family" | "praveen" | "geetha";
 type Period = "6m" | "1y" | "3y" | "5y";
@@ -346,7 +347,9 @@ function PeerSyncPanel({
   current,
   syncing,
   done,
+  tier,
   clearing,
+  categoryStatsSummary,
   onRetryFailed,
   onClearAndResync,
   onDismiss,
@@ -355,7 +358,9 @@ function PeerSyncPanel({
   current: string | null;
   syncing: boolean;
   done: boolean;
+  tier: 1 | 2;
   clearing: boolean;
+  categoryStatsSummary: { category: string; avg_r3y: number | null }[] | null;
   onRetryFailed: () => void;
   onClearAndResync: () => void;
   onDismiss: () => void;
@@ -371,7 +376,9 @@ function PeerSyncPanel({
   return (
     <div className="rounded-lg border border-slate-200 bg-white p-4">
       <div className="flex items-center justify-between">
-        <p className="text-sm font-semibold text-slate-800">Syncing peer data</p>
+        <p className="text-sm font-semibold text-slate-800">
+          {tier === 2 ? "Full sync — all categories" : "Quick sync — your categories"}
+        </p>
         {!syncing && (
           <button
             type="button"
@@ -382,6 +389,12 @@ function PeerSyncPanel({
           </button>
         )}
       </div>
+
+      {tier === 2 && (
+        <p className="mt-1 text-xs text-slate-500">
+          Full sync updates AI recommendation data for all fund categories
+        </p>
+      )}
 
       {total > 0 && (
         <>
@@ -399,7 +412,7 @@ function PeerSyncPanel({
 
           <p className="mt-2 text-xs text-slate-500">
             {syncing && current
-              ? `Currently syncing: ${current}...`
+              ? `Syncing ${current}... (${completed}/${total})`
               : done
                 ? hasFailures
                   ? "Sync finished with some failures."
@@ -424,6 +437,17 @@ function PeerSyncPanel({
             >
               Retry failed
             </button>
+          )}
+
+          {!syncing && done && categoryStatsSummary && categoryStatsSummary.length > 0 && (
+            <div className="mt-3 rounded-md bg-blue-50 px-3 py-2">
+              <p className="text-xs font-semibold text-slate-700">Category performance (3Y CAGR):</p>
+              <p className="mt-1 text-xs text-slate-600">
+                {categoryStatsSummary
+                  .map((c) => `${c.category}: ${c.avg_r3y !== null ? `${c.avg_r3y >= 0 ? "+" : ""}${c.avg_r3y.toFixed(1)}%` : "—"}`)
+                  .join(" | ")}
+              </p>
+            </div>
           )}
         </>
       )}
@@ -455,12 +479,17 @@ export default function DashboardClient({
   const [lastSynced, setLastSynced] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
 
+  const [peerSyncMenuOpen, setPeerSyncMenuOpen] = useState(false);
   const [peerSyncPanelOpen, setPeerSyncPanelOpen] = useState(false);
   const [peerSyncing, setPeerSyncing] = useState(false);
   const [peerSyncDone, setPeerSyncDone] = useState(false);
+  const [peerSyncTier, setPeerSyncTier] = useState<1 | 2>(1);
   const [peerSyncCurrent, setPeerSyncCurrent] = useState<string | null>(null);
   const [peerCategoryStatus, setPeerCategoryStatus] = useState<Record<string, CategorySyncStatus>>({});
   const [peerClearing, setPeerClearing] = useState(false);
+  const [categoryStatsSummary, setCategoryStatsSummary] = useState<
+    { category: string; avg_r3y: number | null }[] | null
+  >(null);
 
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
@@ -677,16 +706,16 @@ export default function DashboardClient({
     }
   };
 
-  // Syncs one category, updating its status in peerCategoryStatus as it goes.
-  // Returns true on success so callers can decide what to do next.
-  const syncOneCategory = async (category: string): Promise<boolean> => {
+  // Syncs one category at the given tier, updating its status in
+  // peerCategoryStatus as it goes. Returns true on success.
+  const syncOneCategory = async (category: string, tier: 1 | 2): Promise<boolean> => {
     setPeerSyncCurrent(category);
     setPeerCategoryStatus((prev) => ({ ...prev, [category]: "in-progress" }));
     try {
       const res = await fetch("/api/mf/peers/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ category }),
+        body: JSON.stringify({ category, tier }),
       });
       const json = await res.json();
       if (!res.ok || !json.processed) {
@@ -701,13 +730,31 @@ export default function DashboardClient({
     }
   };
 
-  const runPeerSync = async (categories: string[]) => {
+  const fetchCategoryStatsSummary = async () => {
+    try {
+      const res = await fetch("/api/mf/peers/category-stats");
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Failed to load category stats");
+      const rows: { category: string; avg_r3y: number | null }[] = Array.isArray(json.data)
+        ? json.data.map((r: { category: string; avg_r3y: number | null }) => ({
+            category: r.category,
+            avg_r3y: r.avg_r3y,
+          }))
+        : [];
+      setCategoryStatsSummary(rows);
+    } catch (err) {
+      console.error("Failed to load category stats summary:", err);
+    }
+  };
+
+  const runPeerSync = async (categories: string[], tier: 1 | 2) => {
     setPeerSyncing(true);
     setPeerSyncDone(false);
+    setPeerSyncTier(tier);
     setPeerSyncPanelOpen(true);
 
     for (let i = 0; i < categories.length; i++) {
-      await syncOneCategory(categories[i]);
+      await syncOneCategory(categories[i], tier);
       // Pause between categories to be gentle on mfapi.in — skip after the last one.
       if (i < categories.length - 1) {
         await new Promise((resolve) => setTimeout(resolve, 2000));
@@ -717,36 +764,56 @@ export default function DashboardClient({
     setPeerSyncCurrent(null);
     setPeerSyncing(false);
     setPeerSyncDone(true);
-    showToast("All categories synced!");
+    showToast(tier === 2 ? "Full sync complete!" : "Quick sync complete!");
+
+    if (tier === 2) {
+      await fetchCategoryStatsSummary();
+    }
+
     setTimeout(() => {
       loadHoldings();
     }, 1000);
   };
 
-  const handleStartPeerSync = async () => {
+  // Tier 1 "Quick sync" — only the categories the user actually holds funds
+  // in, derived straight from already-loaded holdings (no extra API call).
+  const handleQuickSync = async () => {
+    setPeerSyncMenuOpen(false);
     setPeerSyncPanelOpen(true);
     setPeerSyncDone(false);
-    setPeerCategoryStatus({});
-    setPeerSyncCurrent(null);
+    setCategoryStatsSummary(null);
 
-    try {
-      const seedRes = await fetch("/api/mf/peers/seed", { method: "POST" });
-      const seedJson = await seedRes.json();
-      if (!seedRes.ok) throw new Error(seedJson.error ?? "Failed to start peer sync");
-
-      const categories: string[] = Array.isArray(seedJson.categories) ? seedJson.categories : [];
-      const initialStatus: Record<string, CategorySyncStatus> = {};
-      categories.forEach((c) => {
-        initialStatus[c] = "pending";
-      });
-      setPeerCategoryStatus(initialStatus);
-
-      await runPeerSync(categories);
-    } catch (err) {
-      console.error("Peer sync failed:", err);
-      showToast(err instanceof Error ? err.message : "Peer data sync failed");
-      setPeerSyncing(false);
+    const categories = Array.from(new Set(holdings.map((h) => h.category).filter(Boolean)));
+    if (categories.length === 0) {
+      showToast("No held categories to sync yet");
+      setPeerSyncPanelOpen(false);
+      return;
     }
+
+    const initialStatus: Record<string, CategorySyncStatus> = {};
+    categories.forEach((c) => {
+      initialStatus[c] = "pending";
+    });
+    setPeerCategoryStatus(initialStatus);
+
+    await runPeerSync(categories, 1);
+  };
+
+  // Tier 2 "Full sync" — every category in the universe, for the AI
+  // recommendation engine's cross-category intelligence.
+  const handleFullSync = async () => {
+    setPeerSyncMenuOpen(false);
+    setPeerSyncPanelOpen(true);
+    setPeerSyncDone(false);
+    setCategoryStatsSummary(null);
+
+    const initialStatus: Record<string, CategorySyncStatus> = {};
+    ALL_CATEGORIES.forEach((c) => {
+      initialStatus[c] = "pending";
+    });
+    setPeerCategoryStatus(initialStatus);
+
+    await runPeerSync(ALL_CATEGORIES, 2);
   };
 
   const handleRetryFailed = async () => {
@@ -754,7 +821,7 @@ export default function DashboardClient({
       .filter(([, status]) => status === "failed")
       .map(([category]) => category);
     if (failedCategories.length === 0) return;
-    await runPeerSync(failedCategories);
+    await runPeerSync(failedCategories, peerSyncTier);
   };
 
   const handleClearAndResync = async () => {
@@ -770,7 +837,11 @@ export default function DashboardClient({
     } finally {
       setPeerClearing(false);
     }
-    await handleStartPeerSync();
+    if (peerSyncTier === 2) {
+      await handleFullSync();
+    } else {
+      await handleQuickSync();
+    }
   };
 
   const toggleGroup = (key: string) => {
@@ -1234,16 +1305,45 @@ export default function DashboardClient({
                 )}
                 {syncingNav ? "Syncing..." : "Sync NAV"}
               </button>
-              <button
-                onClick={handleStartPeerSync}
-                disabled={peerSyncing}
-                className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
-              >
-                {peerSyncing && (
-                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
+              <div className="relative">
+                <button
+                  onClick={() => setPeerSyncMenuOpen((prev) => !prev)}
+                  disabled={peerSyncing}
+                  className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {peerSyncing && (
+                    <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
+                  )}
+                  {peerSyncing ? "Syncing..." : "Sync peers"}
+                </button>
+
+                {peerSyncMenuOpen && !peerSyncing && (
+                  <>
+                    <div
+                      className="fixed inset-0 z-10"
+                      onClick={() => setPeerSyncMenuOpen(false)}
+                    />
+                    <div className="absolute right-0 z-20 mt-1 w-56 rounded-lg border border-slate-200 bg-white py-1 shadow-lg">
+                      <button
+                        type="button"
+                        onClick={handleQuickSync}
+                        className="flex w-full flex-col items-start px-3 py-2 text-left hover:bg-slate-50"
+                      >
+                        <span className="text-sm font-medium text-slate-800">⚡ Quick sync</span>
+                        <span className="text-xs text-slate-400">Held categories only (~30 seconds)</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleFullSync}
+                        className="flex w-full flex-col items-start px-3 py-2 text-left hover:bg-slate-50"
+                      >
+                        <span className="text-sm font-medium text-slate-800">🔄 Full sync</span>
+                        <span className="text-xs text-slate-400">All categories for AI (~3 minutes)</span>
+                      </button>
+                    </div>
+                  </>
                 )}
-                {peerSyncing ? "Syncing..." : "Sync peers"}
-              </button>
+              </div>
             </div>
             <p className="mt-1 text-xs text-slate-400">
               Last synced: {lastSynced ? new Date(lastSynced).toLocaleString("en-IN") : "—"}
@@ -1259,7 +1359,9 @@ export default function DashboardClient({
                 current={peerSyncCurrent}
                 syncing={peerSyncing}
                 done={peerSyncDone}
+                tier={peerSyncTier}
                 clearing={peerClearing}
+                categoryStatsSummary={categoryStatsSummary}
                 onRetryFailed={handleRetryFailed}
                 onClearAndResync={handleClearAndResync}
                 onDismiss={() => setPeerSyncPanelOpen(false)}

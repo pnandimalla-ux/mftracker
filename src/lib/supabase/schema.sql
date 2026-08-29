@@ -63,9 +63,40 @@ create table if not exists mf_peer_data (
   peer_count integer,
   updated_at timestamptz default now()
 );
+-- tier: which sync produced this row — 'tier1' (weekly, held categories),
+-- 'tier2' (monthly, all categories), or 'tier3' (on-demand, new holding).
+alter table mf_peer_data add column if not exists tier text default 'tier1';
+alter table mf_peer_data add column if not exists amc text;
+alter table mf_peer_data add column if not exists fund_name text;
 alter table mf_peer_data enable row level security;
 drop policy if exists "Authenticated users read peers" on mf_peer_data;
 create policy "Authenticated users read peers" on mf_peer_data for select using (auth.role() = 'authenticated');
+
+-- ============================================================
+-- TABLE 3b: mf_category_stats (tier 2 — cross-category AI intelligence)
+-- ============================================================
+create table if not exists mf_category_stats (
+  category text primary key,
+  avg_r6m numeric(8,2),
+  avg_r1y numeric(8,2),
+  avg_r3y numeric(8,2),
+  avg_r5y numeric(8,2),
+  best_fund_code text,
+  best_fund_name text,
+  best_fund_r1y numeric(8,2),
+  worst_fund_code text,
+  worst_fund_name text,
+  worst_fund_r1y numeric(8,2),
+  benchmark_r1y numeric(8,2),
+  category_vs_benchmark numeric(8,2),
+  trend text,
+  fund_count integer,
+  tier text default 'tier2',
+  updated_at timestamptz default now()
+);
+alter table mf_category_stats enable row level security;
+drop policy if exists "Auth read category stats" on mf_category_stats;
+create policy "Auth read category stats" on mf_category_stats for select using (auth.role() = 'authenticated');
 
 -- ============================================================
 -- TABLE 4: mf_fund_holdings

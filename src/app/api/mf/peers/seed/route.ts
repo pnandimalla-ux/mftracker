@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { CATEGORY_UNIVERSE } from "@/lib/peers/categoryUniverse";
+import { ALL_CATEGORIES } from "@/lib/peers/categoryUniverse";
 
 // This route does NOT run the sync itself — syncing all ~70 funds across 7
 // categories in one request takes minutes, far past a serverless timeout.
@@ -22,7 +22,7 @@ export async function POST() {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const categories = Object.keys(CATEGORY_UNIVERSE);
+    const categories = ALL_CATEGORIES;
     console.log("POST /api/mf/peers/seed — categories to sync:", categories);
 
     return NextResponse.json({
