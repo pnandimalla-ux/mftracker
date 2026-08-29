@@ -34,6 +34,12 @@ create table if not exists mf_nav_cache (
   nav_date date,
   fetched_at timestamptz default now()
 );
+-- Cache of each scheme's full NAV history (from mfapi.in), so looking up an
+-- older date's NAV doesn't re-download years of data every time. Refreshed
+-- on a 24h TTL — see nav_history_fetched_at, checked separately from the
+-- latest-NAV fetched_at column above.
+alter table mf_nav_cache add column if not exists nav_history jsonb;
+alter table mf_nav_cache add column if not exists nav_history_fetched_at timestamptz;
 alter table mf_nav_cache enable row level security;
 drop policy if exists "Authenticated users read nav" on mf_nav_cache;
 create policy "Authenticated users read nav" on mf_nav_cache for select using (auth.role() = 'authenticated');

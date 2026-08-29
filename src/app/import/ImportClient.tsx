@@ -41,6 +41,16 @@ interface SchemeSearchResult {
   schemeName: string;
 }
 
+function todayIso() {
+  return new Date().toISOString().split("T")[0];
+}
+
+function daysAgoIso(days: number) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return d.toISOString().split("T")[0];
+}
+
 interface PreviewRow extends ParsedHolding {
   key: string;
   selected: boolean;
@@ -123,20 +133,24 @@ export default function ImportClient({
   const [mUnits, setMUnits] = useState("");
   const [mAvgNav, setMAvgNav] = useState("");
   const [mInvested, setMInvested] = useState("");
-  const [mAsOnDate, setMAsOnDate] = useState(() =>
-    new Date().toISOString().slice(0, 10)
-  );
+  const [mAsOnDate, setMAsOnDate] = useState(() => daysAgoIso(30));
   const [mDateTouched, setMDateTouched] = useState(false);
+  const [mDateError, setMDateError] = useState<string | null>(null);
   const [mNavLoading, setMNavLoading] = useState(false);
   const [mNavError, setMNavError] = useState<string | null>(null);
+  const [mNavExhausted, setMNavExhausted] = useState(false);
+  const [mNavSlow, setMNavSlow] = useState(false);
+  const [mManualMode, setMManualMode] = useState(false);
   const [mSearchResults, setMSearchResults] = useState<SchemeSearchResult[]>([]);
   const [mSearching, setMSearching] = useState(false);
   const [mSaving, setMSaving] = useState(false);
   const [mError, setMError] = useState<string | null>(null);
   const [mToast, setMToast] = useState(false);
 
-  // Units are always derived from invested amount ÷ auto-fetched NAV.
+  // Units are always derived from invested amount ÷ NAV — unless the user has
+  // switched to manual entry, in which case they type both directly.
   useEffect(() => {
+    if (mManualMode) return;
     const amt = Number(mInvested);
     const nav = Number(mAvgNav);
     if (Number.isFinite(amt) && amt > 0 && Number.isFinite(nav) && nav > 0) {
@@ -144,12 +158,19 @@ export default function ImportClient({
     } else {
       setMUnits("");
     }
-  }, [mInvested, mAvgNav]);
+  }, [mInvested, mAvgNav, mManualMode]);
 
   // Whenever both a fund and a date are picked, auto-fetch the NAV for that
-  // date, retrying prior trading days when the market was closed.
+  // date, retrying prior trading days when the market was closed. Skipped
+  // entirely while the user has switched to manual NAV/units entry.
   useEffect(() => {
+    if (mManualMode) return;
     if (!mSchemeCode || !mAsOnDate) {
+      setMNavError(null);
+      return;
+    }
+    if (mAsOnDate > todayIso()) {
+      // Invalid (future) date — handled by the inline date error instead.
       setMNavError(null);
       return;
     }
@@ -165,7 +186,13 @@ export default function ImportClient({
     const run = async () => {
       setMNavLoading(true);
       setMNavError(null);
+      setMNavExhausted(false);
+      setMNavSlow(false);
       setMAvgNav("");
+
+      const slowTimer = setTimeout(() => {
+        if (!cancelled) setMNavSlow(true);
+      }, 5000);
 
       for (let attempt = 0; attempt < 5 && !cancelled; attempt++) {
         const tryDate = shiftDate(mAsOnDate, -attempt);
@@ -179,7 +206,9 @@ export default function ImportClient({
                 setMAvgNav(String(nav));
                 setMNavError(null);
                 setMNavLoading(false);
+                setMNavSlow(false);
               }
+              clearTimeout(slowTimer);
               return;
             }
           }
@@ -193,11 +222,14 @@ export default function ImportClient({
         }
       }
 
+      clearTimeout(slowTimer);
       if (!cancelled) {
         setMNavError(
-          "Could not fetch NAV for this fund near this date. Please try a different date."
+          `NAV not available for ${mAsOnDate}. Try a nearby date or enter manually.`
         );
+        setMNavExhausted(true);
         setMNavLoading(false);
+        setMNavSlow(false);
       }
     };
 
@@ -206,7 +238,7 @@ export default function ImportClient({
     return () => {
       cancelled = true;
     };
-  }, [mSchemeCode, mAsOnDate]);
+  }, [mSchemeCode, mAsOnDate, mManualMode]);
 
   // --- CAS upload handlers ---
 
@@ -371,11 +403,38 @@ export default function ImportClient({
     setMUnits("");
     setMAvgNav("");
     setMInvested("");
-    setMAsOnDate(new Date().toISOString().slice(0, 10));
+    setMAsOnDate(daysAgoIso(30));
     setMDateTouched(false);
+    setMDateError(null);
     setMNavError(null);
+    setMNavExhausted(false);
+    setMNavSlow(false);
     setMNavLoading(false);
+    setMManualMode(false);
     setMSearchResults([]);
+  };
+
+  const handleDateChange = (value: string) => {
+    setMAsOnDate(value);
+    setMDateTouched(true);
+    setMDateError(value > todayIso() ? "Purchase date cannot be in the future" : null);
+  };
+
+  const switchToManual = () => {
+    setMManualMode(true);
+    setMNavLoading(false);
+    setMNavSlow(false);
+    setMNavError(null);
+    setMNavExhausted(false);
+  };
+
+  const switchToAutoFetch = () => {
+    setMAvgNav("");
+    setMUnits("");
+    setMNavError(null);
+    setMNavExhausted(false);
+    setMNavSlow(false);
+    setMManualMode(false);
   };
 
   const handleAddFundManually = async (e: FormEvent<HTMLFormElement>) => {
@@ -408,6 +467,10 @@ export default function ImportClient({
     }
     if (!mAsOnDate) {
       setMError("As on date is required.");
+      return;
+    }
+    if (mAsOnDate > todayIso()) {
+      setMError("Purchase date cannot be in the future.");
       return;
     }
 
@@ -727,13 +790,17 @@ export default function ImportClient({
                   <input
                     type="date"
                     value={mAsOnDate}
-                    onChange={(e) => {
-                      setMAsOnDate(e.target.value);
-                      setMDateTouched(true);
-                    }}
+                    max={todayIso()}
+                    onChange={(e) => handleDateChange(e.target.value)}
                     className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                   />
-                  {mSchemeCode ? (
+                  {mDateError ? (
+                    <p className="mt-1 text-xs text-red-600">{mDateError}</p>
+                  ) : mManualMode ? (
+                    <p className="mt-1 text-xs text-slate-400">
+                      Manual entry — NAV won&apos;t be re-fetched
+                    </p>
+                  ) : mSchemeCode ? (
                     <p className="mt-1 text-xs text-slate-400">
                       NAV will be auto-fetched for the selected date
                     </p>
@@ -748,45 +815,116 @@ export default function ImportClient({
 
                 <div>
                   <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-700">
-                    <span aria-hidden="true">🔒</span> Avg NAV (₹)
+                    {!mManualMode && <span aria-hidden="true">🔒</span>} Avg NAV (₹)
                   </label>
                   <div className="relative">
-                    <input
-                      type="text"
-                      readOnly
-                      value={
-                        mNavLoading
-                          ? "Fetching…"
-                          : mAvgNav
-                            ? `₹${mAvgNav}`
-                            : ""
-                      }
-                      placeholder="Auto-filled"
-                      className="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-sm text-slate-600"
-                    />
-                    {mNavLoading && (
-                      <span
-                        className="absolute right-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 animate-spin rounded-full border-2 border-slate-300 border-t-blue-600"
-                        aria-hidden="true"
+                    {mNavLoading ? (
+                      <div className="flex h-[38px] w-full items-center rounded-lg border border-slate-200 bg-slate-100 px-3">
+                        <div className="h-3.5 w-16 animate-pulse rounded bg-slate-300" />
+                      </div>
+                    ) : mManualMode ? (
+                      <input
+                        type="number"
+                        step="0.0001"
+                        min={0}
+                        value={mAvgNav}
+                        onChange={(e) => setMAvgNav(e.target.value)}
+                        placeholder="Enter NAV"
+                        className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                      />
+                    ) : (
+                      <input
+                        type="text"
+                        readOnly
+                        value={mAvgNav ? `₹${mAvgNav}` : ""}
+                        placeholder="Auto-filled"
+                        className="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-sm text-slate-600"
                       />
                     )}
                   </div>
-                  {mNavError && (
-                    <p className="mt-1 text-xs text-amber-600">{mNavError}</p>
+
+                  {mManualMode ? (
+                    <button
+                      type="button"
+                      onClick={switchToAutoFetch}
+                      className="mt-1 text-xs font-medium text-blue-600 hover:underline"
+                    >
+                      Auto-fetch
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={switchToManual}
+                      className="mt-1 text-xs font-medium text-blue-600 hover:underline"
+                    >
+                      Enter manually
+                    </button>
+                  )}
+
+                  {mNavSlow && mNavLoading && (
+                    <div className="mt-1.5 rounded-lg bg-amber-50 px-2 py-1.5">
+                      <p className="text-xs text-amber-700">
+                        Taking longer than usual… you can enter NAV manually below
+                      </p>
+                      <button
+                        type="button"
+                        onClick={switchToManual}
+                        className="mt-1 text-xs font-semibold text-blue-600 hover:underline"
+                      >
+                        Enter manually
+                      </button>
+                    </div>
+                  )}
+
+                  {mNavError && !mManualMode && (
+                    <div
+                      className={`mt-1.5 flex items-center justify-between gap-2 rounded-lg px-2 py-1.5 ${
+                        mNavExhausted ? "bg-red-50" : ""
+                      }`}
+                    >
+                      <p className={`text-xs ${mNavExhausted ? "text-red-600" : "text-amber-600"}`}>
+                        {mNavError}
+                      </p>
+                      {mNavExhausted && (
+                        <button
+                          type="button"
+                          onClick={switchToManual}
+                          className="shrink-0 text-xs font-semibold text-blue-600 hover:underline"
+                        >
+                          Enter manually
+                        </button>
+                      )}
+                    </div>
                   )}
                 </div>
 
                 <div>
                   <label className="mb-1 flex items-center gap-1 text-xs font-medium text-slate-700">
-                    <span aria-hidden="true">🔒</span> Units
+                    {!mManualMode && <span aria-hidden="true">🔒</span>} Units
                   </label>
-                  <input
-                    type="text"
-                    readOnly
-                    value={mUnits}
-                    placeholder="Auto-calculated"
-                    className="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-sm text-slate-600"
-                  />
+                  {mNavLoading ? (
+                    <div className="flex h-[38px] w-full items-center rounded-lg border border-slate-200 bg-slate-100 px-3">
+                      <div className="h-3.5 w-16 animate-pulse rounded bg-slate-300" />
+                    </div>
+                  ) : mManualMode ? (
+                    <input
+                      type="number"
+                      step="0.0001"
+                      min={0}
+                      value={mUnits}
+                      onChange={(e) => setMUnits(e.target.value)}
+                      placeholder="Enter units"
+                      className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                  ) : (
+                    <input
+                      type="text"
+                      readOnly
+                      value={mUnits}
+                      placeholder="Auto-calculated"
+                      className="w-full cursor-not-allowed rounded-lg border border-slate-200 bg-slate-100 px-3 py-2 text-sm text-slate-600"
+                    />
+                  )}
                 </div>
               </div>
 
@@ -798,7 +936,7 @@ export default function ImportClient({
 
               <button
                 type="submit"
-                disabled={mSaving || mNavLoading}
+                disabled={mSaving || mNavLoading || !!mDateError}
                 className="w-full rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
                 {mSaving ? "Adding…" : mNavLoading ? "Fetching NAV…" : "Add Fund"}

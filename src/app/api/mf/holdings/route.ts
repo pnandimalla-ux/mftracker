@@ -149,6 +149,32 @@ export async function POST(request: Request) {
       );
     }
 
+    let cleanAsOnDate = new Date().toISOString().slice(0, 10);
+    if (as_on_date !== undefined) {
+      if (typeof as_on_date !== "string" || !as_on_date) {
+        return NextResponse.json(
+          { error: "as_on_date must be a valid date string" },
+          { status: 400 }
+        );
+      }
+      const parsedDate = new Date(as_on_date);
+      if (Number.isNaN(parsedDate.getTime())) {
+        return NextResponse.json(
+          { error: "as_on_date must be a valid date" },
+          { status: 400 }
+        );
+      }
+      const today = new Date();
+      today.setHours(23, 59, 59, 999);
+      if (parsedDate.getTime() > today.getTime()) {
+        return NextResponse.json(
+          { error: "as_on_date cannot be in the future" },
+          { status: 400 }
+        );
+      }
+      cleanAsOnDate = as_on_date;
+    }
+
     const cleanSchemeCode =
       typeof scheme_code === "string" && scheme_code.trim()
         ? scheme_code.trim()
@@ -166,10 +192,7 @@ export async function POST(request: Request) {
         units,
         avg_nav,
         invested_amount,
-        as_on_date:
-          typeof as_on_date === "string" && as_on_date
-            ? as_on_date
-            : new Date().toISOString().slice(0, 10),
+        as_on_date: cleanAsOnDate,
       })
       .select()
       .single();
