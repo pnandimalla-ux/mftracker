@@ -7,6 +7,7 @@ import { createClient } from "@/lib/supabase/client";
 import type { EnrichedMFHolding, MFHolding, Owner } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import { ALL_CATEGORIES } from "@/lib/peers/categoryUniverse";
+import AlternativesPanel, { type AlternativesData } from "@/components/AlternativesPanel";
 
 type OwnerFilter = "family" | "praveen" | "geetha";
 type Period = "6m" | "1y" | "3y" | "5y";
@@ -59,7 +60,7 @@ interface HoldingWithPeer extends EnrichedMFHolding {
   peer: PeerInfo | null;
 }
 
-interface HoldingGroup {
+export interface HoldingGroup {
   key: string;
   scheme_code: string | null;
   scheme_name: string;
@@ -150,6 +151,27 @@ function rankBadgeTone(rank: number, peerCount: number) {
   if (pct <= 0.5) return "bg-blue-100 text-blue-700";
   if (pct <= 0.75) return "bg-amber-100 text-amber-700";
   return "bg-red-100 text-red-700";
+}
+
+type SignalDot = "hold" | "watch" | "switch";
+
+// Cheap client-side approximation of the alternatives panel's rule-based
+// signal, using the fund's own 1Y rank/peer_count (already loaded) so the
+// dashboard doesn't need an extra API call per row just to show a dot.
+function computeSignalDot(rank: number | null, peerCount: number | null): SignalDot | null {
+  if (!rank || !peerCount) return null;
+  const pct = rank / peerCount;
+  if (pct <= 0.25) return "hold";
+  if (pct <= 0.5) return "watch";
+  return "switch";
+}
+
+function SignalDot({ signal }: { signal: SignalDot }) {
+  const color =
+    signal === "hold" ? "bg-green-500" : signal === "watch" ? "bg-amber-500" : "bg-red-500";
+  const label =
+    signal === "hold" ? "Hold — strong performer" : signal === "watch" ? "Watch — moderate underperformance" : "Consider switching";
+  return <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${color}`} title={label} />;
 }
 
 function PencilIcon() {
@@ -492,6 +514,10 @@ export default function DashboardClient({
   >(null);
 
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+
+  const [selectedFund, setSelectedFund] = useState<HoldingGroup | null>(null);
+  const [panelData, setPanelData] = useState<AlternativesData | null>(null);
+  const [panelLoading, setPanelLoading] = useState(false);
 
   // --- Edit lot ---
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -855,6 +881,55 @@ export default function DashboardClient({
 
   const expandGroup = (key: string) => {
     setExpandedGroups((prev) => (prev.has(key) ? prev : new Set(prev).add(key)));
+  };
+
+  // --- Better Alternatives panel ---
+
+  const loadAlternatives = async (schemeCode: string) => {
+    setPanelLoading(true);
+    try {
+      const res = await fetch(`/api/mf/alternatives/${schemeCode}`);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Failed to load alternatives");
+      setPanelData(json.data as AlternativesData);
+    } catch (err) {
+      console.error("Failed to load alternatives:", err);
+      setPanelData(null);
+      showToast("Failed to load alternatives");
+    } finally {
+      setPanelLoading(false);
+    }
+  };
+
+  const handleOpenAlternatives = (group: HoldingGroup) => {
+    if (!group.scheme_code) {
+      showToast("This fund has no scheme code to compare");
+      return;
+    }
+    setSelectedFund(group);
+    setPanelData(null);
+    loadAlternatives(group.scheme_code);
+  };
+
+  const handleClosePanel = () => {
+    setSelectedFund(null);
+    setPanelData(null);
+  };
+
+  const handleSyncNowForPanel = async () => {
+    if (!selectedFund) return;
+    try {
+      await fetch("/api/mf/peers/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ category: selectedFund.category, tier: 1 }),
+      });
+    } catch (err) {
+      console.error("Failed to sync category for alternatives panel:", err);
+    }
+    if (selectedFund.scheme_code) {
+      await loadAlternatives(selectedFund.scheme_code);
+    }
   };
 
   // --- Edit lot handlers ---
@@ -1513,6 +1588,7 @@ export default function DashboardClient({
                   const returnValue = group.peer ? group.peer[returnKey] : null;
                   const rankValue = group.peer ? group.peer[rankKey] : null;
                   const peerCount = group.peer?.peer_count ?? null;
+                  const signalDot = computeSignalDot(group.peer?.rank_1y ?? null, peerCount);
                   const groupPnlPct = group.pnl_pct;
                   const sortedLots = [...group.lots].sort((a, b) =>
                     a.as_on_date < b.as_on_date ? -1 : a.as_on_date > b.as_on_date ? 1 : 0
@@ -1542,8 +1618,9 @@ export default function DashboardClient({
                           <div className="min-w-0">
                             <button
                               type="button"
-                              onClick={() => toggleGroup(group.key)}
-                              className="line-clamp-2 text-left text-sm font-semibold text-slate-800 hover:text-blue-600"
+                              onClick={() => handleOpenAlternatives(group)}
+                              className="line-clamp-2 cursor-pointer text-left text-sm font-semibold text-slate-800 hover:text-blue-600"
+                              title="View better alternatives"
                             >
                               {group.scheme_name}
                             </button>
@@ -1589,7 +1666,7 @@ export default function DashboardClient({
                         >
                           {formatPct(returnValue)}
                         </span>
-                        <div className="hidden md:flex md:items-center">
+                        <div className="hidden md:flex md:items-center md:gap-1.5">
                           {rankValue && peerCount ? (
                             <span
                               className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${rankBadgeTone(
@@ -1607,6 +1684,7 @@ export default function DashboardClient({
                               —
                             </span>
                           )}
+                          {signalDot && <SignalDot signal={signalDot} />}
                         </div>
                         <div className="flex items-center justify-end gap-1">
                           <button
@@ -2027,6 +2105,15 @@ export default function DashboardClient({
         )}
 
       </main>
+
+      <AlternativesPanel
+        isOpen={selectedFund !== null}
+        onClose={handleClosePanel}
+        fund={selectedFund}
+        data={panelData}
+        loading={panelLoading}
+        onSyncNow={handleSyncNowForPanel}
+      />
     </div>
   );
 }
