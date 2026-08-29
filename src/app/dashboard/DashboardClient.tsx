@@ -5,6 +5,7 @@ import Link from "next/link";
 import AppHeader from "@/components/AppHeader";
 import { createClient } from "@/lib/supabase/client";
 import type { EnrichedMFHolding, MFHolding, Owner } from "@/types/mf";
+import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 
 type OwnerFilter = "family" | "praveen" | "geetha";
 type Period = "6m" | "1y" | "3y" | "5y";
@@ -289,6 +290,7 @@ function OwnerBadge({ owner }: { owner: GroupOwner }) {
 
 interface EditDraft {
   owner: Owner;
+  category: string;
   invested_amount: string;
   as_on_date: string;
   avg_nav: string;
@@ -790,6 +792,7 @@ export default function DashboardClient({
     setEditingId(h.id);
     setEditDraft({
       owner: h.owner,
+      category: h.category,
       invested_amount: String(h.invested_amount),
       as_on_date: h.as_on_date,
       avg_nav: String(h.avg_nav),
@@ -907,6 +910,10 @@ export default function DashboardClient({
       setEditError("Units must be a positive number");
       return;
     }
+    if (!editDraft.category.trim()) {
+      setEditError("Category is required");
+      return;
+    }
 
     setEditSaving(true);
     setEditError(null);
@@ -916,6 +923,7 @@ export default function DashboardClient({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           owner: editDraft.owner,
+          category: editDraft.category,
           invested_amount: investedAmount,
           as_on_date: editDraft.as_on_date,
           avg_nav: avgNav,
@@ -938,6 +946,7 @@ export default function DashboardClient({
           return {
             ...row,
             owner: updated.owner,
+            category: updated.category,
             invested_amount: newInvested,
             as_on_date: updated.as_on_date,
             avg_nav: Number(updated.avg_nav),
@@ -1577,8 +1586,8 @@ export default function DashboardClient({
                               }
 
                               return (
+                                <div key={lot.id}>
                                 <div
-                                  key={lot.id}
                                   className={`${SUB_GRID} items-center gap-2 rounded py-2 pl-0 pr-2 text-xs transition-colors duration-700 ${
                                     isSavedFlash ? "bg-green-50" : ""
                                   }`}
@@ -1720,6 +1729,27 @@ export default function DashboardClient({
                                       </>
                                     )}
                                   </span>
+                                </div>
+                                {isEditingLot && editDraft && (
+                                  <div className="mb-1 flex items-center gap-2 pb-1 pl-1">
+                                    <label className="text-[10px] font-medium text-slate-500">
+                                      Category
+                                    </label>
+                                    <select
+                                      value={editDraft.category}
+                                      onChange={(e) =>
+                                        setEditDraft({ ...editDraft, category: e.target.value })
+                                      }
+                                      className="rounded border border-slate-300 px-2 py-1 text-xs"
+                                    >
+                                      {CATEGORY_OPTIONS.map((c) => (
+                                        <option key={c} value={c}>
+                                          {c}
+                                        </option>
+                                      ))}
+                                    </select>
+                                  </div>
+                                )}
                                 </div>
                               );
                             })}

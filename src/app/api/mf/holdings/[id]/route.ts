@@ -24,7 +24,7 @@ export async function PUT(
       );
     }
 
-    const { owner, units, avg_nav, invested_amount, as_on_date } =
+    const { owner, category, units, avg_nav, invested_amount, as_on_date } =
       body as Record<string, unknown>;
 
     const update: Record<string, unknown> = {};
@@ -37,6 +37,15 @@ export async function PUT(
         );
       }
       update.owner = owner;
+    }
+    if (category !== undefined) {
+      if (typeof category !== "string" || !category.trim()) {
+        return NextResponse.json(
+          { error: "category must be a non-empty string" },
+          { status: 400 }
+        );
+      }
+      update.category = category.trim();
     }
     if (units !== undefined) {
       if (typeof units !== "number" || !Number.isFinite(units) || units <= 0) {

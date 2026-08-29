@@ -17,18 +17,7 @@ import {
   type ParseRowError,
 } from "@/lib/parsers/casCsvParser";
 import type { MFCASImport, Owner } from "@/types/mf";
-
-const CATEGORY_OPTIONS = [
-  "Large Cap",
-  "Mid Cap",
-  "Small Cap",
-  "Flexi Cap",
-  "ELSS",
-  "Debt",
-  "Hybrid",
-  "International",
-  "Index",
-];
+import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 
 const STEPS = [
   "Go to camsonline.com → Mailback Services",
