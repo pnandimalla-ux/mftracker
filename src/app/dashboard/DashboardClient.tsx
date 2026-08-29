@@ -4,7 +4,7 @@ import { useEffect, useMemo, useState, useCallback } from "react";
 import Link from "next/link";
 import AppHeader from "@/components/AppHeader";
 import { createClient } from "@/lib/supabase/client";
-import type { EnrichedMFHolding } from "@/types/mf";
+import type { EnrichedMFHolding, Owner } from "@/types/mf";
 
 type OwnerFilter = "family" | "praveen" | "geetha";
 type Period = "6m" | "1y" | "3y" | "5y";
@@ -73,6 +73,54 @@ function rankBadgeTone(rank: number, peerCount: number) {
   return "bg-red-100 text-red-700";
 }
 
+function PencilIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4">
+      <path
+        d="M13.5 3.5l3 3L6 17H3v-3L13.5 3.5z"
+        stroke="currentColor"
+        strokeWidth={1.4}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function CheckIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+      <path
+        d="M4 10.5l3.5 3.5L16 5"
+        stroke="currentColor"
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function XIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+      <path
+        d="M5 5l10 10M15 5L5 15"
+        stroke="currentColor"
+        strokeWidth={2}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+interface EditDraft {
+  owner: Owner;
+  invested_amount: string;
+  as_on_date: string;
+}
+
 function KpiCard({
   label,
   value,
@@ -123,6 +171,12 @@ export default function DashboardClient({
 
   const [peerDataEmpty, setPeerDataEmpty] = useState(false);
   const [seedingPeers, setSeedingPeers] = useState(false);
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState<EditDraft | null>(null);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [savedFlashId, setSavedFlashId] = useState<string | null>(null);
 
   const showToast = useCallback((message: string) => {
     setToast(message);
@@ -275,6 +329,81 @@ export default function DashboardClient({
       console.error("Peer seed failed:", err);
       showToast("Peer data sync failed");
       setSeedingPeers(false);
+    }
+  };
+
+  const handleStartEdit = (h: HoldingWithPeer) => {
+    setEditingId(h.id);
+    setEditDraft({
+      owner: h.owner,
+      invested_amount: String(h.invested_amount),
+      as_on_date: h.as_on_date,
+    });
+    setEditError(null);
+  };
+
+  const handleCancelEdit = () => {
+    setEditingId(null);
+    setEditDraft(null);
+    setEditError(null);
+  };
+
+  const handleSaveEdit = async (h: HoldingWithPeer) => {
+    if (!editDraft) return;
+
+    const investedAmount = Number(editDraft.invested_amount);
+    if (!Number.isFinite(investedAmount) || investedAmount <= 0) {
+      setEditError("Invested amount must be a positive number");
+      return;
+    }
+    if (!editDraft.as_on_date) {
+      setEditError("As on date is required");
+      return;
+    }
+
+    setEditSaving(true);
+    setEditError(null);
+    try {
+      const res = await fetch(`/api/mf/holdings/${h.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          owner: editDraft.owner,
+          invested_amount: investedAmount,
+          as_on_date: editDraft.as_on_date,
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Failed to save");
+
+      const updated = json.data as { owner: Owner; invested_amount: number; as_on_date: string };
+
+      setHoldings((prev) =>
+        prev.map((row) => {
+          if (row.id !== h.id) return row;
+          const newInvested = Number(updated.invested_amount);
+          const newPnl = row.current_value - newInvested;
+          const newPnlPct = newInvested > 0 ? (newPnl / newInvested) * 100 : 0;
+          return {
+            ...row,
+            owner: updated.owner,
+            invested_amount: newInvested,
+            as_on_date: updated.as_on_date,
+            pnl: newPnl,
+            pnl_pct: newPnlPct,
+          };
+        })
+      );
+
+      setEditingId(null);
+      setEditDraft(null);
+      setSavedFlashId(h.id);
+      setTimeout(() => setSavedFlashId(null), 1500);
+    } catch (err) {
+      console.error("Failed to save holding edit:", err);
+      setEditError("Failed to save");
+    } finally {
+      setEditSaving(false);
     }
   };
 
@@ -431,6 +560,7 @@ export default function DashboardClient({
                     <th className="px-4 py-2 font-medium">{PERIODS.find((p) => p.id === period)?.label} Return</th>
                     <th className="px-4 py-2 font-medium">Peer rank</th>
                     <th className="px-4 py-2 font-medium">NAV date</th>
+                    <th className="px-4 py-2 font-medium"></th>
                   </tr>
                 </thead>
                 <tbody>
@@ -442,9 +572,16 @@ export default function DashboardClient({
                     const returnValue = h.peer ? h.peer[returnKey] : null;
                     const rankValue = h.peer ? h.peer[rankKey] : null;
                     const peerCount = h.peer?.peer_count ?? null;
+                    const isEditing = editingId === h.id;
+                    const isSavedFlash = savedFlashId === h.id;
 
                     return (
-                      <tr key={h.id} className="border-b border-slate-100 last:border-0">
+                      <tr
+                        key={h.id}
+                        className={`group border-b border-slate-100 last:border-0 transition-colors duration-700 ${
+                          isSavedFlash ? "bg-green-50" : ""
+                        }`}
+                      >
                         <td className="px-4 py-3 text-slate-800">
                           <Link
                             href={`/fund/${h.scheme_code}`}
@@ -454,19 +591,59 @@ export default function DashboardClient({
                           </Link>
                         </td>
                         <td className="px-4 py-3">
-                          <span
-                            className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
-                              h.owner === "praveen"
-                                ? "bg-blue-100 text-blue-700"
-                                : "bg-amber-100 text-amber-700"
-                            }`}
-                          >
-                            {h.owner === "praveen" ? "P" : "G"}
-                          </span>
+                          {isEditing && editDraft ? (
+                            <div className="inline-flex rounded-md border border-slate-200 p-0.5">
+                              <button
+                                type="button"
+                                onClick={() => setEditDraft({ ...editDraft, owner: "praveen" })}
+                                className={`rounded px-2 py-0.5 text-xs font-semibold transition ${
+                                  editDraft.owner === "praveen"
+                                    ? "bg-blue-600 text-white"
+                                    : "text-slate-500 hover:bg-slate-100"
+                                }`}
+                              >
+                                P
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setEditDraft({ ...editDraft, owner: "geetha" })}
+                                className={`rounded px-2 py-0.5 text-xs font-semibold transition ${
+                                  editDraft.owner === "geetha"
+                                    ? "bg-amber-500 text-white"
+                                    : "text-slate-500 hover:bg-slate-100"
+                                }`}
+                              >
+                                G
+                              </button>
+                            </div>
+                          ) : (
+                            <span
+                              className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
+                                h.owner === "praveen"
+                                  ? "bg-blue-100 text-blue-700"
+                                  : "bg-amber-100 text-amber-700"
+                              }`}
+                            >
+                              {h.owner === "praveen" ? "P" : "G"}
+                            </span>
+                          )}
                         </td>
                         <td className="px-4 py-3 text-slate-600">{h.category}</td>
                         <td className="px-4 py-3 text-slate-800">
-                          {formatInr(Number(h.invested_amount))}
+                          {isEditing && editDraft ? (
+                            <input
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              value={editDraft.invested_amount}
+                              onChange={(e) =>
+                                setEditDraft({ ...editDraft, invested_amount: e.target.value })
+                              }
+                              className="w-24 rounded border border-slate-300 px-2 py-1 text-sm"
+                            />
+                          ) : (
+                            formatInr(Number(h.invested_amount))
+                          )}
                         </td>
                         <td className="px-4 py-3 text-slate-800">
                           {formatInr(Number(h.current_value))}
@@ -512,7 +689,57 @@ export default function DashboardClient({
                           )}
                         </td>
                         <td className="px-4 py-3 text-slate-600">
-                          {h.nav_date ?? "—"}
+                          {isEditing && editDraft ? (
+                            <input
+                              type="date"
+                              value={editDraft.as_on_date}
+                              max={new Date().toISOString().slice(0, 10)}
+                              onChange={(e) =>
+                                setEditDraft({ ...editDraft, as_on_date: e.target.value })
+                              }
+                              className="rounded border border-slate-300 px-2 py-1 text-sm"
+                            />
+                          ) : (
+                            h.nav_date ?? "—"
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {isEditing ? (
+                            <div className="flex flex-col items-end gap-1">
+                              <div className="flex items-center gap-1.5">
+                                <button
+                                  type="button"
+                                  onClick={() => handleSaveEdit(h)}
+                                  disabled={editSaving}
+                                  aria-label="Save"
+                                  className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-600 text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  <CheckIcon />
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={handleCancelEdit}
+                                  disabled={editSaving}
+                                  aria-label="Cancel"
+                                  className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-200 text-slate-600 transition hover:bg-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  <XIcon />
+                                </button>
+                              </div>
+                              {editError && (
+                                <span className="text-xs font-medium text-red-600">{editError}</span>
+                              )}
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => handleStartEdit(h)}
+                              aria-label="Edit"
+                              className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 opacity-0 transition hover:bg-slate-100 hover:text-slate-600 group-hover:opacity-100"
+                            >
+                              <PencilIcon />
+                            </button>
+                          )}
                         </td>
                       </tr>
                     );

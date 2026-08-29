@@ -24,11 +24,20 @@ export async function PUT(
       );
     }
 
-    const { units, avg_nav, invested_amount, as_on_date } =
+    const { owner, units, avg_nav, invested_amount, as_on_date } =
       body as Record<string, unknown>;
 
     const update: Record<string, unknown> = {};
 
+    if (owner !== undefined) {
+      if (owner !== "praveen" && owner !== "geetha") {
+        return NextResponse.json(
+          { error: "owner must be 'praveen' or 'geetha'" },
+          { status: 400 }
+        );
+      }
+      update.owner = owner;
+    }
     if (units !== undefined) {
       if (typeof units !== "number" || !Number.isFinite(units) || units <= 0) {
         return NextResponse.json(
@@ -68,6 +77,21 @@ export async function PUT(
       if (typeof as_on_date !== "string" || !as_on_date) {
         return NextResponse.json(
           { error: "as_on_date must be a valid date string" },
+          { status: 400 }
+        );
+      }
+      const parsedDate = new Date(as_on_date);
+      if (Number.isNaN(parsedDate.getTime())) {
+        return NextResponse.json(
+          { error: "as_on_date must be a valid date" },
+          { status: 400 }
+        );
+      }
+      const today = new Date();
+      today.setHours(23, 59, 59, 999);
+      if (parsedDate.getTime() > today.getTime()) {
+        return NextResponse.json(
+          { error: "as_on_date cannot be in the future" },
           { status: 400 }
         );
       }
