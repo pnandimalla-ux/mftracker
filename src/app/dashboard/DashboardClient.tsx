@@ -1174,7 +1174,7 @@ export default function DashboardClient({
                   return (
                     <div key={group.key} className="border-b border-slate-100 last:border-0">
                       <div
-                        className={`${MAIN_GRID} items-center gap-2 px-4 py-3 transition-colors hover:bg-slate-50`}
+                        className={`${MAIN_GRID} items-center gap-2 px-4 py-3 text-sm transition-colors hover:bg-slate-50`}
                       >
                         <div className="flex min-w-0 items-start gap-1.5" title={group.scheme_name}>
                           <button
@@ -1343,7 +1343,7 @@ export default function DashboardClient({
                               return (
                                 <div
                                   key={lot.id}
-                                  className={`${SUB_GRID} items-center gap-2 rounded py-2 pl-0 pr-2 text-sm transition-colors duration-700 ${
+                                  className={`${SUB_GRID} items-center gap-2 rounded py-2 pl-0 pr-2 text-xs transition-colors duration-700 ${
                                     isSavedFlash ? "bg-green-50" : ""
                                   }`}
                                 >
