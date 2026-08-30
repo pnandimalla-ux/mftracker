@@ -10,7 +10,7 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import AppHeader from "@/components/AppHeader";
-import type { CoinFund, CoinParseResult, ExcludedRow, SellRow } from "@/lib/parsers/coinCsvParser";
+import type { CoinFund, CoinParseResult, ExcludedRow, LotType, SellRow } from "@/lib/parsers/coinCsvParser";
 import type { MFCASImport, Owner } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import { detectCategory, type DetectCategoryResult } from "@/lib/analysis/fundCategoriser";
@@ -22,7 +22,7 @@ const COIN_STEPS = [
   "Go to Orders → Order History",
   "Set date range: All time",
   "Click Download / Export CSV",
-  "Repeat for Geetha's account (WKT509) if needed",
+  "Repeat for Geetha's account (EKT509) if needed",
   "Upload both CSVs below (or one at a time)",
 ];
 
@@ -96,9 +96,11 @@ export default function ImportClient({
   const [sellsOpen, setSellsOpen] = useState(false);
   const [duplicates, setDuplicates] = useState<DuplicateInfo[]>([]);
   const [duplicateAction, setDuplicateAction] = useState<DuplicateAction>("skip");
-  const [importHistory] = useState<MFCASImport[]>(initialImportHistory);
+  const [importHistory, setImportHistory] = useState<MFCASImport[]>(initialImportHistory);
+  const [deletingImportId, setDeletingImportId] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
+  const [historyToast, setHistoryToast] = useState<string | null>(null);
 
   // --- Manual add form state ---
   const [mOwner, setMOwner] = useState<Owner>("praveen");
@@ -365,6 +367,41 @@ export default function ImportClient({
     setPreviewFunds((prev) => prev.map((f) => (f.key === key ? { ...f, ...patch } : f)));
   };
 
+  const toggleLotType = (fundKey: string, lotIndex: number) => {
+    setPreviewFunds((prev) =>
+      prev.map((f) => {
+        if (f.key !== fundKey) return f;
+        const lots = f.lots.map((lot, i) =>
+          i === lotIndex
+            ? { ...lot, lot_type: (lot.lot_type === "sip" ? "lumpsum" : "sip") as LotType }
+            : lot
+        );
+        return { ...f, lots };
+      })
+    );
+  };
+
+  const handleDeleteImport = async (importId: string) => {
+    if (!window.confirm("Delete this import and all holdings it created? This cannot be undone.")) {
+      return;
+    }
+    setDeletingImportId(importId);
+    try {
+      const res = await fetch(`/api/mf/import/${importId}`, { method: "DELETE" });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error ?? "Failed to delete import");
+      setImportHistory((prev) => prev.filter((imp) => imp.id !== importId));
+      setHistoryToast(`Deleted import (${json.deleted_holdings ?? 0} holding${json.deleted_holdings === 1 ? "" : "s"} removed)`);
+      setTimeout(() => setHistoryToast(null), 3000);
+    } catch (err) {
+      console.error("Failed to delete import:", err);
+      setHistoryToast("Failed to delete import");
+      setTimeout(() => setHistoryToast(null), 3000);
+    } finally {
+      setDeletingImportId(null);
+    }
+  };
+
   const isDuplicateFund = (f: PreviewFund) =>
     !!f.scheme_code && duplicates.some((d) => d.owner === f.owner && d.scheme_code === f.scheme_code);
 
@@ -626,7 +663,7 @@ export default function ImportClient({
           <h1 className="text-lg font-semibold text-slate-800">Import holdings</h1>
           <p className="mt-1 text-sm text-slate-500">
             Import your holdings from Zerodha Coin order history. Works for both
-            Praveen (YE7266) and Geetha (WKT509).
+            Praveen (YE7266) and Geetha (EKT509).
           </p>
         </div>
 
@@ -693,7 +730,7 @@ export default function ImportClient({
                 Drop CSV(s) here or click to browse
               </p>
               <p className="mt-1 text-xs text-slate-400">
-                Supports both YE7266 and WKT509 — owner auto-detected from file
+                Supports both YE7266 and EKT509 — owner auto-detected from file
               </p>
             </div>
 
@@ -1144,9 +1181,14 @@ export default function ImportClient({
 
         {/* Import history — full width */}
         <div className="mt-6 rounded-xl border border-slate-200 bg-white p-5">
-          <h3 className="mb-2 text-sm font-semibold text-slate-800">
-            Import history
-          </h3>
+          <div className="mb-2 flex items-center justify-between">
+            <h3 className="text-sm font-semibold text-slate-800">
+              Import history
+            </h3>
+            {historyToast && (
+              <p className="text-xs font-medium text-slate-500">{historyToast}</p>
+            )}
+          </div>
           <div className="overflow-x-auto rounded-lg border border-slate-200">
             <table className="w-full text-left text-sm">
               <thead>
@@ -1156,12 +1198,13 @@ export default function ImportClient({
                   <th className="px-3 py-2 font-medium">Source</th>
                   <th className="px-3 py-2 font-medium">Rows</th>
                   <th className="px-3 py-2 font-medium">Status</th>
+                  <th className="px-3 py-2 font-medium text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {importHistory.length === 0 ? (
                   <tr>
-                    <td colSpan={5} className="px-3 py-4 text-center text-slate-400">
+                    <td colSpan={6} className="px-3 py-4 text-center text-slate-400">
                       No imports yet.
                     </td>
                   </tr>
@@ -1200,6 +1243,18 @@ export default function ImportClient({
                         >
                           {imp.status ?? "unknown"}
                         </span>
+                      </td>
+                      <td className="px-3 py-2 text-right">
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteImport(imp.id)}
+                          disabled={deletingImportId === imp.id}
+                          aria-label="Delete import"
+                          title="Delete import and all its holdings"
+                          className="rounded-md px-1.5 py-1 text-slate-400 transition hover:bg-red-50 hover:text-red-600 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          {deletingImportId === imp.id ? "…" : "🗑"}
+                        </button>
                       </td>
                     </tr>
                   ))
@@ -1357,6 +1412,7 @@ export default function ImportClient({
                                   <th className="py-1 pr-3 font-medium">Amount</th>
                                   <th className="py-1 pr-3 font-medium">Units</th>
                                   <th className="py-1 pr-3 font-medium">NAV</th>
+                                  <th className="py-1 pr-3 font-medium">Type</th>
                                   <th className="py-1 pr-3 font-medium">Settlement ID</th>
                                 </tr>
                               </thead>
@@ -1370,6 +1426,20 @@ export default function ImportClient({
                                     </td>
                                     <td className="py-1 pr-3 text-slate-600">
                                       ₹{lot.nav.toLocaleString("en-IN", { maximumFractionDigits: 4 })}
+                                    </td>
+                                    <td className="py-1 pr-3">
+                                      <button
+                                        type="button"
+                                        onClick={() => toggleLotType(f.key, i)}
+                                        title="Click to toggle SIP / Lumpsum"
+                                        className={`rounded-full px-2 py-0.5 text-[10px] font-semibold transition ${
+                                          lot.lot_type === "sip"
+                                            ? "bg-blue-100 text-blue-700 hover:bg-blue-200"
+                                            : "bg-slate-200 text-slate-600 hover:bg-slate-300"
+                                        }`}
+                                      >
+                                        {lot.lot_type === "sip" ? "SIP" : "Lumpsum"}
+                                      </button>
                                     </td>
                                     <td className="py-1 pr-3 text-slate-600">{lot.settlement_id || "—"}</td>
                                   </tr>

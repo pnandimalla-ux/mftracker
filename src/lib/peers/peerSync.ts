@@ -227,18 +227,26 @@ function hasAnyReturn(row: PeerRankRow): boolean {
 }
 
 // Recalculates peer_rank_6m/1y/3y/5y and peer_count for every fund currently
-// in mf_peer_data under `category`, ranking against the FULL current set for
-// that category (not just whichever funds a particular sync pass touched) —
-// this keeps ranks consistent regardless of which tier last updated which
+// in mf_peer_data under `peerGroup`, ranking against the FULL current set for
+// that peer group (not just whichever funds a particular sync pass touched)
+// — this keeps ranks consistent regardless of which tier last updated which
 // specific fund. Rank 1 = best (highest) return for that period.
-export async function recalculateCategoryRanks(category: string): Promise<{ errors: string[] }> {
+//
+// Grouping by peer_group (a precise bucket like "Sectoral - MNC" or "Focused
+// Fund", derived by derivePeerGroup from mfapi.in's own category + the fund
+// name) rather than the broad SEBI `category` column is what makes a rank
+// like "2/5 in Focused Fund" mean something — comparing all "Sectoral/
+// Thematic" funds together mixed MNC, Tech and Banking funds, which isn't a
+// meaningful comparison. A row with no peer_group yet (not re-synced since
+// this column was added) is simply excluded from ranking until its next sync.
+export async function recalculateCategoryRanks(peerGroup: string): Promise<{ errors: string[] }> {
   const supabase = createServiceClient();
   const errors: string[] = [];
 
   const { data: rows, error } = await supabase
     .from("mf_peer_data")
     .select("scheme_code, r6m, r1y, r3y, r5y")
-    .eq("category", category);
+    .eq("peer_group", peerGroup);
 
   if (error) {
     return { errors: [error.message] };

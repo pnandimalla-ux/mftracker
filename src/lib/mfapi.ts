@@ -17,6 +17,49 @@ export interface MfapiSchemeMatch {
   scheme_name: string;
 }
 
+export interface MfapiSchemeMeta {
+  mf_api_category: string;
+  fund_house: string;
+}
+
+// Cached per warm server instance — a sync run touching the same scheme
+// repeatedly (tier1/tier2 sweeps) shouldn't re-fetch its meta every time.
+const schemeMetaCache = new Map<string, MfapiSchemeMeta | null>();
+
+// Fetches a scheme's raw mfapi.in category (meta.scheme_category, e.g.
+// "Equity Scheme - Sectoral/Thematic") and fund house — used to derive an
+// accurate peer_group via derivePeerGroup() instead of the broad SEBI
+// category alone.
+export async function fetchSchemeMeta(schemeCode: string): Promise<MfapiSchemeMeta | null> {
+  if (schemeMetaCache.has(schemeCode)) {
+    return schemeMetaCache.get(schemeCode) ?? null;
+  }
+  try {
+    const res = await fetchWithTimeout(`https://api.mfapi.in/mf/${schemeCode}/latest`);
+    if (!res.ok) {
+      schemeMetaCache.set(schemeCode, null);
+      return null;
+    }
+    const json = await res.json();
+    const category = json?.meta?.scheme_category;
+    const fundHouse = json?.meta?.fund_house;
+    if (typeof category !== "string" || !category) {
+      schemeMetaCache.set(schemeCode, null);
+      return null;
+    }
+    const meta: MfapiSchemeMeta = {
+      mf_api_category: category,
+      fund_house: typeof fundHouse === "string" ? fundHouse : "",
+    };
+    schemeMetaCache.set(schemeCode, meta);
+    return meta;
+  } catch (err) {
+    console.error(`fetchSchemeMeta(${schemeCode}) failed:`, err);
+    schemeMetaCache.set(schemeCode, null);
+    return null;
+  }
+}
+
 // Searches mfapi.in for a fund name and returns the first Direct Plan +
 // Growth option result — used when importing holdings from a source (Coin
 // CSV, CAS) whose ISIN isn't in a known local mapping. Falls back to the

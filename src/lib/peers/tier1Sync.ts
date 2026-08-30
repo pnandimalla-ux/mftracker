@@ -1,4 +1,6 @@
 import { createServiceClient } from "@/lib/supabase/service";
+import { fetchSchemeMeta } from "@/lib/mfapi";
+import { derivePeerGroup } from "./peerGroup";
 import {
   calculateReturns,
   delay,
@@ -42,19 +44,26 @@ export async function syncTier1Category(category: string): Promise<SyncCategoryR
   const supabase = createServiceClient();
   const universeFunds = getCategoryFunds(category);
 
-  const { data: heldRows, error: heldError } = await supabase
-    .from("mf_holdings")
-    .select("scheme_code")
-    .eq("category", category);
+  // `category` here may be a broad SEBI category (from the curated universe)
+  // or a precise peer_group value (e.g. "Sectoral - MNC", passed by callers
+  // that derived it from a user's held funds) — held funds are looked up
+  // both ways so either kind of caller finds its extra (outside-universe)
+  // held funds.
+  const [{ data: byCategory, error: heldError }, { data: byPeerGroup }] = await Promise.all([
+    supabase.from("mf_holdings").select("scheme_code").eq("category", category),
+    supabase.from("mf_holdings").select("scheme_code").eq("peer_group", category),
+  ]);
 
   if (heldError) {
     console.error("Failed to look up held funds for category:", category, heldError.message);
   }
 
+  const heldRows = [...(byCategory ?? []), ...(byPeerGroup ?? [])];
+
   const universeCodes = new Set(universeFunds.map((f) => f.code));
   const extraCodes = Array.from(
     new Set(
-      (heldRows ?? [])
+      heldRows
         .map((r) => r.scheme_code as string)
         .filter((code) => isRealSchemeCode(code) && !universeCodes.has(code))
     )
@@ -81,6 +90,7 @@ export async function syncTier1Category(category: string): Promise<SyncCategoryR
   let failed = 0;
   const errors: string[] = [];
   const now = new Date().toISOString();
+  const touchedPeerGroups = new Set<string>();
 
   for (let i = 0; i < funds.length; i++) {
     const fund = funds[i];
@@ -92,17 +102,24 @@ export async function syncTier1Category(category: string): Promise<SyncCategoryR
       console.log("NAV history length:", sliced.length, "for scheme:", fund.code);
       console.log("Calculated returns:", returns, "for scheme:", fund.code);
 
+      const fundName = fund.name || schemeName || null;
+      const meta = await fetchSchemeMeta(fund.code);
+      const peerGroup = meta ? derivePeerGroup(meta.mf_api_category, fundName ?? fund.code) : category;
+      touchedPeerGroups.add(peerGroup);
+
       const { error } = await supabase.from("mf_peer_data").upsert(
         {
           scheme_code: fund.code,
           category,
+          mf_api_category: meta?.mf_api_category ?? null,
+          peer_group: peerGroup,
           r6m: returns.r6m,
           r1y: returns.r1y,
           r3y: returns.r3y,
           r5y: returns.r5y,
           tier: "tier1",
           amc: fund.amc || null,
-          fund_name: fund.name || schemeName || null,
+          fund_name: fundName,
           updated_at: now,
         },
         { onConflict: "scheme_code" }
@@ -123,8 +140,14 @@ export async function syncTier1Category(category: string): Promise<SyncCategoryR
     }
   }
 
-  const { errors: rankErrors } = await recalculateCategoryRanks(category);
-  errors.push(...rankErrors);
+  // Ranks are recalculated per actual peer_group encountered (not just the
+  // outer `category`) — a "Sectoral/Thematic" sync pass can touch several
+  // distinct peer groups (MNC, Technology, Banking...) that each need their
+  // own ranking pass.
+  for (const peerGroup of Array.from(touchedPeerGroups)) {
+    const { errors: rankErrors } = await recalculateCategoryRanks(peerGroup);
+    errors.push(...rankErrors);
+  }
 
   console.log(
     `Finished tier1 sync for category: ${category} — processed=${processed} failed=${failed}`
@@ -150,7 +173,7 @@ export async function syncTier1(userId: string): Promise<Tier1Result> {
 
   const { data: holdings, error } = await supabase
     .from("mf_holdings")
-    .select("scheme_code, category")
+    .select("scheme_code, category, peer_group")
     .eq("user_id", userId);
 
   if (error) {
@@ -161,14 +184,21 @@ export async function syncTier1(userId: string): Promise<Tier1Result> {
   const held = holdings ?? [];
   const heldSchemeCodes = held.map((h) => h.scheme_code as string);
 
-  // Categories found two ways: via the curated universe (scheme_code match)
-  // and directly from each holding's own category field — the latter also
-  // catches funds outside the universe entirely.
+  // Precise peer_group values (e.g. "Sectoral - MNC") are preferred when a
+  // holding has one — falling back to its broad category only for holdings
+  // imported/added before peer_group existed (peer_group is still null for
+  // those until their next sync). The curated universe's broad categories
+  // are also included so a held fund inside the universe still pulls in the
+  // rest of its universe peers.
   const categoriesFromUniverse = getHeldCategories(heldSchemeCodes);
-  const categoriesFromHoldings = Array.from(
-    new Set(held.map((h) => h.category as string).filter((c): c is string => !!c))
+  const groupsFromHoldings = Array.from(
+    new Set(
+      held
+        .map((h) => (h.peer_group as string | null) ?? (h.category as string | null))
+        .filter((c): c is string => !!c)
+    )
   );
-  const categories = Array.from(new Set([...categoriesFromUniverse, ...categoriesFromHoldings]));
+  const categories = Array.from(new Set([...categoriesFromUniverse, ...groupsFromHoldings]));
 
   let fundsProcessed = 0;
   const errors: string[] = [];

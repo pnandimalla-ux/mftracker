@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/service";
+import { fetchSchemeMeta } from "@/lib/mfapi";
+import { derivePeerGroup } from "@/lib/peers/peerGroup";
 import { getCategoryForCode, getCategoryFunds } from "@/lib/peers/categoryUniverse";
 import { fetchSchemeReturns, type PeriodReturns } from "@/lib/peers/peerSync";
 
@@ -76,25 +78,27 @@ export async function GET(
     // resort for a fund that's neither held nor in the curated universe.
     const { data: holding } = await supabase
       .from("mf_holdings")
-      .select("category")
+      .select("category, peer_group")
       .eq("scheme_code", schemeCode)
       .eq("user_id", user.id)
       .limit(1)
       .maybeSingle();
 
     let category = (holding?.category as string | undefined) ?? null;
+    let peerGroup = (holding?.peer_group as string | undefined) ?? null;
 
     if (!category) {
       category = getCategoryForCode(schemeCode);
     }
 
-    if (!category) {
+    if (!category || !peerGroup) {
       const { data: peerRow } = await supabase
         .from("mf_peer_data")
-        .select("category")
+        .select("category, peer_group")
         .eq("scheme_code", schemeCode)
         .maybeSingle();
-      category = (peerRow?.category as string | undefined) ?? null;
+      category = category ?? (peerRow?.category as string | undefined) ?? null;
+      peerGroup = peerGroup ?? (peerRow?.peer_group as string | undefined) ?? null;
     }
 
     if (!category) {
@@ -104,10 +108,15 @@ export async function GET(
       );
     }
 
+    // Precise peer comparison bucket (e.g. "Sectoral - MNC") when available —
+    // falls back to the broad SEBI category for a fund whose peer_group
+    // hasn't been synced yet, so the panel still renders something.
+    const groupKey = peerGroup ?? category;
+
     const { data: categoryRows } = await supabase
       .from("mf_peer_data")
       .select("*")
-      .eq("category", category);
+      .eq("peer_group", groupKey);
 
     const peerDataMap = new Map<string, PeerDataRow>(
       (categoryRows ?? []).map((p) => [p.scheme_code as string, p as PeerDataRow])
@@ -124,10 +133,16 @@ export async function GET(
         liveReturns = result.returns;
         try {
           const serviceClient = createServiceClient();
+          const meta = await fetchSchemeMeta(schemeCode);
+          const resolvedPeerGroup = meta
+            ? derivePeerGroup(meta.mf_api_category, schemeCode)
+            : groupKey;
           await serviceClient.from("mf_peer_data").upsert(
             {
               scheme_code: schemeCode,
               category,
+              mf_api_category: meta?.mf_api_category ?? null,
+              peer_group: resolvedPeerGroup,
               r6m: liveReturns.r6m,
               r1y: liveReturns.r1y,
               r3y: liveReturns.r3y,
@@ -259,6 +274,7 @@ export async function GET(
     return NextResponse.json({
       data: {
         category,
+        peer_group: groupKey,
         scheme,
         peers,
         category_avg,

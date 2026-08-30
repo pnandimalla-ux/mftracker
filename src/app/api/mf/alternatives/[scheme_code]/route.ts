@@ -7,6 +7,7 @@ import type { Owner } from "@/types/mf";
 interface PeerDataRow {
   scheme_code: string;
   category: string | null;
+  peer_group: string | null;
   amc: string | null;
   fund_name: string | null;
   r6m: number | null;
@@ -87,7 +88,7 @@ export async function GET(
 
     const { data: holdingRows, error: holdingError } = await supabase
       .from("mf_holdings")
-      .select("scheme_code, scheme_name, category, amc, owner")
+      .select("scheme_code, scheme_name, category, peer_group, amc, owner")
       .eq("scheme_code", schemeCode)
       .eq("user_id", user.id);
 
@@ -102,23 +103,37 @@ export async function GET(
     const category = primaryHolding.category as string;
     const owners = Array.from(new Set(holdingRows.map((h) => h.owner as Owner)));
 
+    // Precise peer comparison bucket (e.g. "Sectoral - MNC") when available —
+    // falls back to the broad SEBI category for a fund not yet synced.
+    let groupKey = (primaryHolding.peer_group as string | null) ?? category;
+
     const { data: categoryRows } = await supabase
       .from("mf_peer_data")
-      .select("scheme_code, category, amc, fund_name, r6m, r1y, r3y, r5y, expense_ratio")
-      .eq("category", category);
+      .select("scheme_code, category, peer_group, amc, fund_name, r6m, r1y, r3y, r5y, expense_ratio")
+      .eq("peer_group", groupKey);
 
     let peerRows: PeerDataRow[] = (categoryRows ?? []) as PeerDataRow[];
     let heldRow = peerRows.find((p) => p.scheme_code === schemeCode) ?? null;
 
     // Not synced yet (e.g. just added, tier3 hasn't finished) — compute and
-    // cache it now so the panel isn't empty, then re-read the category set.
+    // cache it now so the panel isn't empty, then re-read the peer group.
     if (!heldRow) {
       try {
         await syncNewFund(schemeCode, category);
+        // The sync may have resolved a more precise peer_group than was
+        // known before this fund had ever been synced.
+        const { data: selfAfterSync } = await supabase
+          .from("mf_peer_data")
+          .select("peer_group")
+          .eq("scheme_code", schemeCode)
+          .maybeSingle();
+        if (selfAfterSync?.peer_group) {
+          groupKey = selfAfterSync.peer_group as string;
+        }
         const { data: refreshed } = await supabase
           .from("mf_peer_data")
-          .select("scheme_code, category, amc, fund_name, r6m, r1y, r3y, r5y, expense_ratio")
-          .eq("category", category);
+          .select("scheme_code, category, peer_group, amc, fund_name, r6m, r1y, r3y, r5y, expense_ratio")
+          .eq("peer_group", groupKey);
         peerRows = (refreshed ?? []) as PeerDataRow[];
         heldRow = peerRows.find((p) => p.scheme_code === schemeCode) ?? null;
       } catch (err) {
@@ -133,6 +148,7 @@ export async function GET(
             scheme_code: schemeCode,
             scheme_name: primaryHolding.scheme_name,
             category,
+            peer_group: groupKey,
             amc: primaryHolding.amc,
             r6m: null,
             r1y: null,
@@ -287,6 +303,7 @@ export async function GET(
           scheme_code: schemeCode,
           scheme_name: heldName,
           category,
+          peer_group: groupKey,
           amc: heldAmc,
           r6m: heldRanked?.r6m ?? null,
           r1y: heldRanked?.r1y ?? null,

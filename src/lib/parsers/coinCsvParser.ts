@@ -4,6 +4,8 @@ import { searchDirectGrowthScheme } from "@/lib/mfapi";
 import { KNOWN_ISIN_MAP } from "@/lib/peers/isinMapping";
 import type { Owner } from "@/types/mf";
 
+export type LotType = "sip" | "lumpsum";
+
 export interface CoinLot {
   trade_date: string; // ISO yyyy-mm-dd
   amount: number;
@@ -11,6 +13,7 @@ export interface CoinLot {
   nav: number;
   settlement_id: string;
   exchange_order_id: string;
+  lot_type: LotType;
 }
 
 export interface CoinFund {
@@ -54,7 +57,7 @@ export interface CoinParseResult {
 
 const CLIENT_ID_OWNER: Record<string, Owner> = {
   YE7266: "praveen",
-  WKT509: "geetha",
+  EKT509: "geetha",
 };
 
 const ETF_KEYWORDS = [
@@ -152,6 +155,7 @@ interface BuyRow {
   nav: number;
   settlement_id: string;
   exchange_order_id: string;
+  lot_type: LotType;
 }
 
 // Parses a Zerodha Coin "Order History" CSV export. Only COMPLETE orders are
@@ -224,6 +228,7 @@ export async function parseCoinCsv(csvText: string): Promise<CoinParseResult> {
       nav: parseNum(r.nav),
       settlement_id: (r.settlement_id ?? "").trim(),
       exchange_order_id: (r.exchange_order_id ?? "").trim(),
+      lot_type: (r.tag ?? "").trim().toLowerCase() === "coiniossip" ? "sip" : "lumpsum",
     });
   }
 
@@ -283,6 +288,7 @@ export async function parseCoinCsv(csvText: string): Promise<CoinParseResult> {
         nav: r.nav,
         settlement_id: r.settlement_id,
         exchange_order_id: r.exchange_order_id,
+        lot_type: r.lot_type,
       }))
       .sort((a, b) => a.trade_date.localeCompare(b.trade_date));
 

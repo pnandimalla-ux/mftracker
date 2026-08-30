@@ -105,7 +105,13 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
-    if (!CATEGORY_UNIVERSE[category]) {
+    // Tier 1 accepts either a broad curated-universe category OR a precise
+    // peer_group value (e.g. "Sectoral - MNC", derived from a user's held
+    // funds) — syncTier1Category handles both, falling back to just the
+    // user's held funds under that value when it's not a universe key.
+    // Tier 2 and test mode sweep the curated universe itself, so they still
+    // require a known broad category.
+    if ((tier === 2 || test) && !CATEGORY_UNIVERSE[category]) {
       return NextResponse.json(
         { error: `Unknown category: ${category}` },
         { status: 400 }

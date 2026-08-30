@@ -27,6 +27,7 @@ export interface AlternativesData {
     scheme_code: string;
     scheme_name: string;
     category: string;
+    peer_group: string | null;
     amc: string | null;
     r6m: number | null;
     r1y: number | null;
@@ -264,7 +265,7 @@ export default function AlternativesPanel({
           ) : (
             <div className="mt-2 flex flex-wrap items-center gap-2 text-xs">
               <span className="rounded-full bg-blue-50 px-2 py-0.5 font-medium text-blue-700">
-                {heldFund.category}
+                {heldFund.peer_group ?? heldFund.category}
               </span>
               {heldFund.peer_rank_1y && heldFund.peer_count ? (
                 <span className="text-slate-500">
@@ -314,7 +315,7 @@ export default function AlternativesPanel({
               <div className="rounded-lg border border-slate-200 bg-slate-50 p-3">
                 <p className="text-sm font-semibold text-slate-800">{heldFund.scheme_name}</p>
                 <p className="text-xs text-slate-500">
-                  {heldFund.amc ?? "—"} · {heldFund.category}
+                  {heldFund.amc ?? "—"} · {heldFund.peer_group ?? heldFund.category}
                 </p>
 
                 <div className="mt-3 grid grid-cols-4 gap-2">

@@ -1,5 +1,7 @@
 export type Owner = "praveen" | "geetha";
 
+export type LotType = "sip" | "lumpsum";
+
 export interface MFHolding {
   id: string;
   user_id: string;
@@ -12,6 +14,10 @@ export interface MFHolding {
   avg_nav: number;
   invested_amount: number;
   as_on_date: string;
+  lot_type: LotType;
+  import_id: string | null;
+  mf_api_category: string | null;
+  peer_group: string | null;
   created_at: string;
 }
 
@@ -34,6 +40,8 @@ export interface MFNavCache {
 export interface MFPeerData {
   scheme_code: string;
   category: string | null;
+  mf_api_category: string | null;
+  peer_group: string | null;
   r6m: number | null;
   r1y: number | null;
   r3y: number | null;

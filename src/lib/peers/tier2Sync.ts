@@ -1,4 +1,6 @@
 import { createServiceClient } from "@/lib/supabase/service";
+import { fetchSchemeMeta } from "@/lib/mfapi";
+import { derivePeerGroup } from "./peerGroup";
 import {
   calculateReturns,
   delay,
@@ -62,6 +64,7 @@ export async function syncTier2Category(category: string): Promise<SyncCategoryR
     r3y: number | null;
     r5y: number | null;
   }> = [];
+  const touchedPeerGroups = new Set<string>();
 
   for (let i = 0; i < funds.length; i++) {
     const fund = funds[i];
@@ -74,11 +77,16 @@ export async function syncTier2Category(category: string): Promise<SyncCategoryR
       console.log("Calculated returns:", returns, "for scheme:", fund.code);
 
       const fundName = fund.name || schemeName || null;
+      const meta = await fetchSchemeMeta(fund.code);
+      const peerGroup = meta ? derivePeerGroup(meta.mf_api_category, fundName ?? fund.code) : category;
+      touchedPeerGroups.add(peerGroup);
 
       const { error } = await supabase.from("mf_peer_data").upsert(
         {
           scheme_code: fund.code,
           category,
+          mf_api_category: meta?.mf_api_category ?? null,
+          peer_group: peerGroup,
           r6m: returns.r6m,
           r1y: returns.r1y,
           r3y: returns.r3y,
@@ -107,8 +115,10 @@ export async function syncTier2Category(category: string): Promise<SyncCategoryR
     }
   }
 
-  const { errors: rankErrors } = await recalculateCategoryRanks(category);
-  errors.push(...rankErrors);
+  for (const peerGroup of Array.from(touchedPeerGroups)) {
+    const { errors: rankErrors } = await recalculateCategoryRanks(peerGroup);
+    errors.push(...rankErrors);
+  }
 
   // Category-level intelligence for the AI recommendation engine.
   let benchmarkR1y: number | null = null;

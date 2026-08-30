@@ -9,6 +9,7 @@ const NAV_ITEMS = [
   { href: "/sip", label: "SIP Calendar" },
   { href: "/import", label: "Import" },
   { href: "/recommendations", label: "Recommendations" },
+  { href: "/settings", label: "Settings" },
 ];
 
 export default function AppHeader({ userEmail }: { userEmail?: string }) {

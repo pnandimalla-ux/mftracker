@@ -31,6 +31,7 @@ interface SchemeRow {
 
 interface PeerApiData {
   category: string;
+  peer_group: string | null;
   scheme: SchemeRow;
   peers: SchemeRow[];
   category_avg: { r6m: number | null; r1y: number | null; r3y: number | null; r5y: number | null };
@@ -229,6 +230,10 @@ export default function FundDetailClient({
 
   const fundName = peerData?.scheme.name ?? navInfo?.scheme_name ?? holdings[0]?.scheme_name ?? schemeCode;
   const category = peerData?.category ?? holdings[0]?.category ?? null;
+  // Precise peer comparison bucket (e.g. "Sectoral - MNC") when available —
+  // this is what the fund is actually being ranked against, so it's what's
+  // shown next to the peer rank rather than the broad SEBI category.
+  const peerGroupLabel = peerData?.peer_group ?? category;
   const amc = holdings[0]?.amc ?? null;
 
   const allPeerRows = useMemo(() => {
@@ -286,9 +291,9 @@ export default function FundDetailClient({
               <div>
                 <div className="flex items-center gap-2">
                   <h1 className="text-xl font-semibold text-slate-900">{fundName}</h1>
-                  {category && (
+                  {peerGroupLabel && (
                     <span className="rounded-full bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-700">
-                      {category}
+                      {peerGroupLabel}
                     </span>
                   )}
                 </div>

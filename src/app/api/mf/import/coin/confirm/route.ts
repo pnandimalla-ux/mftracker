@@ -1,8 +1,10 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
-import { refreshNavCache } from "@/lib/mfapi";
+import { createServiceClient } from "@/lib/supabase/service";
+import { fetchSchemeMeta, refreshNavCache } from "@/lib/mfapi";
 import { syncNewFund } from "@/lib/peers/tier3Sync";
 import { isRealSchemeCode } from "@/lib/peers/peerSync";
+import { derivePeerGroup } from "@/lib/peers/peerGroup";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 
 export const maxDuration = 60;
@@ -14,6 +16,7 @@ interface ConfirmLot {
   amount: number;
   units: number;
   nav: number;
+  lot_type?: "sip" | "lumpsum";
 }
 
 interface ConfirmFund {
@@ -144,6 +147,20 @@ export async function POST(request: Request) {
       const finalSchemeCode =
         fund.scheme_code ?? `manual-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
+      // Precise peer comparison bucket, derived from mfapi.in's own category
+      // string + the fund name (e.g. splits "Sectoral/Thematic" into
+      // "Sectoral - MNC" vs "Sectoral - Technology") — best-effort only, a
+      // manual/unmatched fund or an mfapi.in miss just leaves this null.
+      let mfApiCategory: string | null = null;
+      let peerGroup: string | null = null;
+      if (fund.scheme_code && isRealSchemeCode(fund.scheme_code)) {
+        const meta = await fetchSchemeMeta(fund.scheme_code);
+        if (meta) {
+          mfApiCategory = meta.mf_api_category;
+          peerGroup = derivePeerGroup(meta.mf_api_category, fund.scheme_name);
+        }
+      }
+
       for (const lot of fund.lots) {
         rows.push({
           user_id: user.id,
@@ -156,6 +173,9 @@ export async function POST(request: Request) {
           avg_nav: lot.nav,
           invested_amount: lot.amount,
           as_on_date: lot.trade_date,
+          lot_type: lot.lot_type ?? "lumpsum",
+          mf_api_category: mfApiCategory,
+          peer_group: peerGroup,
         });
       }
 
@@ -172,24 +192,41 @@ export async function POST(request: Request) {
       await supabase.from("mf_holdings").delete().eq("user_id", user.id).eq("owner", owner).eq("scheme_code", scheme_code);
     }
 
-    const { data: inserted, error } = await supabase.from("mf_holdings").insert(rows).select();
-
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
-    }
-
-    const ownersImported = Array.from(new Set(validFunds.map((f) => f.owner)));
+    // mf_cas_imports is inserted FIRST (per owner) so each holding row can
+    // carry the batch's id — lets a later delete of the import remove every
+    // holding it created. Writes to mf_cas_imports go through the service
+    // client per the project's RLS convention for sync/import audit tables.
+    const serviceClient = createServiceClient();
+    const importIdMap = new Map<string, string>();
+    const ownersImported = Array.from(new Set(rows.map((r) => r.owner as string)));
     for (const owner of ownersImported) {
       const ownerLots = rows.filter((r) => r.owner === owner).length;
-      if (ownerLots > 0) {
-        await supabase.from("mf_cas_imports").insert({
+      const { data: importRow, error: importError } = await serviceClient
+        .from("mf_cas_imports")
+        .insert({
           user_id: user.id,
           owner,
           filename: "Zerodha Coin order history",
           status: "success",
           rows_imported: ownerLots,
-        });
+        })
+        .select()
+        .single();
+      if (importError) {
+        console.error(`Failed to create mf_cas_imports row for owner ${owner}:`, importError.message);
+        continue;
       }
+      importIdMap.set(owner, importRow.id as string);
+    }
+
+    for (const row of rows) {
+      row.import_id = importIdMap.get(row.owner as string) ?? null;
+    }
+
+    const { data: inserted, error } = await supabase.from("mf_holdings").insert(rows).select();
+
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
     // Best-effort background follow-up — never block the response on mfapi.in.
@@ -204,10 +241,16 @@ export async function POST(request: Request) {
       }
     }
 
+    const import_ids: { praveen?: string; geetha?: string } = {};
+    for (const [owner, id] of Array.from(importIdMap.entries())) {
+      if (owner === "praveen" || owner === "geetha") import_ids[owner] = id;
+    }
+
     return NextResponse.json({
       funds_imported: validFunds.length - fundsSkipped,
       funds_skipped: fundsSkipped,
       lots_imported: inserted?.length ?? rows.length,
+      import_ids,
     });
   } catch (err) {
     console.error("POST /api/mf/import/coin/confirm failed:", err);

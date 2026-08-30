@@ -1,4 +1,6 @@
 import { createServiceClient } from "@/lib/supabase/service";
+import { fetchSchemeMeta } from "@/lib/mfapi";
+import { derivePeerGroup } from "./peerGroup";
 import {
   calculateReturns,
   ensurePeerDataSchema,
@@ -31,10 +33,15 @@ export async function syncNewFund(schemeCode: string, category: string): Promise
   const returns = calculateReturns(sliced);
   console.log("Tier3 calculated returns:", returns, "for scheme:", schemeCode);
 
+  const meta = await fetchSchemeMeta(schemeCode);
+  const peerGroup = meta ? derivePeerGroup(meta.mf_api_category, schemeName ?? schemeCode) : category;
+
   const { error } = await supabase.from("mf_peer_data").upsert(
     {
       scheme_code: schemeCode,
       category,
+      mf_api_category: meta?.mf_api_category ?? null,
+      peer_group: peerGroup,
       r6m: returns.r6m,
       r1y: returns.r1y,
       r3y: returns.r3y,
@@ -47,7 +54,7 @@ export async function syncNewFund(schemeCode: string, category: string): Promise
   );
   if (error) throw new Error(`Failed to upsert mf_peer_data for ${schemeCode}: ${error.message}`);
 
-  const { errors } = await recalculateCategoryRanks(category);
+  const { errors } = await recalculateCategoryRanks(peerGroup);
   if (errors.length > 0) {
     console.error("Tier3 rank recalculation errors:", errors);
   }
