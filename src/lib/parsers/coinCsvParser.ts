@@ -243,10 +243,34 @@ export async function parseCoinCsv(csvText: string): Promise<CoinParseResult> {
     groups.set(key, list);
   }
 
+  const groupList = Array.from(groups.values());
+
+  // Resolve every ISIN mfapi.in doesn't already have a known scheme_code for
+  // concurrently, up front — the loop below used to `await`
+  // searchDirectGrowthScheme() one ISIN at a time, which at ~1-2s per call
+  // was slow enough (16+ unknown ISINs) to blow past Vercel's 60s function
+  // timeout on a large CSV. A single Promise.all resolves them all in a
+  // couple of seconds regardless of how many there are.
   const searchCache = new Map<string, string | null>();
+  const unknownIsinRows = new Map<string, BuyRow>();
+  for (const rows of groupList) {
+    const isin = rows[0].isin;
+    if (!KNOWN_ISIN_MAP[isin] && !unknownIsinRows.has(isin)) {
+      unknownIsinRows.set(isin, rows[0]);
+    }
+  }
+
+  await Promise.all(
+    Array.from(unknownIsinRows.entries()).map(async ([isin, row]) => {
+      const name = normalizeSchemeName(row.scheme_name);
+      const match = await searchDirectGrowthScheme(name);
+      searchCache.set(isin, match?.scheme_code ?? null);
+    })
+  );
+
   const funds: CoinFund[] = [];
 
-  for (const groupRows of Array.from(groups.values())) {
+  for (const groupRows of groupList) {
     const first = groupRows[0];
     const isin = first.isin;
     const known = KNOWN_ISIN_MAP[isin];
@@ -263,10 +287,7 @@ export async function parseCoinCsv(csvText: string): Promise<CoinParseResult> {
       category_confidence = "high";
       amc = known.amc;
     } else {
-      if (!searchCache.has(isin)) {
-        const match = await searchDirectGrowthScheme(cleanedName);
-        searchCache.set(isin, match?.scheme_code ?? null);
-      }
+      // Already resolved above — no await left in this loop.
       scheme_code = searchCache.get(isin) ?? null;
       const detection = detectCategory(cleanedName);
       category = detection.category;
