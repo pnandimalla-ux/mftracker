@@ -17,17 +17,45 @@ export async function PATCH(
     }
 
     const body = await request.json().catch(() => null);
-
-    if (!body || typeof body.is_active !== "boolean") {
+    if (!body || typeof body !== "object") {
       return NextResponse.json(
-        { error: "is_active (boolean) is required" },
+        { error: "Invalid request body" },
+        { status: 400 }
+      );
+    }
+
+    const { is_active, notify_email, notify_sms } = body as Record<string, unknown>;
+    const update: Record<string, unknown> = {};
+
+    if (is_active !== undefined) {
+      if (typeof is_active !== "boolean") {
+        return NextResponse.json({ error: "is_active must be a boolean" }, { status: 400 });
+      }
+      update.is_active = is_active;
+    }
+    if (notify_email !== undefined) {
+      if (typeof notify_email !== "boolean") {
+        return NextResponse.json({ error: "notify_email must be a boolean" }, { status: 400 });
+      }
+      update.notify_email = notify_email;
+    }
+    if (notify_sms !== undefined) {
+      if (typeof notify_sms !== "boolean") {
+        return NextResponse.json({ error: "notify_sms must be a boolean" }, { status: 400 });
+      }
+      update.notify_sms = notify_sms;
+    }
+
+    if (Object.keys(update).length === 0) {
+      return NextResponse.json(
+        { error: "No valid fields to update" },
         { status: 400 }
       );
     }
 
     const { data, error } = await supabase
       .from("mf_sip_schedules")
-      .update({ is_active: body.is_active })
+      .update(update)
       .eq("id", params.id)
       .eq("user_id", user.id)
       .select()

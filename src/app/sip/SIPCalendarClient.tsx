@@ -321,6 +321,25 @@ export default function SIPCalendarClient({
     }
   };
 
+  const toggleNotify = async (sip: MFSIPSchedule, field: "notify_email" | "notify_sms") => {
+    const nextValue = !sip[field];
+    try {
+      const res = await fetch(`/api/mf/sip/${sip.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [field]: nextValue }),
+      });
+      if (res.ok) {
+        const json = await res.json();
+        setSips((prev) =>
+          prev.map((s) => (s.id === sip.id ? (json.data as MFSIPSchedule) : s))
+        );
+      }
+    } catch (err) {
+      console.error(`Failed to toggle ${field}:`, err);
+    }
+  };
+
   return (
     <div className="min-h-screen bg-slate-50">
       <AppHeader userEmail={userEmail} />
@@ -434,10 +453,10 @@ export default function SIPCalendarClient({
                       </span>
                       <div className="mt-1 flex flex-col gap-1">
                         {occ.map(({ sip, isWeekend }) => (
-                          <div key={sip.id}>
+                          <div key={sip.id} className="group relative">
                             <span
                               title={`${sip.scheme_name} — ₹${sip.amount.toLocaleString("en-IN")}`}
-                              className={`block truncate rounded-full px-2 py-0.5 text-[10px] font-medium ${
+                              className={`block truncate rounded-full px-2 py-0.5 pr-4 text-[10px] font-medium ${
                                 sip.owner === "praveen"
                                   ? "bg-blue-100 text-blue-700"
                                   : "bg-amber-100 text-amber-700"
@@ -445,6 +464,19 @@ export default function SIPCalendarClient({
                             >
                               {sip.scheme_name} · ₹{sip.amount.toLocaleString("en-IN")}
                             </span>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                if (window.confirm("Delete this SIP?")) {
+                                  deleteSip(sip.id);
+                                }
+                              }}
+                              aria-label="Delete SIP"
+                              title="Delete SIP"
+                              className="absolute -right-1 -top-1 hidden h-3.5 w-3.5 items-center justify-center rounded-full bg-red-600 text-[9px] font-bold leading-none text-white group-hover:flex"
+                            >
+                              ×
+                            </button>
                             {isWeekend && (
                               <span className="mt-0.5 block text-[9px] text-slate-400">
                                 → next trading day
@@ -636,13 +668,15 @@ export default function SIPCalendarClient({
                   <th className="px-4 py-2 font-medium">SIP date</th>
                   <th className="px-4 py-2 font-medium">Category</th>
                   <th className="px-4 py-2 font-medium">Status</th>
+                  <th className="px-4 py-2 font-medium">Email</th>
+                  <th className="px-4 py-2 font-medium">SMS</th>
                   <th className="px-4 py-2 font-medium">Actions</th>
                 </tr>
               </thead>
               <tbody>
                 {sips.length === 0 && (
                   <tr>
-                    <td colSpan={7} className="px-4 py-6 text-center text-slate-400">
+                    <td colSpan={9} className="px-4 py-6 text-center text-slate-400">
                       No SIPs yet.
                     </td>
                   </tr>
@@ -681,6 +715,22 @@ export default function SIPCalendarClient({
                       >
                         {sip.is_active ? "Active" : "Paused"}
                       </span>
+                    </td>
+                    <td className="px-4 py-3">
+                      <input
+                        type="checkbox"
+                        checked={sip.notify_email}
+                        onChange={() => toggleNotify(sip, "notify_email")}
+                        aria-label="Email notifications"
+                      />
+                    </td>
+                    <td className="px-4 py-3">
+                      <input
+                        type="checkbox"
+                        checked={sip.notify_sms}
+                        onChange={() => toggleNotify(sip, "notify_sms")}
+                        aria-label="SMS notifications"
+                      />
                     </td>
                     <td className="px-4 py-3">
                       <div className="flex gap-3">

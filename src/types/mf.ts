@@ -108,6 +108,8 @@ export interface MFSIPSchedule {
   start_date: string;
   end_date: string | null;
   is_active: boolean;
+  notify_email: boolean;
+  notify_sms: boolean;
   created_at: string;
 }
 

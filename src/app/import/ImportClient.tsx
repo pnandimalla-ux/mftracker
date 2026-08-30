@@ -56,6 +56,65 @@ interface DuplicateInfo {
 
 type DuplicateAction = "skip" | "add_lots" | "replace";
 
+interface DetectedSip {
+  key: string;
+  scheme_name: string;
+  scheme_code: string | null;
+  owner: Owner;
+  amount: number;
+  sip_date: number;
+  category: string;
+}
+
+const SIP_ACTIVE_WINDOW_DAYS = 60;
+
+// A fund counts as an "active SIP" if its most recent SIP-tagged lot landed
+// within the last 60 days — an older SIP lot with nothing recent likely
+// means the SIP was since paused or switched, so it isn't auto-suggested.
+function detectActiveSips(funds: PreviewFund[]): DetectedSip[] {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - SIP_ACTIVE_WINDOW_DAYS);
+  const cutoffIso = cutoff.toISOString().slice(0, 10);
+
+  const results: DetectedSip[] = [];
+  for (const fund of funds) {
+    const sipLots = fund.lots.filter((l) => l.lot_type === "sip");
+    if (sipLots.length === 0) continue;
+
+    const mostRecent = [...sipLots].sort((a, b) => b.trade_date.localeCompare(a.trade_date))[0];
+    if (mostRecent.trade_date < cutoffIso) continue;
+
+    const day = Number(mostRecent.trade_date.slice(8, 10));
+    if (!Number.isInteger(day) || day < 1 || day > 31) continue;
+
+    results.push({
+      key: fund.key,
+      scheme_name: fund.scheme_name,
+      scheme_code: fund.scheme_code,
+      owner: fund.owner,
+      amount: mostRecent.amount,
+      sip_date: day,
+      category: fund.category,
+    });
+  }
+  return results;
+}
+
+function ordinalSuffix(n: number): string {
+  const v = n % 100;
+  if (v >= 11 && v <= 13) return "th";
+  switch (n % 10) {
+    case 1:
+      return "st";
+    case 2:
+      return "nd";
+    case 3:
+      return "rd";
+    default:
+      return "th";
+  }
+}
+
 function ConfidenceBadge({ level }: { level: ConfidenceLevel }) {
   const styles: Record<ConfidenceLevel, string> = {
     high: "bg-green-100 text-green-700",
@@ -101,6 +160,13 @@ export default function ImportClient({
   const [confirming, setConfirming] = useState(false);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
   const [historyToast, setHistoryToast] = useState<string | null>(null);
+
+  // --- Step 4: active SIPs detected after import ---
+  const [showSipStep, setShowSipStep] = useState(false);
+  const [sipCandidates, setSipCandidates] = useState<DetectedSip[]>([]);
+  const [sipSelected, setSipSelected] = useState<Record<string, boolean>>({});
+  const [addingSips, setAddingSips] = useState(false);
+  const [sipAddResult, setSipAddResult] = useState<string | null>(null);
 
   // --- Manual add form state ---
   const [mOwner, setMOwner] = useState<Owner>("praveen");
@@ -303,6 +369,10 @@ export default function ImportClient({
     setSellTransactions([]);
     setParseErrorRows([]);
     setDuplicates([]);
+    setShowSipStep(false);
+    setSipCandidates([]);
+    setSipSelected({});
+    setSipAddResult(null);
     try {
       const results = await Promise.all(
         coinFiles.map(async (f) => {
@@ -445,14 +515,58 @@ export default function ImportClient({
       setImportSuccess(
         `${json.funds_imported} fund${json.funds_imported === 1 ? "" : "s"} imported (${json.lots_imported} lot${json.lots_imported === 1 ? "" : "s"} total)`
       );
-      setTimeout(() => {
-        router.push("/dashboard");
-      }, 2000);
+
+      const detected = detectActiveSips(selectedFunds);
+      if (detected.length > 0) {
+        setSipCandidates(detected);
+        setSipSelected(Object.fromEntries(detected.map((d) => [d.key, true])));
+        setShowSipStep(true);
+      } else {
+        setTimeout(() => {
+          router.push("/dashboard");
+        }, 2000);
+      }
     } catch (err) {
       console.error("Coin CSV import failed:", err);
       setParseError("Import failed. Please try again.");
     } finally {
       setConfirming(false);
+    }
+  };
+
+  const handleAddDetectedSips = async () => {
+    const selected = sipCandidates.filter((c) => sipSelected[c.key]);
+    if (selected.length === 0) return;
+    setAddingSips(true);
+    setSipAddResult(null);
+    try {
+      const res = await fetch("/api/mf/sip/bulk", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sips: selected.map((c) => ({
+            scheme_name: c.scheme_name,
+            scheme_code: c.scheme_code,
+            owner: c.owner,
+            amount: c.amount,
+            sip_date: c.sip_date,
+            category: c.category,
+            frequency: "monthly",
+          })),
+        }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Failed to add SIPs");
+      setSipAddResult(
+        `${json.created} SIP${json.created === 1 ? "" : "s"} added to calendar${
+          json.skipped ? ` (${json.skipped} already existed)` : ""
+        }`
+      );
+    } catch (err) {
+      console.error("Failed to add detected SIPs:", err);
+      setSipAddResult("Failed to add SIPs. Please try again.");
+    } finally {
+      setAddingSips(false);
     }
   };
 
@@ -1519,6 +1633,67 @@ export default function ImportClient({
                 {confirming ? "Importing…" : `Import ${selectedFunds.length} fund${selectedFunds.length === 1 ? "" : "s"} (${selectedLots} lot${selectedLots === 1 ? "" : "s"}) →`}
               </button>
             </div>
+          </div>
+        )}
+
+        {/* Step 4 — active SIPs detected after import */}
+        {showSipStep && sipCandidates.length > 0 && (
+          <div className="mt-6 rounded-xl border-2 border-blue-200 bg-white p-5">
+            <h3 className="text-base font-semibold text-slate-800">
+              Step 4 — Active SIPs Detected
+            </h3>
+            <p className="mt-1 text-sm text-slate-500">
+              These funds had a SIP purchase in the last {SIP_ACTIVE_WINDOW_DAYS} days. Add them to
+              your SIP calendar so future installments show up automatically.
+            </p>
+
+            <div className="mt-4 space-y-2">
+              {sipCandidates.map((c) => (
+                <label
+                  key={c.key}
+                  className="flex cursor-pointer items-center gap-3 rounded-lg border border-slate-200 px-3 py-2 hover:bg-slate-50"
+                >
+                  <input
+                    type="checkbox"
+                    checked={sipSelected[c.key] ?? false}
+                    onChange={(e) =>
+                      setSipSelected((prev) => ({ ...prev, [c.key]: e.target.checked }))
+                    }
+                  />
+                  <div className="flex items-center gap-1.5">
+                    <span
+                      className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold ${
+                        c.owner === "praveen" ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700"
+                      }`}
+                    >
+                      {c.owner === "praveen" ? "P" : "G"}
+                    </span>
+                    <div>
+                      <p className="text-sm font-medium text-slate-800">{c.scheme_name}</p>
+                      <p className="text-xs text-slate-500">
+                        {formatMoney(c.amount)} on the {c.sip_date}
+                        {ordinalSuffix(c.sip_date)} of every month · {c.category}
+                      </p>
+                    </div>
+                  </div>
+                </label>
+              ))}
+            </div>
+
+            {sipAddResult && (
+              <p className="mt-3 rounded-lg bg-green-50 px-3 py-2 text-sm text-green-700">
+                {sipAddResult}
+              </p>
+            )}
+
+            <button
+              type="button"
+              onClick={handleAddDetectedSips}
+              disabled={addingSips || !Object.values(sipSelected).some(Boolean)}
+              className="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {addingSips ? "Adding…" : "Add to SIP Calendar"}
+            </button>
           </div>
         )}
       </main>
