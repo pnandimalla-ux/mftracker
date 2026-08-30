@@ -1,54 +1,7 @@
 import { redirect } from "next/navigation";
 import { getAuthedUser } from "@/lib/supabase/getAuthedUser";
 import SIPCalendarClient from "./SIPCalendarClient";
-import type { MFSIPSchedule, Owner, SIPFrequency } from "@/types/mf";
-
-const SAMPLE_SIPS: {
-  owner: Owner;
-  scheme_name: string;
-  category: string;
-  amount: number;
-  sip_date: number;
-  frequency: SIPFrequency;
-  start_date: string;
-}[] = [
-  {
-    owner: "praveen",
-    scheme_name: "Mirae Asset Large Cap Fund",
-    category: "Large Cap",
-    amount: 5000,
-    sip_date: 5,
-    frequency: "monthly",
-    start_date: "2025-01-05",
-  },
-  {
-    owner: "praveen",
-    scheme_name: "HDFC Mid-Cap Opportunities Fund",
-    category: "Mid Cap",
-    amount: 3000,
-    sip_date: 10,
-    frequency: "monthly",
-    start_date: "2025-01-10",
-  },
-  {
-    owner: "geetha",
-    scheme_name: "Axis Bluechip Fund",
-    category: "Large Cap",
-    amount: 3000,
-    sip_date: 7,
-    frequency: "monthly",
-    start_date: "2025-01-07",
-  },
-  {
-    owner: "geetha",
-    scheme_name: "Kotak Emerging Equity Fund",
-    category: "Mid Cap",
-    amount: 2000,
-    sip_date: 15,
-    frequency: "monthly",
-    start_date: "2025-01-15",
-  },
-];
+import type { MFSIPSchedule } from "@/types/mf";
 
 function SIPPageError({ message }: { message: string }) {
   return (
@@ -79,17 +32,6 @@ export default async function SIPPage() {
   let sips: MFSIPSchedule[] = [];
 
   try {
-    const { count } = await supabase
-      .from("mf_sip_schedules")
-      .select("id", { count: "exact", head: true })
-      .eq("user_id", user.id);
-
-    if (!count) {
-      await supabase.from("mf_sip_schedules").insert(
-        SAMPLE_SIPS.map((sip) => ({ ...sip, user_id: user!.id }))
-      );
-    }
-
     const { data, error } = await supabase
       .from("mf_sip_schedules")
       .select("*")
@@ -97,7 +39,6 @@ export default async function SIPPage() {
       .order("sip_date", { ascending: true });
 
     if (error) throw error;
-
     sips = (data ?? []) as MFSIPSchedule[];
   } catch (err) {
     console.error("SIP page: failed to load SIP schedules", err);
