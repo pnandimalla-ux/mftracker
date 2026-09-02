@@ -3,6 +3,7 @@
 import { useMemo, useState, type FormEvent } from "react";
 import AppHeader from "@/components/AppHeader";
 import type { MFSIPSchedule, Owner, SIPFrequency } from "@/types/mf";
+import { detectCategory } from "@/lib/analysis/fundCategoriser";
 
 const MONTH_NAMES = [
   "January",
@@ -63,6 +64,39 @@ function computeLumpsumsByDay(
     map.set(ld, existing);
   }
   return map;
+}
+
+interface GroupedLumpsum {
+  key: string;
+  scheme_name: string;
+  owner: Owner;
+  amount: number;
+  trade_date: string;
+  category: string;
+}
+
+// Collapses individual lumpsum lots into one row per fund + owner — total
+// invested is the sum of every lot, last purchase date is the most recent.
+function groupLumpsums(lumpsums: LumpsumEntry[]): GroupedLumpsum[] {
+  const map = new Map<string, GroupedLumpsum>();
+  for (const l of lumpsums) {
+    const key = `${l.scheme_name}::${l.owner}`;
+    const existing = map.get(key);
+    if (!existing) {
+      map.set(key, {
+        key,
+        scheme_name: l.scheme_name,
+        owner: l.owner,
+        amount: l.amount,
+        trade_date: l.trade_date,
+        category: detectCategory(l.scheme_name).category,
+      });
+    } else {
+      existing.amount += l.amount;
+      if (l.trade_date > existing.trade_date) existing.trade_date = l.trade_date;
+    }
+  }
+  return Array.from(map.values());
 }
 
 interface SchemeSearchResult {
@@ -176,6 +210,47 @@ export default function SIPCalendarClient({
   const [fFrequency, setFFrequency] = useState<SIPFrequency>("monthly");
   const [searchResults, setSearchResults] = useState<SchemeSearchResult[]>([]);
   const [searching, setSearching] = useState(false);
+
+  // --- "All SIPs" table filters ---
+  const [sipFilterOwner, setSipFilterOwner] = useState<"all" | Owner>("all");
+  const [sipFilterFrequency, setSipFilterFrequency] = useState<"all" | SIPFrequency>("all");
+  const [sipFilterCategory, setSipFilterCategory] = useState("all");
+  const [sipFilterStatus, setSipFilterStatus] = useState<"all" | "active" | "paused">("all");
+
+  const sipCategoryOptions = useMemo(
+    () => Array.from(new Set(sips.map((s) => s.category).filter((c): c is string => !!c))).sort(),
+    [sips]
+  );
+
+  const filteredSips = useMemo(() => {
+    return sips.filter((s) => {
+      if (sipFilterOwner !== "all" && s.owner !== sipFilterOwner) return false;
+      if (sipFilterFrequency !== "all" && s.frequency !== sipFilterFrequency) return false;
+      if (sipFilterCategory !== "all" && s.category !== sipFilterCategory) return false;
+      if (sipFilterStatus === "active" && !s.is_active) return false;
+      if (sipFilterStatus === "paused" && s.is_active) return false;
+      return true;
+    });
+  }, [sips, sipFilterOwner, sipFilterFrequency, sipFilterCategory, sipFilterStatus]);
+
+  // --- "Lumpsum Purchases" table filters ---
+  const [lumpsumFilterOwner, setLumpsumFilterOwner] = useState<"all" | Owner>("all");
+  const [lumpsumFilterCategory, setLumpsumFilterCategory] = useState("all");
+
+  const groupedLumpsums = useMemo(() => groupLumpsums(lumpsums), [lumpsums]);
+
+  const lumpsumCategoryOptions = useMemo(
+    () => Array.from(new Set(groupedLumpsums.map((l) => l.category))).sort(),
+    [groupedLumpsums]
+  );
+
+  const filteredLumpsums = useMemo(() => {
+    return groupedLumpsums.filter((l) => {
+      if (lumpsumFilterOwner !== "all" && l.owner !== lumpsumFilterOwner) return false;
+      if (lumpsumFilterCategory !== "all" && l.category !== lumpsumFilterCategory) return false;
+      return true;
+    });
+  }, [groupedLumpsums, lumpsumFilterOwner, lumpsumFilterCategory]);
 
   const occurrencesThisView = useMemo(
     () => computeOccurrences(sips, viewYear, viewMonth),
@@ -742,6 +817,52 @@ export default function SIPCalendarClient({
             </form>
           )}
 
+          {/* Filter bar */}
+          <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 px-4 py-2.5">
+            <span className="text-xs font-medium text-slate-400">Filter:</span>
+            <select
+              value={sipFilterOwner}
+              onChange={(e) => setSipFilterOwner(e.target.value as "all" | Owner)}
+              className="rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            >
+              <option value="all">All owners</option>
+              <option value="praveen">Praveen</option>
+              <option value="geetha">Geetha</option>
+            </select>
+            <select
+              value={sipFilterFrequency}
+              onChange={(e) => setSipFilterFrequency(e.target.value as "all" | SIPFrequency)}
+              className="rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            >
+              <option value="all">All frequencies</option>
+              <option value="weekly">Weekly</option>
+              <option value="bi-weekly">Bi-weekly</option>
+              <option value="monthly">Monthly</option>
+              <option value="quarterly">Quarterly</option>
+            </select>
+            <select
+              value={sipFilterCategory}
+              onChange={(e) => setSipFilterCategory(e.target.value)}
+              className="rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            >
+              <option value="all">All categories</option>
+              {sipCategoryOptions.map((c) => (
+                <option key={c} value={c}>
+                  {c}
+                </option>
+              ))}
+            </select>
+            <select
+              value={sipFilterStatus}
+              onChange={(e) => setSipFilterStatus(e.target.value as "all" | "active" | "paused")}
+              className="rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            >
+              <option value="all">All statuses</option>
+              <option value="active">Active</option>
+              <option value="paused">Paused</option>
+            </select>
+          </div>
+
           <div className="overflow-x-auto">
             <table className="w-full text-left text-sm">
               <thead>
@@ -765,7 +886,14 @@ export default function SIPCalendarClient({
                     </td>
                   </tr>
                 )}
-                {sips.map((sip) => (
+                {sips.length > 0 && filteredSips.length === 0 && (
+                  <tr>
+                    <td colSpan={9} className="px-4 py-6 text-center text-slate-400">
+                      No SIPs match the selected filters.
+                    </td>
+                  </tr>
+                )}
+                {filteredSips.map((sip) => (
                   <tr key={sip.id} className="border-b border-slate-100 last:border-0">
                     <td className="px-4 py-3 text-slate-800">{sip.scheme_name}</td>
                     <td className="px-4 py-3">
@@ -844,6 +972,85 @@ export default function SIPCalendarClient({
             </table>
           </div>
         </div>
+
+        {/* Lumpsum purchases */}
+        {lumpsums.length > 0 && (
+          <div className="mt-8 rounded-xl border border-slate-200 bg-white">
+            <div className="border-b border-slate-200 px-4 py-3">
+              <h3 className="text-sm font-semibold text-slate-800">Lumpsum Purchases</h3>
+            </div>
+
+            {/* Filter bar */}
+            <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 px-4 py-2.5">
+              <span className="text-xs font-medium text-slate-400">Filter:</span>
+              <select
+                value={lumpsumFilterOwner}
+                onChange={(e) => setLumpsumFilterOwner(e.target.value as "all" | Owner)}
+                className="rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              >
+                <option value="all">All owners</option>
+                <option value="praveen">Praveen</option>
+                <option value="geetha">Geetha</option>
+              </select>
+              <select
+                value={lumpsumFilterCategory}
+                onChange={(e) => setLumpsumFilterCategory(e.target.value)}
+                className="rounded-lg border border-slate-300 px-2 py-1 text-xs text-slate-600 focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              >
+                <option value="all">All categories</option>
+                {lumpsumCategoryOptions.map((c) => (
+                  <option key={c} value={c}>
+                    {c}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-sm">
+                <thead>
+                  <tr className="border-b border-slate-200 text-xs text-slate-500">
+                    <th className="px-4 py-2 font-medium">Fund name</th>
+                    <th className="px-4 py-2 font-medium">Owner</th>
+                    <th className="px-4 py-2 font-medium">Total invested</th>
+                    <th className="px-4 py-2 font-medium">Last purchase date</th>
+                    <th className="px-4 py-2 font-medium">Category</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {filteredLumpsums.length === 0 && (
+                    <tr>
+                      <td colSpan={5} className="px-4 py-6 text-center text-slate-400">
+                        No lumpsum purchases match the selected filters.
+                      </td>
+                    </tr>
+                  )}
+                  {filteredLumpsums.map((l) => (
+                    <tr key={l.key} className="border-b border-slate-100 last:border-0">
+                      <td className="px-4 py-3 text-slate-800">{l.scheme_name}</td>
+                      <td className="px-4 py-3">
+                        <span
+                          className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
+                            l.owner === "praveen"
+                              ? "bg-blue-100 text-blue-700"
+                              : "bg-amber-100 text-amber-700"
+                          }`}
+                        >
+                          {l.owner === "praveen" ? "P" : "G"}
+                        </span>
+                      </td>
+                      <td className="px-4 py-3 text-slate-800">
+                        ₹{l.amount.toLocaleString("en-IN")}
+                      </td>
+                      <td className="px-4 py-3 text-slate-600">{l.trade_date}</td>
+                      <td className="px-4 py-3 text-slate-600">{l.category}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
       </main>
     </div>
   );
