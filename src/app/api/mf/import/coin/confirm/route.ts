@@ -17,6 +17,7 @@ interface ConfirmLot {
   units: number;
   nav: number;
   lot_type?: "sip" | "lumpsum";
+  settlement_id?: string;
 }
 
 interface ConfirmFund {
@@ -127,10 +128,47 @@ export async function POST(request: Request) {
     const action: DuplicateAction =
       duplicate_action === "add_lots" || duplicate_action === "replace" ? duplicate_action : "skip";
 
+    // For "add_lots" duplicate funds, fetch their existing lots so we can
+    // filter out any incoming lot that's already in mf_holdings — otherwise
+    // a CSV date range that overlaps a prior import double-inserts those
+    // lots, inflating units and invested amounts.
+    const addLotsSchemeCodes = Array.from(
+      new Set(
+        validFunds
+          .filter((f) => {
+            const dupKey = f.scheme_code ? `${f.owner}:${f.scheme_code}` : null;
+            return action === "add_lots" && !!dupKey && duplicateCounts.has(dupKey);
+          })
+          .map((f) => f.scheme_code)
+          .filter((c): c is string => !!c)
+      )
+    );
+
+    const existingSettlementIds = new Set<string>();
+    const existingFallbackKeys = new Set<string>();
+    if (addLotsSchemeCodes.length > 0) {
+      const { data: existingLots } = await supabase
+        .from("mf_holdings")
+        .select("settlement_id, as_on_date, invested_amount, units, owner, scheme_code")
+        .eq("user_id", user.id)
+        .in("scheme_code", addLotsSchemeCodes);
+
+      for (const row of existingLots ?? []) {
+        const keyPrefix = `${row.owner}:${row.scheme_code}`;
+        const settlementId = typeof row.settlement_id === "string" ? row.settlement_id.trim() : "";
+        if (settlementId) {
+          existingSettlementIds.add(`${keyPrefix}:${settlementId}`);
+        } else {
+          existingFallbackKeys.add(`${keyPrefix}:${row.as_on_date}|${row.invested_amount}|${row.units}`);
+        }
+      }
+    }
+
     const rows: Record<string, unknown>[] = [];
     const schemeCodeCategories = new Map<string, string>();
     const replaceKeys: { owner: string; scheme_code: string }[] = [];
     let fundsSkipped = 0;
+    let lotsSkippedDuplicates = 0;
 
     for (const fund of validFunds) {
       const dupKey = fund.scheme_code ? `${fund.owner}:${fund.scheme_code}` : null;
@@ -162,6 +200,20 @@ export async function POST(request: Request) {
       }
 
       for (const lot of fund.lots) {
+        if (isDuplicate && action === "add_lots" && fund.scheme_code) {
+          const keyPrefix = `${fund.owner}:${fund.scheme_code}`;
+          const settlementId = (lot.settlement_id ?? "").trim();
+          if (settlementId) {
+            if (existingSettlementIds.has(`${keyPrefix}:${settlementId}`)) {
+              lotsSkippedDuplicates++;
+              continue;
+            }
+          } else if (existingFallbackKeys.has(`${keyPrefix}:${lot.trade_date}|${lot.amount}|${lot.units}`)) {
+            lotsSkippedDuplicates++;
+            continue;
+          }
+        }
+
         rows.push({
           user_id: user.id,
           owner: fund.owner,
@@ -176,6 +228,7 @@ export async function POST(request: Request) {
           lot_type: lot.lot_type ?? "lumpsum",
           mf_api_category: mfApiCategory,
           peer_group: peerGroup,
+          settlement_id: lot.settlement_id ?? null,
         });
       }
 
@@ -185,7 +238,11 @@ export async function POST(request: Request) {
     }
 
     if (rows.length === 0) {
-      return NextResponse.json({ error: "No lots to import (all funds were skipped as duplicates)" }, { status: 400 });
+      const reason =
+        lotsSkippedDuplicates > 0
+          ? "all lots were already imported"
+          : "all funds were skipped as duplicates";
+      return NextResponse.json({ error: `No lots to import (${reason})` }, { status: 400 });
     }
 
     for (const { owner, scheme_code } of replaceKeys) {
@@ -250,6 +307,7 @@ export async function POST(request: Request) {
       funds_imported: validFunds.length - fundsSkipped,
       funds_skipped: fundsSkipped,
       lots_imported: inserted?.length ?? rows.length,
+      lots_skipped_duplicates: lotsSkippedDuplicates,
       import_ids,
     });
   } catch (err) {
