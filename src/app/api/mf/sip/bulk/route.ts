@@ -15,6 +15,10 @@ interface BulkSipInput {
 
 const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
+export const maxDuration = 60;
+
+const VALID_FREQUENCIES: SIPFrequency[] = ["weekly", "bi-weekly", "monthly", "quarterly"];
+
 export async function POST(request: Request) {
   try {
     const supabase = createClient();
@@ -57,8 +61,9 @@ export async function POST(request: Request) {
         amount,
         sip_date,
         category: typeof raw.category === "string" && raw.category.trim() ? raw.category.trim() : null,
-        frequency:
-          raw.frequency === "weekly" ? "weekly" : raw.frequency === "quarterly" ? "quarterly" : "monthly",
+        frequency: VALID_FREQUENCIES.includes(raw.frequency as SIPFrequency)
+          ? (raw.frequency as SIPFrequency)
+          : "monthly",
         start_date,
       });
     }

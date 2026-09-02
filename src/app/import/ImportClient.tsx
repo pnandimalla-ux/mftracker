@@ -68,36 +68,49 @@ interface DetectedSip {
   start_date: string;
 }
 
-const SIP_ACTIVE_WINDOW_DAYS = 60;
+// Parses a "yyyy-mm-dd" string as a local date — never `new Date(iso)`,
+// which parses date-only strings as UTC midnight and causes off-by-one
+// day errors under IST (UTC+5:30).
+function parseLocalDate(iso: string): Date {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
 
-// A fund counts as an "active SIP" if its most recent SIP-tagged lot landed
-// within the last 60 days — an older SIP lot with nothing recent likely
-// means the SIP was since paused or switched, so it isn't auto-suggested.
+function medianGapDays(datesAsc: string[]): number {
+  const gaps: number[] = [];
+  for (let i = 1; i < datesAsc.length; i++) {
+    const prev = parseLocalDate(datesAsc[i - 1]);
+    const curr = parseLocalDate(datesAsc[i]);
+    gaps.push(Math.round((curr.getTime() - prev.getTime()) / (24 * 60 * 60 * 1000)));
+  }
+  const sorted = [...gaps].sort((a, b) => a - b);
+  const mid = Math.floor(sorted.length / 2);
+  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+}
+
+// Detects each fund's SIP cadence from the spacing between its SIP-tagged
+// lots — a single lot defaults to monthly (there's no interval to measure),
+// otherwise the median gap between consecutive lots picks the frequency.
 function detectActiveSips(funds: PreviewFund[]): DetectedSip[] {
-  const cutoff = new Date();
-  cutoff.setDate(cutoff.getDate() - SIP_ACTIVE_WINDOW_DAYS);
-  const cutoffIso = cutoff.toISOString().slice(0, 10);
-
   const results: DetectedSip[] = [];
   for (const fund of funds) {
     const sipLots = fund.lots.filter((l) => l.lot_type === "sip");
-    if (sipLots.length === 0) continue;
+    if (sipLots.length < 1) continue;
 
     const sorted = [...sipLots].sort((a, b) => a.trade_date.localeCompare(b.trade_date));
     const mostRecent = sorted[sorted.length - 1];
-    if (mostRecent.trade_date < cutoffIso) continue;
 
-    const day = Number(mostRecent.trade_date.slice(8, 10));
+    const day = Number(mostRecent.trade_date.split("-")[2]);
     if (!Number.isInteger(day) || day < 1 || day > 31) continue;
 
-    // More than one SIP lot landing in the same calendar month means the
-    // fund is being debited weekly rather than monthly.
-    const lotsPerMonth = new Map<string, number>();
-    for (const lot of sipLots) {
-      const month = lot.trade_date.slice(0, 7);
-      lotsPerMonth.set(month, (lotsPerMonth.get(month) ?? 0) + 1);
+    let frequency: SIPFrequency = "monthly";
+    if (sorted.length >= 2) {
+      const gap = medianGapDays(sorted.map((l) => l.trade_date));
+      if (gap <= 10) frequency = "weekly";
+      else if (gap <= 20) frequency = "bi-weekly";
+      else if (gap <= 50) frequency = "monthly";
+      else frequency = "quarterly";
     }
-    const isWeekly = Array.from(lotsPerMonth.values()).some((count) => count > 1);
 
     results.push({
       key: fund.key,
@@ -107,7 +120,7 @@ function detectActiveSips(funds: PreviewFund[]): DetectedSip[] {
       amount: mostRecent.amount,
       sip_date: day,
       category: fund.category,
-      frequency: isWeekly ? "weekly" : "monthly",
+      frequency,
       start_date: sorted[0].trade_date,
     });
   }
@@ -144,6 +157,27 @@ function ConfidenceBadge({ level }: { level: ConfidenceLevel }) {
 
 function formatMoney(n: number) {
   return `₹${Math.round(n).toLocaleString("en-IN")}`;
+}
+
+const FREQUENCY_LABELS: Record<SIPFrequency, string> = {
+  weekly: "Weekly",
+  "bi-weekly": "Bi-weekly",
+  monthly: "Monthly",
+  quarterly: "Quarterly",
+};
+
+function FrequencyBadge({ frequency }: { frequency: SIPFrequency }) {
+  const styles: Record<SIPFrequency, string> = {
+    weekly: "bg-purple-100 text-purple-700",
+    "bi-weekly": "bg-indigo-100 text-indigo-700",
+    monthly: "bg-blue-100 text-blue-700",
+    quarterly: "bg-teal-100 text-teal-700",
+  };
+  return (
+    <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${styles[frequency]}`}>
+      {FREQUENCY_LABELS[frequency]}
+    </span>
+  );
 }
 
 export default function ImportClient({
@@ -572,11 +606,7 @@ export default function ImportClient({
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Failed to add SIPs");
-      setSipAddResult(
-        `${json.created} SIP${json.created === 1 ? "" : "s"} added to calendar${
-          json.skipped ? ` (${json.skipped} already existed)` : ""
-        }`
-      );
+      setSipAddResult(`${json.created} SIP(s) added, ${json.skipped} already existed`);
     } catch (err) {
       console.error("Failed to add detected SIPs:", err);
       setSipAddResult("Failed to add SIPs. Please try again.");
@@ -1655,11 +1685,10 @@ export default function ImportClient({
         {showSipStep && sipCandidates.length > 0 && (
           <div className="mt-6 rounded-xl border-2 border-blue-200 bg-white p-5">
             <h3 className="text-base font-semibold text-slate-800">
-              Step 4 — Active SIPs Detected
+              Active SIPs Detected
             </h3>
             <p className="mt-1 text-sm text-slate-500">
-              These funds had a SIP purchase in the last {SIP_ACTIVE_WINDOW_DAYS} days. Add them to
-              your SIP calendar so future installments show up automatically.
+              These SIPs were found in your import. Confirm to add them to your SIP calendar.
             </p>
 
             <div className="mt-4 space-y-2">
@@ -1675,24 +1704,22 @@ export default function ImportClient({
                       setSipSelected((prev) => ({ ...prev, [c.key]: e.target.checked }))
                     }
                   />
-                  <div className="flex items-center gap-1.5">
-                    <span
-                      className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold ${
-                        c.owner === "praveen" ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700"
-                      }`}
-                    >
-                      {c.owner === "praveen" ? "P" : "G"}
-                    </span>
-                    <div>
-                      <p className="text-sm font-medium text-slate-800">{c.scheme_name}</p>
-                      <p className="text-xs text-slate-500">
-                        {formatMoney(c.amount)}{" "}
-                        {c.frequency === "weekly"
-                          ? `every week starting the ${c.sip_date}${ordinalSuffix(c.sip_date)}`
-                          : `on the ${c.sip_date}${ordinalSuffix(c.sip_date)} of every month`}{" "}
-                        · {c.category}
-                      </p>
+                  <span
+                    className={`inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold ${
+                      c.owner === "praveen" ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700"
+                    }`}
+                  >
+                    {c.owner === "praveen" ? "P" : "G"}
+                  </span>
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <p className="truncate text-sm font-medium text-slate-800">{c.scheme_name}</p>
+                      <FrequencyBadge frequency={c.frequency} />
                     </div>
+                    <p className="text-xs text-slate-500">
+                      {formatMoney(c.amount)} · starts {c.start_date} · SIP date {c.sip_date}
+                      {ordinalSuffix(c.sip_date)} · {c.category}
+                    </p>
                   </div>
                 </label>
               ))}

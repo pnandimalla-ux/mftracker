@@ -39,6 +39,32 @@ interface Occurrence {
   isWeekend: boolean;
 }
 
+export interface LumpsumEntry {
+  trade_date: string;
+  amount: number;
+  scheme_name: string;
+  owner: Owner;
+}
+
+// Groups lumpsum holdings into the days of the viewed month — parsed from
+// local Y/M/D components (not `new Date(iso)`, which parses a date-only
+// string as UTC midnight and shifts the day under IST).
+function computeLumpsumsByDay(
+  lumpsums: LumpsumEntry[],
+  year: number,
+  month: number
+): Map<number, LumpsumEntry[]> {
+  const map = new Map<number, LumpsumEntry[]>();
+  for (const l of lumpsums) {
+    const [ly, lm, ld] = l.trade_date.split("-").map(Number);
+    if (ly !== year || lm - 1 !== month) continue;
+    const existing = map.get(ld) ?? [];
+    existing.push(l);
+    map.set(ld, existing);
+  }
+  return map;
+}
+
 interface SchemeSearchResult {
   schemeCode: number;
   schemeName: string;
@@ -82,7 +108,7 @@ function computeOccurrences(
       if (diff % 3 !== 0) continue;
     }
 
-    if (sip.frequency === "weekly") {
+    if (sip.frequency === "weekly" || sip.frequency === "bi-weekly") {
       // Parsed from local Y/M/D components (not `new Date(sip.start_date)`,
       // which parses a date-only string as UTC midnight) so this stays in
       // the same local-time frame as monthStart/monthEnd below — mixing the
@@ -91,6 +117,7 @@ function computeOccurrences(
       let current = new Date(startY, startM - 1, startD);
       const monthEnd = new Date(year, month + 1, 0);
       const monthStart = new Date(year, month, 1);
+      const stepDays = sip.frequency === "bi-weekly" ? 14 : 7;
       while (current <= monthEnd) {
         if (current >= monthStart && current.getFullYear() === year && current.getMonth() === month) {
           const day = current.getDate();
@@ -100,7 +127,7 @@ function computeOccurrences(
           existing.push({ sip, isWeekend });
           map.set(day, existing);
         }
-        current = new Date(current.getTime() + 7 * 24 * 60 * 60 * 1000);
+        current = new Date(current.getTime() + stepDays * 24 * 60 * 60 * 1000);
       }
       continue;
     }
@@ -120,13 +147,16 @@ function computeOccurrences(
 export default function SIPCalendarClient({
   userEmail,
   initialSips,
+  initialLumpsums,
 }: {
   userEmail: string;
   initialSips: MFSIPSchedule[];
+  initialLumpsums: LumpsumEntry[];
 }) {
   const today = useMemo(() => new Date(), []);
 
   const [sips, setSips] = useState<MFSIPSchedule[]>(initialSips);
+  const [lumpsums] = useState<LumpsumEntry[]>(initialLumpsums);
   const [viewYear, setViewYear] = useState(today.getFullYear());
   const [viewMonth, setViewMonth] = useState(today.getMonth());
   const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>("all");
@@ -150,6 +180,11 @@ export default function SIPCalendarClient({
   const occurrencesThisView = useMemo(
     () => computeOccurrences(sips, viewYear, viewMonth),
     [sips, viewYear, viewMonth]
+  );
+
+  const lumpsumsByDay = useMemo(
+    () => computeLumpsumsByDay(lumpsums, viewYear, viewMonth),
+    [lumpsums, viewYear, viewMonth]
   );
 
   const totalThisMonth = useMemo(() => {
@@ -461,6 +496,11 @@ export default function SIPCalendarClient({
                     (o) => ownerFilter === "all" || o.sip.owner === ownerFilter
                   )
                 : [];
+              const dayLumpsums = day
+                ? (lumpsumsByDay.get(day) ?? []).filter(
+                    (l) => ownerFilter === "all" || l.owner === ownerFilter
+                  )
+                : [];
 
               return (
                 <div
@@ -505,6 +545,25 @@ export default function SIPCalendarClient({
                                 → next trading day
                               </span>
                             )}
+                          </div>
+                        ))}
+                        {dayLumpsums.map((l, li) => (
+                          <div key={`lumpsum-${li}`} className="flex items-center gap-1">
+                            <span
+                              className={`inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full text-[8px] font-bold ${
+                                l.owner === "praveen"
+                                  ? "bg-blue-100 text-blue-700"
+                                  : "bg-amber-100 text-amber-700"
+                              }`}
+                            >
+                              {l.owner === "praveen" ? "P" : "G"}
+                            </span>
+                            <span
+                              title={`Lumpsum — ${l.scheme_name} — ₹${l.amount.toLocaleString("en-IN")}`}
+                              className="block flex-1 truncate rounded-full border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[9px] font-medium text-slate-600"
+                            >
+                              ₹ {l.scheme_name} · ₹{l.amount.toLocaleString("en-IN")}
+                            </span>
                           </div>
                         ))}
                       </div>
@@ -648,6 +707,7 @@ export default function SIPCalendarClient({
                     className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                   >
                     <option value="weekly">Weekly</option>
+                    <option value="bi-weekly">Bi-weekly</option>
                     <option value="monthly">Monthly</option>
                     <option value="quarterly">Quarterly</option>
                   </select>
@@ -724,7 +784,13 @@ export default function SIPCalendarClient({
                     </td>
                     <td className="px-4 py-3 text-slate-600">
                       {ordinal(sip.sip_date)} of every{" "}
-                      {sip.frequency === "weekly" ? "week" : sip.frequency === "monthly" ? "month" : "quarter"}
+                      {sip.frequency === "weekly"
+                        ? "week"
+                        : sip.frequency === "bi-weekly"
+                          ? "2 weeks"
+                          : sip.frequency === "monthly"
+                            ? "month"
+                            : "quarter"}
                     </td>
                     <td className="px-4 py-3 text-slate-600">
                       {sip.category ?? "—"}

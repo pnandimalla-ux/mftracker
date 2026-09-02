@@ -93,7 +93,7 @@ export interface MFCASImport {
   rows_imported: number;
 }
 
-export type SIPFrequency = "weekly" | "monthly" | "quarterly";
+export type SIPFrequency = "weekly" | "bi-weekly" | "monthly" | "quarterly";
 
 export interface MFSIPSchedule {
   id: string;
