@@ -83,12 +83,24 @@ function computeOccurrences(
     }
 
     if (sip.frequency === "weekly") {
-      for (let day = Math.min(sip.sip_date, dim); day <= dim; day += 7) {
-        const dow = new Date(year, month, day).getDay();
-        const isWeekend = dow === 0 || dow === 6;
-        const existing = map.get(day) ?? [];
-        existing.push({ sip, isWeekend });
-        map.set(day, existing);
+      // Parsed from local Y/M/D components (not `new Date(sip.start_date)`,
+      // which parses a date-only string as UTC midnight) so this stays in
+      // the same local-time frame as monthStart/monthEnd below — mixing the
+      // two silently drops the month's last occurrence in UTC+ timezones.
+      const [startY, startM, startD] = sip.start_date.split("-").map(Number);
+      let current = new Date(startY, startM - 1, startD);
+      const monthEnd = new Date(year, month + 1, 0);
+      const monthStart = new Date(year, month, 1);
+      while (current <= monthEnd) {
+        if (current >= monthStart && current.getFullYear() === year && current.getMonth() === month) {
+          const day = current.getDate();
+          const dow = current.getDay();
+          const isWeekend = dow === 0 || dow === 6;
+          const existing = map.get(day) ?? [];
+          existing.push({ sip, isWeekend });
+          map.set(day, existing);
+        }
+        current = new Date(current.getTime() + 7 * 24 * 60 * 60 * 1000);
       }
       continue;
     }
