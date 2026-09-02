@@ -82,6 +82,17 @@ function computeOccurrences(
       if (diff % 3 !== 0) continue;
     }
 
+    if (sip.frequency === "weekly") {
+      for (let day = Math.min(sip.sip_date, dim); day <= dim; day += 7) {
+        const dow = new Date(year, month, day).getDay();
+        const isWeekend = dow === 0 || dow === 6;
+        const existing = map.get(day) ?? [];
+        existing.push({ sip, isWeekend });
+        map.set(day, existing);
+      }
+      continue;
+    }
+
     const day = Math.min(sip.sip_date, dim);
     const dow = new Date(year, month, day).getDay();
     const isWeekend = dow === 0 || dow === 6;
@@ -624,6 +635,7 @@ export default function SIPCalendarClient({
                     onChange={(e) => setFFrequency(e.target.value as SIPFrequency)}
                     className="w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-blue-500 focus:outline-none focus:ring-1 focus:ring-blue-500"
                   >
+                    <option value="weekly">Weekly</option>
                     <option value="monthly">Monthly</option>
                     <option value="quarterly">Quarterly</option>
                   </select>
@@ -700,7 +712,7 @@ export default function SIPCalendarClient({
                     </td>
                     <td className="px-4 py-3 text-slate-600">
                       {ordinal(sip.sip_date)} of every{" "}
-                      {sip.frequency === "monthly" ? "month" : "quarter"}
+                      {sip.frequency === "weekly" ? "week" : sip.frequency === "monthly" ? "month" : "quarter"}
                     </td>
                     <td className="px-4 py-3 text-slate-600">
                       {sip.category ?? "—"}

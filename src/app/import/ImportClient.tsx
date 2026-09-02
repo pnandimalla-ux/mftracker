@@ -11,7 +11,7 @@ import {
 import { useRouter } from "next/navigation";
 import AppHeader from "@/components/AppHeader";
 import type { CoinFund, CoinParseResult, ExcludedRow, LotType, SellRow } from "@/lib/parsers/coinCsvParser";
-import type { MFCASImport, Owner } from "@/types/mf";
+import type { MFCASImport, Owner, SIPFrequency } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import { detectCategory, type DetectCategoryResult } from "@/lib/analysis/fundCategoriser";
 
@@ -64,6 +64,8 @@ interface DetectedSip {
   amount: number;
   sip_date: number;
   category: string;
+  frequency: SIPFrequency;
+  start_date: string;
 }
 
 const SIP_ACTIVE_WINDOW_DAYS = 60;
@@ -81,11 +83,21 @@ function detectActiveSips(funds: PreviewFund[]): DetectedSip[] {
     const sipLots = fund.lots.filter((l) => l.lot_type === "sip");
     if (sipLots.length === 0) continue;
 
-    const mostRecent = [...sipLots].sort((a, b) => b.trade_date.localeCompare(a.trade_date))[0];
+    const sorted = [...sipLots].sort((a, b) => a.trade_date.localeCompare(b.trade_date));
+    const mostRecent = sorted[sorted.length - 1];
     if (mostRecent.trade_date < cutoffIso) continue;
 
     const day = Number(mostRecent.trade_date.slice(8, 10));
     if (!Number.isInteger(day) || day < 1 || day > 31) continue;
+
+    // More than one SIP lot landing in the same calendar month means the
+    // fund is being debited weekly rather than monthly.
+    const lotsPerMonth = new Map<string, number>();
+    for (const lot of sipLots) {
+      const month = lot.trade_date.slice(0, 7);
+      lotsPerMonth.set(month, (lotsPerMonth.get(month) ?? 0) + 1);
+    }
+    const isWeekly = Array.from(lotsPerMonth.values()).some((count) => count > 1);
 
     results.push({
       key: fund.key,
@@ -95,6 +107,8 @@ function detectActiveSips(funds: PreviewFund[]): DetectedSip[] {
       amount: mostRecent.amount,
       sip_date: day,
       category: fund.category,
+      frequency: isWeekly ? "weekly" : "monthly",
+      start_date: sorted[0].trade_date,
     });
   }
   return results;
@@ -551,7 +565,8 @@ export default function ImportClient({
             amount: c.amount,
             sip_date: c.sip_date,
             category: c.category,
-            frequency: "monthly",
+            frequency: c.frequency,
+            start_date: c.start_date,
           })),
         }),
       });
@@ -1671,8 +1686,11 @@ export default function ImportClient({
                     <div>
                       <p className="text-sm font-medium text-slate-800">{c.scheme_name}</p>
                       <p className="text-xs text-slate-500">
-                        {formatMoney(c.amount)} on the {c.sip_date}
-                        {ordinalSuffix(c.sip_date)} of every month · {c.category}
+                        {formatMoney(c.amount)}{" "}
+                        {c.frequency === "weekly"
+                          ? `every week starting the ${c.sip_date}${ordinalSuffix(c.sip_date)}`
+                          : `on the ${c.sip_date}${ordinalSuffix(c.sip_date)} of every month`}{" "}
+                        · {c.category}
                       </p>
                     </div>
                   </div>

@@ -161,7 +161,7 @@ create table if not exists mf_sip_schedules (
   category text,
   amount numeric(18,2) not null,
   sip_date integer not null check (sip_date between 1 and 31),
-  frequency text not null default 'monthly' check (frequency in ('monthly', 'quarterly')),
+  frequency text not null default 'monthly' check (frequency in ('weekly', 'monthly', 'quarterly')),
   start_date date not null,
   end_date date,
   is_active boolean default true,

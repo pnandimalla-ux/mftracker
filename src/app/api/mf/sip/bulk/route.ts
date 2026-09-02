@@ -10,7 +10,10 @@ interface BulkSipInput {
   sip_date: number;
   category: string | null;
   frequency: SIPFrequency;
+  start_date: string;
 }
+
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 export async function POST(request: Request) {
   try {
@@ -29,12 +32,19 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "sips array is required" }, { status: 400 });
     }
 
+    const today = new Date().toISOString().slice(0, 10);
+
     const validItems: BulkSipInput[] = [];
     for (const raw of body.sips as Record<string, unknown>[]) {
       const owner = raw.owner === "praveen" || raw.owner === "geetha" ? raw.owner : null;
       const scheme_name = typeof raw.scheme_name === "string" ? raw.scheme_name.trim() : "";
       const amount = Number(raw.amount);
       const sip_date = Number(raw.sip_date);
+
+      const start_date =
+        typeof raw.start_date === "string" && ISO_DATE_RE.test(raw.start_date)
+          ? raw.start_date
+          : today;
 
       if (!owner || !scheme_name) continue;
       if (!Number.isFinite(amount) || amount <= 0) continue;
@@ -47,7 +57,9 @@ export async function POST(request: Request) {
         amount,
         sip_date,
         category: typeof raw.category === "string" && raw.category.trim() ? raw.category.trim() : null,
-        frequency: raw.frequency === "quarterly" ? "quarterly" : "monthly",
+        frequency:
+          raw.frequency === "weekly" ? "weekly" : raw.frequency === "quarterly" ? "quarterly" : "monthly",
+        start_date,
       });
     }
 
@@ -73,7 +85,6 @@ export async function POST(request: Request) {
       }
     }
 
-    const today = new Date().toISOString().slice(0, 10);
     const rowsToInsert: Record<string, unknown>[] = [];
     let skipped = 0;
 
@@ -93,7 +104,7 @@ export async function POST(request: Request) {
         amount: item.amount,
         sip_date: item.sip_date,
         frequency: item.frequency,
-        start_date: today,
+        start_date: item.start_date,
         is_active: true,
         notify_email: true,
         notify_sms: false,

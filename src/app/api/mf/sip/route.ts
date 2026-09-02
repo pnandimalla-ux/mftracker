@@ -95,9 +95,9 @@ export async function POST(request: Request) {
         { status: 400 }
       );
     }
-    if (frequency !== "monthly" && frequency !== "quarterly") {
+    if (frequency !== "weekly" && frequency !== "monthly" && frequency !== "quarterly") {
       return NextResponse.json(
-        { error: "frequency must be 'monthly' or 'quarterly'" },
+        { error: "frequency must be 'weekly', 'monthly', or 'quarterly'" },
         { status: 400 }
       );
     }
