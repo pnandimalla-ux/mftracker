@@ -4,6 +4,7 @@ import { createServiceClient } from "@/lib/supabase/service";
 import { fetchSchemeMeta } from "@/lib/mfapi";
 import { derivePeerGroup } from "@/lib/peers/peerGroup";
 import { getCategoryForCode, getCategoryFunds } from "@/lib/peers/categoryUniverse";
+import { matchPeers } from "@/lib/peers/peerMatcher";
 import { fetchSchemeReturns, type PeriodReturns } from "@/lib/peers/peerSync";
 
 interface SchemeRow {
@@ -78,7 +79,7 @@ export async function GET(
     // resort for a fund that's neither held nor in the curated universe.
     const { data: holding } = await supabase
       .from("mf_holdings")
-      .select("category, peer_group")
+      .select("category, peer_group, scheme_name")
       .eq("scheme_code", schemeCode)
       .eq("user_id", user.id)
       .limit(1)
@@ -173,7 +174,24 @@ export async function GET(
 
     // Curated-universe funds carry their real name/AMC even if this
     // particular scheme_code hasn't been synced into mf_peer_data yet.
-    const universeNameMap = new Map(getCategoryFunds(category).map((f) => [f.code, f.name]));
+    //
+    // NOTE: this two-layer (category + name-keyword sub-group) match only
+    // narrows which curated-universe funds populate this display-name
+    // fallback map — it does NOT determine the actual peer set returned to
+    // the client (that's the mf_peer_data.peer_group query above, already a
+    // finer-grained, independently-computed grouping via derivePeerGroup()
+    // for every synced fund). matchPeers needs a reference fund name to
+    // narrow against; the held fund's own scheme_name is the natural choice
+    // here since this route is keyed on one specific holding.
+    const heldFundName = (holding?.scheme_name as string | undefined) ?? null;
+    const { peers: universePeers, matchedGroup, keywordFiltered } = heldFundName
+      ? matchPeers(heldFundName, category)
+      : { peers: getCategoryFunds(category), matchedGroup: null, keywordFiltered: false };
+    console.log(
+      `peers/${schemeCode}: category="${category}" matchedGroup=${matchedGroup ?? "none"} ` +
+      `keywordFiltered=${keywordFiltered} universePeers=${universePeers.length}`
+    );
+    const universeNameMap = new Map(universePeers.map((f) => [f.code, f.name]));
 
     const resolveName = (code: string): string | null => {
       const p = peerDataMap.get(code);
