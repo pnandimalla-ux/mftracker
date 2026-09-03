@@ -31,7 +31,15 @@ export function derivePeerGroup(mfApiCategory: string, fundName: string): string
   if (cat.includes("small cap")) return "Small Cap";
   if (cat.includes("elss") || cat.includes("tax saver")) return "ELSS";
   if (cat.includes("value") || cat.includes("contra")) return "Value";
-  if (cat.includes("hybrid") || cat.includes("balanced") || cat.includes("arbitrage")) return "Hybrid";
+  // These three are all technically "Hybrid Scheme - ..." per mfapi.in's own
+  // category text, so they must be checked BEFORE the generic hybrid/balanced
+  // catch-all below — otherwise an Arbitrage fund (market-neutral, low-risk)
+  // would get grouped with a Balanced Advantage fund (equity-heavy, volatile)
+  // just because both scheme_category strings contain the word "hybrid".
+  if (cat.includes("arbitrage")) return "Arbitrage";
+  if (cat.includes("aggressive hybrid")) return "Aggressive Hybrid";
+  if (cat.includes("multi asset")) return "Multi Asset Allocation";
+  if (cat.includes("hybrid") || cat.includes("balanced")) return "Hybrid";
   if (cat.includes("debt") || cat.includes("bond") || cat.includes("liquid") || cat.includes("money market")) return "Debt";
   if (cat.includes("index") || cat.includes("etf")) return "Index";
   if (cat.includes("international") || cat.includes("global") || cat.includes("overseas")) return "International";
