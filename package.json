@@ -11,6 +11,7 @@
     "migrate": "npx ts-node src/lib/db/runMigration.ts"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.124.0",
     "@supabase/ssr": "^0.12.5",
     "@supabase/supabase-js": "^2.112.4",
     "@types/papaparse": "^5.5.2",

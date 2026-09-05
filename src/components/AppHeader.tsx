@@ -8,6 +8,7 @@ const NAV_ITEMS = [
   { href: "/dashboard", label: "Dashboard" },
   { href: "/sip", label: "SIP Calendar" },
   { href: "/import", label: "Import" },
+  { href: "/insights", label: "Insights" },
   { href: "/recommendations", label: "Recommendations" },
   { href: "/settings", label: "Settings" },
 ];
