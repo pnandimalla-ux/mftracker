@@ -166,19 +166,7 @@ const FREQUENCY_LABELS: Record<SIPFrequency, string> = {
   quarterly: "Quarterly",
 };
 
-function FrequencyBadge({ frequency }: { frequency: SIPFrequency }) {
-  const styles: Record<SIPFrequency, string> = {
-    weekly: "bg-purple-100 text-purple-700",
-    "bi-weekly": "bg-indigo-100 text-indigo-700",
-    monthly: "bg-blue-100 text-blue-700",
-    quarterly: "bg-teal-100 text-teal-700",
-  };
-  return (
-    <span className={`rounded-full px-2 py-0.5 text-[10px] font-medium ${styles[frequency]}`}>
-      {FREQUENCY_LABELS[frequency]}
-    </span>
-  );
-}
+const SIP_FREQUENCY_OPTIONS: SIPFrequency[] = ["weekly", "bi-weekly", "monthly", "quarterly"];
 
 export default function ImportClient({
   userEmail,
@@ -580,6 +568,15 @@ export default function ImportClient({
     } finally {
       setConfirming(false);
     }
+  };
+
+  const updateSipFrequency = (key: string, frequency: SIPFrequency) => {
+    setSipCandidates((prev) => prev.map((c) => (c.key === key ? { ...c, frequency } : c)));
+  };
+
+  const handleSkipDetectedSips = () => {
+    setShowSipStep(false);
+    router.push("/dashboard");
   };
 
   const handleAddDetectedSips = async () => {
@@ -1712,15 +1709,23 @@ export default function ImportClient({
                     {c.owner === "praveen" ? "P" : "G"}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <div className="flex items-center gap-1.5">
-                      <p className="truncate text-sm font-medium text-slate-800">{c.scheme_name}</p>
-                      <FrequencyBadge frequency={c.frequency} />
-                    </div>
+                    <p className="truncate text-sm font-medium text-slate-800">{c.scheme_name}</p>
                     <p className="text-xs text-slate-500">
                       {formatMoney(c.amount)} · starts {c.start_date} · SIP date {c.sip_date}
                       {ordinalSuffix(c.sip_date)} · {c.category}
                     </p>
                   </div>
+                  <select
+                    value={c.frequency}
+                    onChange={(e) => updateSipFrequency(c.key, e.target.value as SIPFrequency)}
+                    className="shrink-0 rounded border border-slate-300 px-2 py-1 text-xs"
+                  >
+                    {SIP_FREQUENCY_OPTIONS.map((f) => (
+                      <option key={f} value={f}>
+                        {FREQUENCY_LABELS[f]}
+                      </option>
+                    ))}
+                  </select>
                 </label>
               ))}
             </div>
@@ -1731,14 +1736,26 @@ export default function ImportClient({
               </p>
             )}
 
-            <button
-              type="button"
-              onClick={handleAddDetectedSips}
-              disabled={addingSips || !Object.values(sipSelected).some(Boolean)}
-              className="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
-            >
-              {addingSips ? "Adding…" : "Add to SIP Calendar"}
-            </button>
+            <div className="mt-4 flex items-center gap-4">
+              <button
+                type="button"
+                onClick={handleAddDetectedSips}
+                disabled={addingSips || !Object.values(sipSelected).some(Boolean)}
+                className="rounded-lg bg-blue-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {addingSips
+                  ? "Adding…"
+                  : `Save ${Object.values(sipSelected).filter(Boolean).length} SIP${Object.values(sipSelected).filter(Boolean).length === 1 ? "" : "s"} →`}
+              </button>
+              <button
+                type="button"
+                onClick={handleSkipDetectedSips}
+                disabled={addingSips}
+                className="text-sm font-medium text-slate-500 hover:text-slate-700 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                Skip
+              </button>
+            </div>
           </div>
         )}
       </main>
