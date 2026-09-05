@@ -8,6 +8,19 @@ import type { EnrichedMFHolding, MFHolding, Owner } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import AlternativesPanel, { type AlternativesData } from "@/components/AlternativesPanel";
 import { detectCategory } from "@/lib/analysis/fundCategoriser";
+import {
+  ResponsiveContainer,
+  PieChart,
+  Pie,
+  Cell,
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend,
+} from "recharts";
 
 type OwnerFilter = "family" | "praveen" | "geetha";
 type Period = "6m" | "1y" | "3y" | "5y";
@@ -134,6 +147,102 @@ function formatDateDMY(iso: string): string {
   const [y, m, d] = iso.split("-");
   if (y && m && d) return `${d}-${m}-${y}`;
   return iso;
+}
+
+// --- Portfolio Overview charts (Recharts) ---
+
+const CATEGORY_COLORS = [
+  "#6366f1",
+  "#10b981",
+  "#f59e0b",
+  "#f43f5e",
+  "#8b5cf6",
+  "#0ea5e9",
+  "#94a3b8",
+];
+
+function truncateName(name: string, maxLen: number): string {
+  return name.length > maxLen ? `${name.slice(0, maxLen)}…` : name;
+}
+
+interface CategoryAllocationSlice {
+  category: string;
+  value: number;
+}
+
+interface FundValueBar {
+  key: string;
+  name: string;
+  fullName: string;
+  invested: number;
+  current: number;
+  pnl_pct: number;
+}
+
+interface FundPnlBar {
+  key: string;
+  name: string;
+  fullName: string;
+  pnl_pct: number;
+  pnl: number;
+}
+
+function CategoryAllocationTooltip({
+  active,
+  payload,
+  total,
+}: {
+  active?: boolean;
+  payload?: readonly { payload?: CategoryAllocationSlice }[];
+  total: number;
+}) {
+  if (!active || !payload || payload.length === 0 || !payload[0].payload) return null;
+  const { category, value } = payload[0].payload;
+  const pct = total > 0 ? ((value / total) * 100).toFixed(1) : "0.0";
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-lg dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100">
+      {category}: {formatInr(value)} ({pct}%)
+    </div>
+  );
+}
+
+function FundValueTooltip({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: readonly { payload?: FundValueBar }[];
+}) {
+  if (!active || !payload || payload.length === 0 || !payload[0].payload) return null;
+  const { fullName, invested, current, pnl_pct } = payload[0].payload;
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-lg dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100">
+      <p className="font-medium">{fullName}</p>
+      <p className="mt-1 text-slate-500 dark:text-slate-400">Invested: {formatInr(invested)}</p>
+      <p className="text-slate-500 dark:text-slate-400">Current: {formatInr(current)}</p>
+      <p className={pnl_pct >= 0 ? "text-emerald-600" : "text-rose-600"}>P&L: {formatPct(pnl_pct)}</p>
+    </div>
+  );
+}
+
+function FundPnlTooltip({
+  active,
+  payload,
+}: {
+  active?: boolean;
+  payload?: readonly { payload?: FundPnlBar }[];
+}) {
+  if (!active || !payload || payload.length === 0 || !payload[0].payload) return null;
+  const { fullName, pnl_pct, pnl } = payload[0].payload;
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-lg dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100">
+      <p className="font-medium">{fullName}</p>
+      <p className={pnl_pct >= 0 ? "text-emerald-600" : "text-rose-600"}>
+        {formatPct(pnl_pct)} ({pnl >= 0 ? "+" : "-"}
+        {formatInr(Math.abs(pnl))})
+      </p>
+    </div>
+  );
 }
 
 const PEER_SYNC_STALE_MS = 7 * 24 * 60 * 60 * 1000;
@@ -628,6 +737,57 @@ export default function DashboardClient({
 
     return { totalInvested, currentValue, pnl, pnlPct, underperforming, avg1y, underperformingPeers };
   }, [filteredHoldings]);
+
+  // Portfolio Overview charts derive from groupedHoldings (one entry per
+  // fund, already summed across lots) rather than filteredHoldings (one
+  // entry per individual lot) — otherwise a fund with many SIP lots would
+  // show up as many separate slices/bars instead of one.
+  const categoryAllocation = useMemo<CategoryAllocationSlice[]>(() => {
+    const byCategory = new Map<string, number>();
+    for (const g of groupedHoldings) {
+      byCategory.set(g.category, (byCategory.get(g.category) ?? 0) + g.current_value);
+    }
+    const sorted = Array.from(byCategory.entries())
+      .map(([category, value]) => ({ category, value }))
+      .sort((a, b) => b.value - a.value);
+
+    if (sorted.length <= 6) return sorted;
+
+    const top = sorted.slice(0, 6);
+    const othersTotal = sorted.slice(6).reduce((sum, c) => sum + c.value, 0);
+    return [...top, { category: "Others", value: othersTotal }];
+  }, [groupedHoldings]);
+
+  const categoryAllocationTotal = useMemo(
+    () => categoryAllocation.reduce((sum, c) => sum + c.value, 0),
+    [categoryAllocation]
+  );
+
+  const topFundsByValue = useMemo<FundValueBar[]>(() => {
+    return [...groupedHoldings]
+      .sort((a, b) => b.current_value - a.current_value)
+      .slice(0, 10)
+      .map((g) => ({
+        key: g.key,
+        name: truncateName(g.scheme_name, 22),
+        fullName: g.scheme_name,
+        invested: g.total_invested,
+        current: g.current_value,
+        pnl_pct: g.pnl_pct,
+      }));
+  }, [groupedHoldings]);
+
+  const pnlByFund = useMemo<FundPnlBar[]>(() => {
+    return groupedHoldings
+      .map((g) => ({
+        key: g.key,
+        name: truncateName(g.scheme_name, 12),
+        fullName: g.scheme_name,
+        pnl_pct: g.pnl_pct,
+        pnl: g.pnl,
+      }))
+      .sort((a, b) => b.pnl_pct - a.pnl_pct);
+  }, [groupedHoldings]);
 
   const hasAnyHoldings = holdings.length > 0;
   const hasPeerKpiData = filteredHoldings.some((h) => h.peer?.r1y !== null && h.peer?.r1y !== undefined);
@@ -1223,6 +1383,83 @@ export default function DashboardClient({
             </>
           )}
         </div>
+
+        {!loading && hasAnyHoldings && (
+          <section className="mb-8 mt-8">
+            <h2 className="mb-4 text-lg font-semibold text-slate-800 dark:text-slate-100">
+              Portfolio Overview
+            </h2>
+
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+              <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900 md:col-span-1">
+                <p className="mb-3 text-sm font-medium text-slate-600 dark:text-slate-400">
+                  Category Allocation
+                </p>
+                <ResponsiveContainer width="100%" height={280}>
+                  <PieChart>
+                    <Pie
+                      data={categoryAllocation}
+                      dataKey="value"
+                      nameKey="category"
+                      innerRadius={60}
+                      outerRadius={100}
+                    >
+                      {categoryAllocation.map((entry, i) => (
+                        <Cell key={entry.category} fill={CATEGORY_COLORS[i % CATEGORY_COLORS.length]} />
+                      ))}
+                    </Pie>
+                    <Tooltip
+                      content={(props) => (
+                        <CategoryAllocationTooltip {...props} total={categoryAllocationTotal} />
+                      )}
+                    />
+                    <Legend />
+                  </PieChart>
+                </ResponsiveContainer>
+              </div>
+
+              <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900 md:col-span-1">
+                <p className="mb-3 text-sm font-medium text-slate-600 dark:text-slate-400">
+                  Invested vs Current Value
+                </p>
+                <ResponsiveContainer width="100%" height={340}>
+                  <BarChart data={topFundsByValue} layout="vertical" margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+                    <CartesianGrid strokeDasharray="3 3" />
+                    <XAxis type="number" />
+                    <YAxis type="category" dataKey="name" width={180} />
+                    <Tooltip content={<FundValueTooltip />} />
+                    <Legend />
+                    <Bar dataKey="invested" name="Invested" fill="#94a3b8" />
+                    <Bar dataKey="current" name="Current">
+                      {topFundsByValue.map((entry) => (
+                        <Cell key={entry.key} fill={entry.current >= entry.invested ? "#10b981" : "#f43f5e"} />
+                      ))}
+                    </Bar>
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            </div>
+
+            <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900">
+              <p className="mb-3 text-sm font-medium text-slate-600 dark:text-slate-400">
+                P&L by Fund (%)
+              </p>
+              <ResponsiveContainer width="100%" height={300}>
+                <BarChart data={pnlByFund} margin={{ top: 5, right: 20, left: 0, bottom: 30 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="name" angle={-35} textAnchor="end" interval={0} height={60} />
+                  <YAxis tickFormatter={(v) => `${v.toFixed(1)}%`} />
+                  <Tooltip content={<FundPnlTooltip />} />
+                  <Bar dataKey="pnl_pct" name="P&L %">
+                    {pnlByFund.map((entry) => (
+                      <Cell key={entry.key} fill={entry.pnl_pct >= 0 ? "#10b981" : "#f43f5e"} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </section>
+        )}
 
         {loading && (
           <div className="mt-8 overflow-hidden rounded-xl border border-slate-200 bg-white">
