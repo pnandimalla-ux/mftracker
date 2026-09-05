@@ -88,6 +88,26 @@ export async function POST(request: Request) {
       );
     }
 
+    // mf_cas_imports is inserted FIRST so each holding row can carry the
+    // batch's id — lets a later delete of the import cascade-remove every
+    // holding it created (mf_holdings.import_id is ON DELETE CASCADE).
+    const { data: importRow, error: importInsertError } = await supabase
+      .from("mf_cas_imports")
+      .insert({
+        user_id: user.id,
+        owner,
+        filename: typeof filename === "string" ? filename : null,
+        status: "success",
+        rows_imported: 0,
+      })
+      .select()
+      .single();
+
+    if (importInsertError) {
+      console.error("Failed to create mf_cas_imports row:", importInsertError.message);
+    }
+    const importId = importRow?.id ?? null;
+
     const asOnDate = new Date().toISOString().slice(0, 10);
     const insertPayload = validRows.map((r, i) => ({
       user_id: user.id,
@@ -99,6 +119,7 @@ export async function POST(request: Request) {
       avg_nav: r.avg_nav,
       invested_amount: r.invested_amount,
       as_on_date: asOnDate,
+      import_id: importId,
     }));
 
     const { data: inserted, error: insertError } = await supabase
@@ -112,13 +133,12 @@ export async function POST(request: Request) {
         ? "success"
         : "partial";
 
-    await supabase.from("mf_cas_imports").insert({
-      user_id: user.id,
-      owner,
-      filename: typeof filename === "string" ? filename : null,
-      status,
-      rows_imported: inserted?.length ?? 0,
-    });
+    if (importId) {
+      await supabase
+        .from("mf_cas_imports")
+        .update({ status, rows_imported: inserted?.length ?? 0 })
+        .eq("id", importId);
+    }
 
     if (insertError) {
       return NextResponse.json({ error: insertError.message }, { status: 500 });

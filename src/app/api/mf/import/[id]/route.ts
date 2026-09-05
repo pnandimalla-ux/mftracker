@@ -2,11 +2,12 @@ import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/service";
 
-// Deletes an import batch and every mf_holdings row it created. mf_holdings
-// deletes go through the caller's own (RLS-scoped) client; mf_cas_imports —
-// read-only for regular users per this project's RLS convention — is
-// verified with the regular client (SELECT is allowed) but deleted with the
-// service client.
+// Deletes an import batch. mf_holdings.import_id is ON DELETE CASCADE
+// (migration_006), so deleting the mf_cas_imports row automatically removes
+// every mf_holdings row it created — rows with import_id = NULL (manually
+// added lots) are untouched. mf_cas_imports is read-only for regular users
+// per this project's RLS convention, so it's verified with the regular
+// client (SELECT is allowed) but deleted with the service client.
 export async function DELETE(
   _request: Request,
   { params }: { params: { id: string } }
@@ -35,18 +36,13 @@ export async function DELETE(
       return NextResponse.json({ error: "Import not found" }, { status: 404 });
     }
 
-    const serviceClient = createServiceClient();
-
-    const { data: deletedHoldings, error: deleteHoldingsError } = await supabase
+    const { count: deletedHoldingsCount } = await supabase
       .from("mf_holdings")
-      .delete()
+      .select("id", { count: "exact", head: true })
       .eq("user_id", user.id)
-      .eq("import_id", params.id)
-      .select("id");
+      .eq("import_id", params.id);
 
-    if (deleteHoldingsError) {
-      return NextResponse.json({ error: deleteHoldingsError.message }, { status: 500 });
-    }
+    const serviceClient = createServiceClient();
 
     const { error: deleteImportError } = await serviceClient
       .from("mf_cas_imports")
@@ -57,7 +53,7 @@ export async function DELETE(
       return NextResponse.json({ error: deleteImportError.message }, { status: 500 });
     }
 
-    return NextResponse.json({ deleted_holdings: deletedHoldings?.length ?? 0 });
+    return NextResponse.json({ deleted_holdings: deletedHoldingsCount ?? 0 });
   } catch (err) {
     console.error(`DELETE /api/mf/import/${params.id} failed:`, err);
     return NextResponse.json(
