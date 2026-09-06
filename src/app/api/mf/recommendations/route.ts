@@ -5,7 +5,9 @@ import { createServiceClient } from "@/lib/supabase/service";
 import { isRealSchemeCode } from "@/lib/peers/peerSync";
 import type { Owner } from "@/types/mf";
 
-export const maxDuration = 60;
+// A single Gemini call measured ~47s in live testing on 8 funds — 60s left
+// too little margin, especially before parallelizing the per-owner calls.
+export const maxDuration = 120;
 
 // The task that specified this swap named the package "@google/generative-ai"
 // and model "gemini-1.5-flash" — both are dead: that SDK was fully deprecated
@@ -441,11 +443,13 @@ export async function POST(request: Request) {
     const owners: Owner[] = ownerParam === "family" ? ["praveen", "geetha"] : [ownerParam];
     const serviceClient = createServiceClient();
 
-    const allRecs: RecommendationView[] = [];
-    for (const owner of owners) {
-      const recs = await generateRecommendationsForOwner(serviceClient, user.id, owner);
-      allRecs.push(...recs);
-    }
+    // Run per-owner generation concurrently, not sequentially — a single
+    // Gemini call measured ~47s in testing, so "family" (2 owners) run
+    // one-after-another could take ~90s+ and blow past maxDuration.
+    const recsByOwner = await Promise.all(
+      owners.map((owner) => generateRecommendationsForOwner(serviceClient, user.id, owner))
+    );
+    const allRecs: RecommendationView[] = recsByOwner.flat();
 
     const { error: deleteError } = await serviceClient
       .from("mf_ai_recommendations")
