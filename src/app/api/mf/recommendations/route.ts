@@ -95,26 +95,14 @@ function daysBetween(fromIso: string, toIso: string): number {
   return Math.max(0, Math.round((to - from) / (24 * 60 * 60 * 1000)));
 }
 
-function addDaysIso(iso: string, days: number): string {
-  const [y, m, d] = iso.split("-").map(Number);
-  const date = new Date(Date.UTC(y, m - 1, d));
-  date.setUTCDate(date.getUTCDate() + days);
-  return date.toISOString().slice(0, 10);
-}
-
-function formatDMY(iso: string): string {
-  const [y, m, d] = iso.split("-");
-  return `${d}-${m}-${y}`;
-}
-
 // Deterministic LTCG note — computed here rather than trusted from Gemini's
-// output, since exact date arithmetic ("365 days from purchase") is a poor
-// fit for an LLM to get right consistently.
-function computeLtcgNote(action: Action, holdingDays: number, earliestDate: string): string | null {
-  if (action !== "SWITCH" && action !== "EXIT") return null;
-  if (holdingDays >= 365) return null;
-  const eligibleDate = addDaysIso(earliestDate, 365);
-  return `⚠️ Currently under 1 year — switch after ${formatDMY(eligibleDate)} to qualify for LTCG rate (10%) instead of STCG (taxed as income).`;
+// output, since exact date/tax-threshold logic is a poor fit for an LLM to
+// get right consistently. Applied to every recommendation regardless of
+// action, so the card always shows the fund's current tax status.
+function computeLtcgNote(holdingDays: number): string {
+  return holdingDays < 365
+    ? "Short-term gains applicable"
+    : "LTCG applicable — ₹1L exemption per year";
 }
 
 type ServiceClient = ReturnType<typeof createServiceClient>;
@@ -356,7 +344,9 @@ async function callGemini(
       },
     });
     responseText = response.text ?? "";
+    console.log(`Gemini call succeeded — response length: ${responseText.length} chars`);
   } catch (err) {
+    console.error("Gemini call failed:", err);
     throw new Error(`Gemini API error: ${err instanceof Error ? err.message : String(err)}`);
   }
 
@@ -368,7 +358,9 @@ async function callGemini(
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
+    console.log(`Parsed Gemini response — ${Array.isArray(parsed) ? parsed.length : "non-array"} item(s)`);
   } catch (err) {
+    console.error("Failed to parse Gemini response as JSON. Raw response was:", cleaned);
     throw new Error(
       `Failed to parse Gemini response as JSON: ${err instanceof Error ? err.message : String(err)}`
     );
@@ -386,6 +378,7 @@ async function generateRecommendationsForOwner(
   owner: Owner
 ): Promise<RecommendationView[]> {
   const { funds, categoryTotals, overallTotal } = await buildFundSummaries(serviceClient, userId, owner);
+  console.log(`Data fetch complete for owner ${owner} — ${funds.length} fund(s)`);
   if (funds.length === 0) return [];
 
   const geminiRecs = await callGemini(funds, categoryTotals, overallTotal);
@@ -413,7 +406,7 @@ async function generateRecommendationsForOwner(
       action,
       reason: rec.reason,
       suggested_fund: action === "SWITCH" ? rec.suggested_fund ?? null : null,
-      ltcg_note: computeLtcgNote(action, fund.holding_days, fund.earliest_date),
+      ltcg_note: computeLtcgNote(fund.holding_days),
     });
   }
 
@@ -428,8 +421,10 @@ export async function POST(request: Request) {
     } = await supabase.auth.getUser();
 
     if (!user) {
+      console.error("POST /api/mf/recommendations: no authenticated user");
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
+    console.log(`POST /api/mf/recommendations: authenticated as user ${user.id}`);
 
     const body = await request.json().catch(() => null);
     const ownerParam = (body as { owner?: unknown } | null)?.owner;
@@ -482,8 +477,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ recommendations: allRecs });
   } catch (err) {
     console.error("POST /api/mf/recommendations failed:", err);
+    // Stack traces in the response are a deliberate debugging aid for this
+    // single-user app while diagnosing the Gemini integration in prod —
+    // not something to keep on a multi-tenant/public route.
     return NextResponse.json(
-      { error: "Internal server error", detail: err instanceof Error ? err.message : String(err) },
+      {
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      },
       { status: 500 }
     );
   }
@@ -550,6 +551,12 @@ export async function GET(request: Request) {
     return NextResponse.json({ recommendations: enriched, generated_at });
   } catch (err) {
     console.error("GET /api/mf/recommendations failed:", err);
-    return NextResponse.json({ error: "Internal server error" }, { status: 500 });
+    return NextResponse.json(
+      {
+        error: err instanceof Error ? err.message : String(err),
+        stack: err instanceof Error ? err.stack : undefined,
+      },
+      { status: 500 }
+    );
   }
 }

@@ -93,14 +93,25 @@ export default function InsightsClient({ userEmail }: { userEmail: string }) {
   const handleGenerate = async () => {
     setGenerating(true);
     setError(null);
+
+    // Gemini calls have measured ~47s for a single owner in testing — an
+    // AbortController timeout keeps the browser from hanging indefinitely
+    // if the serverless function itself gets killed without a clean response.
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 90_000);
+
     try {
       const res = await fetch("/api/mf/recommendations", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ owner }),
+        signal: controller.signal,
       });
       const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json.error ?? json.detail ?? "Failed to generate recommendations");
+      if (!res.ok) {
+        console.error("Recommendation generation failed:", json.error, json.stack);
+        throw new Error(json.error ?? json.detail ?? "Failed to generate recommendations");
+      }
 
       // Re-fetch the saved rows rather than trusting the POST response
       // directly — it gives us DB-assigned ids and the real generated_at
@@ -108,9 +119,16 @@ export default function InsightsClient({ userEmail }: { userEmail: string }) {
       await loadSaved(owner);
     } catch (err) {
       console.error("Failed to generate recommendations:", err);
-      setError(err instanceof Error ? err.message : "Failed to generate recommendations. Please try again.");
-      setTimeout(() => setError(null), 5000);
+      const message =
+        err instanceof DOMException && err.name === "AbortError"
+          ? "Request timed out after 90 seconds. Please try again."
+          : err instanceof Error
+            ? err.message
+            : "Failed to generate recommendations. Please try again.";
+      setError(message);
+      setTimeout(() => setError(null), 8000);
     } finally {
+      clearTimeout(timeoutId);
       setGenerating(false);
     }
   };
@@ -126,7 +144,7 @@ export default function InsightsClient({ userEmail }: { userEmail: string }) {
           <div>
             <h1 className="text-lg font-semibold text-slate-800">AI Insights</h1>
             <p className="mt-1 text-sm text-slate-500">
-              Claude-generated hold / switch / rebalance / exit recommendations for your portfolio.
+              AI-generated hold / switch / rebalance / exit recommendations for your portfolio.
             </p>
           </div>
 
@@ -158,7 +176,10 @@ export default function InsightsClient({ userEmail }: { userEmail: string }) {
               {generating ? "Analysing portfolio…" : "Generate Recommendations"}
             </button>
             <p className="text-xs text-slate-400">
-              {generating ? "This can take 10–15 seconds" : `Last generated: ${formatRelativeTime(generatedAt)}`}
+              {generating
+                ? // Measured ~47s for a single owner live — "10-15 seconds" undersold it badly.
+                  "Analysing portfolio... this can take up to a minute"
+                : `Last generated: ${formatRelativeTime(generatedAt)}`}
             </p>
           </div>
 
