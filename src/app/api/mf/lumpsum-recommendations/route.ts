@@ -1,6 +1,8 @@
 import { NextResponse } from "next/server";
 import { GoogleGenAI } from "@google/genai";
 import { createClient } from "@/lib/supabase/server";
+import { fetchFundReturns } from "@/lib/fetchFundReturns";
+import { CURATED_FUNDS } from "@/lib/curatedFunds";
 import type { Owner } from "@/types/mf";
 
 export const maxDuration = 60;
@@ -16,6 +18,7 @@ const REPO_RATE_PCT = 6.25; // RBI repo rate, mid-2026
 type OwnerFilter = Owner | "family";
 type Horizon = "3m" | "6m" | "1yr";
 type RiskLevel = "Low" | "Medium" | "High";
+type Mode = "ai" | "curated";
 const HORIZONS: Horizon[] = ["3m", "6m", "1yr"];
 
 interface NiftyMarketData {
@@ -30,12 +33,24 @@ interface CategoryAllocation {
   pct: number;
 }
 
+interface FundWithReturns {
+  name: string;
+  schemeCode: string;
+  r1y: number | null;
+  r3y: number | null;
+  r5y: number | null;
+}
+
 interface LumpsumRecommendation {
   asset_class: string;
   category: string;
   rationale: string;
   risk_level: RiskLevel;
   suggested_allocation_pct: number;
+  // Raw from Gemini in mode=ai only — consumed by enrichWithAiFunds, not
+  // sent to the client (replaced by `funds` after enrichment).
+  suggested_funds?: string[];
+  funds?: FundWithReturns[];
 }
 
 interface LumpsumResponse {
@@ -127,7 +142,8 @@ function stripCodeFences(text: string): string {
 
 async function callGeminiForLumpsum(
   marketData: NiftyMarketData | null,
-  categoryAllocations: CategoryAllocation[]
+  categoryAllocations: CategoryAllocation[],
+  mode: Mode
 ): Promise<LumpsumResponse> {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
@@ -143,6 +159,21 @@ async function callGeminiForLumpsum(
       ? categoryAllocations.map((c) => `${c.category}: ${c.pct}%`).join(", ")
       : "no existing holdings";
 
+  // mode=curated does a direct dictionary lookup (CURATED_FUNDS[category])
+  // after Gemini responds, so `category` must be constrained to exactly
+  // these keys — a freeform category string would silently match nothing.
+  const categoryConstraint =
+    mode === "curated"
+      ? `\n\nThe "category" field in each recommendation MUST be exactly one of these values (no others): ${Object.keys(CURATED_FUNDS)
+          .map((c) => `"${c}"`)
+          .join(", ")}.`
+      : "";
+
+  const suggestedFundsInstruction =
+    mode === "ai"
+      ? `\n\nFor each recommendation, also suggest 2-3 specific well-known Indian mutual fund names within that category. Use full fund names as commonly known (e.g. "Parag Parikh Flexi Cap Fund - Direct Plan"). Return them in a "suggested_funds": string[] field on that recommendation.`
+      : "";
+
   const systemPrompt = `You are a mutual fund and lumpsum investment advisor for an Indian retail investor. Given current market conditions and the investor's existing portfolio allocation, recommend where to deploy a fresh lumpsum investment across three horizons: 3 months, 6 months, and 1 year.
 
 Context:
@@ -150,13 +181,13 @@ Context:
 - RBI repo rate: ${REPO_RATE_PCT}%
 - Investor's existing category allocation (% of invested amount): ${allocationSummary}
 
-For each horizon, give 2-3 recommendations that account for what's already held (avoid recommending further concentration into an already-dominant category unless clearly justified) and reflect the interest-rate and market-valuation context above.
+For each horizon, give 2-3 recommendations that account for what's already held (avoid recommending further concentration into an already-dominant category unless clearly justified) and reflect the interest-rate and market-valuation context above.${categoryConstraint}${suggestedFundsInstruction}
 
 Return ONLY valid JSON, no prose, no markdown code fences, in this exact shape:
 {
   "market_context": string (1-2 sentence summary of current conditions and what it means for lumpsum timing),
   "recommendations": {
-    "3m": [{ "asset_class": string, "category": string, "rationale": string, "risk_level": "Low" | "Medium" | "High", "suggested_allocation_pct": number }, ...],
+    "3m": [{ "asset_class": string, "category": string, "rationale": string, "risk_level": "Low" | "Medium" | "High", "suggested_allocation_pct": number${mode === "ai" ? ', "suggested_funds": string[]' : ""} }, ...],
     "6m": [...],
     "1yr": [...]
   }
@@ -209,6 +240,120 @@ Return ONLY valid JSON, no prose, no markdown code fences, in this exact shape:
   return { market_context: obj.market_context, recommendations };
 }
 
+async function toFundWithReturns(name: string, schemeCode: string): Promise<FundWithReturns> {
+  const returns = await fetchFundReturns(schemeCode);
+  return {
+    name,
+    schemeCode,
+    r1y: returns?.r1y ?? null,
+    r3y: returns?.r3y ?? null,
+    r5y: returns?.r5y ?? null,
+  };
+}
+
+// mode=curated: look up the recommendation's category directly in
+// CURATED_FUNDS (Gemini was constrained to only use these exact category
+// strings) and take the top 3.
+async function enrichCurated(rec: LumpsumRecommendation): Promise<LumpsumRecommendation> {
+  const candidates = (CURATED_FUNDS[rec.category] ?? []).slice(0, 3);
+  const funds = await Promise.all(candidates.map((f) => toFundWithReturns(f.name, f.schemeCode)));
+  return {
+    asset_class: rec.asset_class,
+    category: rec.category,
+    rationale: rec.rationale,
+    risk_level: rec.risk_level,
+    suggested_allocation_pct: rec.suggested_allocation_pct,
+    funds,
+  };
+}
+
+// A stricter search than @/lib/mfapi's searchDirectGrowthScheme, which falls
+// back to the search's first raw result when no clean Direct+Growth match
+// exists — fine for its original use (a human reviews the import preview
+// before saving), but wrong here: it can confidently return a stale,
+// dividend-only, since-renamed plan under a plausible-looking name (verified
+// live: "Kotak Equity Arbitrage Fund" resolved to a discontinued dividend
+// plan from 2007). This route shows the result directly as fact, so a
+// non-match must come back as "not found," never a guess.
+async function findCleanDirectGrowthMatch(
+  name: string
+): Promise<{ scheme_code: string; scheme_name: string } | null> {
+  try {
+    const res = await fetchWithTimeout(`https://api.mfapi.in/mf/search?q=${encodeURIComponent(name)}`);
+    if (!res.ok) return null;
+    const results = await res.json();
+    if (!Array.isArray(results)) return null;
+
+    const match = results.find(
+      (r: { schemeName?: string }) =>
+        typeof r.schemeName === "string" &&
+        /direct/i.test(r.schemeName) &&
+        /growth/i.test(r.schemeName) &&
+        !/idcw|dividend|bonus/i.test(r.schemeName)
+    );
+    if (!match || typeof match.schemeCode === "undefined") return null;
+    return { scheme_code: String(match.schemeCode), scheme_name: String(match.schemeName) };
+  } catch (err) {
+    console.error(`findCleanDirectGrowthMatch("${name}") failed:`, err);
+    return null;
+  }
+}
+
+async function fetchWithTimeout(url: string, timeoutMs = 5000): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { signal: controller.signal, cache: "no-store" });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// mode=ai: Gemini suggested 2-3 fund names freeform — resolve each to a real
+// scheme via mfapi.in search. A fund that can't be found or whose returns
+// fetch fails still shows up with null returns rather than being dropped.
+async function enrichAi(rec: LumpsumRecommendation): Promise<LumpsumRecommendation> {
+  const names = Array.isArray(rec.suggested_funds) ? rec.suggested_funds.slice(0, 3) : [];
+  const funds = await Promise.all(
+    names.map(async (name): Promise<FundWithReturns> => {
+      const match = await findCleanDirectGrowthMatch(name);
+      if (!match) {
+        return { name, schemeCode: "", r1y: null, r3y: null, r5y: null };
+      }
+      return toFundWithReturns(match.scheme_name || name, match.scheme_code);
+    })
+  );
+  return {
+    asset_class: rec.asset_class,
+    category: rec.category,
+    rationale: rec.rationale,
+    risk_level: rec.risk_level,
+    suggested_allocation_pct: rec.suggested_allocation_pct,
+    funds,
+  };
+}
+
+// Every fund lookup across every horizon runs in one flat Promise.all —
+// never sequential — so a large recommendation set still completes well
+// within maxDuration.
+async function enrichRecommendations(
+  recommendations: Record<Horizon, LumpsumRecommendation[]>,
+  mode: Mode
+): Promise<Record<Horizon, LumpsumRecommendation[]>> {
+  const enrichFn = mode === "curated" ? enrichCurated : enrichAi;
+  const flat = HORIZONS.flatMap((h) => recommendations[h]);
+  const enrichedFlat = await Promise.all(flat.map(enrichFn));
+
+  const result = {} as Record<Horizon, LumpsumRecommendation[]>;
+  let idx = 0;
+  for (const h of HORIZONS) {
+    const count = recommendations[h].length;
+    result[h] = enrichedFlat.slice(idx, idx + count);
+    idx += count;
+  }
+  return result;
+}
+
 export async function GET(request: Request) {
   try {
     const supabase = createClient();
@@ -233,15 +378,20 @@ export async function GET(request: Request) {
     // "family" merges holdings from both owners into one blended allocation.
     const owners: Owner[] = ownerParam === "family" ? ["praveen", "geetha"] : [ownerParam];
 
+    const modeParam = searchParams.get("mode");
+    const mode: Mode = modeParam === "curated" ? "curated" : "ai";
+
     const [marketData, categoryAllocations] = await Promise.all([
       fetchNiftyMarketData(),
       fetchCategoryAllocations(supabase, user.id, owners),
     ]);
     console.log(
-      `Data fetch complete — market data: ${marketData ? "ok" : "unavailable"}, ${categoryAllocations.length} categor(y/ies) held`
+      `Data fetch complete — mode: ${mode}, market data: ${marketData ? "ok" : "unavailable"}, ${categoryAllocations.length} categor(y/ies) held`
     );
 
-    const result = await callGeminiForLumpsum(marketData, categoryAllocations);
+    const result = await callGeminiForLumpsum(marketData, categoryAllocations, mode);
+    result.recommendations = await enrichRecommendations(result.recommendations, mode);
+    console.log(`Fund enrichment complete for mode=${mode}`);
 
     return NextResponse.json({
       ...result,

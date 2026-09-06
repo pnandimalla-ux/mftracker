@@ -26,12 +26,71 @@ const RISK_STYLES: Record<RiskLevel, string> = {
   High: "bg-red-100 text-red-700",
 };
 
+type Mode = "ai" | "curated";
+
+interface FundWithReturns {
+  name: string;
+  schemeCode: string;
+  r1y: number | null;
+  r3y: number | null;
+  r5y: number | null;
+}
+
 interface LumpsumRecommendation {
   asset_class: string;
   category: string;
   rationale: string;
   risk_level: RiskLevel;
   suggested_allocation_pct: number;
+  funds?: FundWithReturns[];
+}
+
+function truncateName(name: string, maxLen = 35): string {
+  return name.length > maxLen ? `${name.slice(0, maxLen)}…` : name;
+}
+
+function formatReturn(value: number | null): string {
+  if (value === null) return "—";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(1)}%`;
+}
+
+function ReturnCell({ value }: { value: number | null }) {
+  if (value === null) return <td className="px-2 py-1.5 text-right text-slate-400">—</td>;
+  return (
+    <td className={`px-2 py-1.5 text-right font-medium ${value >= 0 ? "text-green-600" : "text-red-600"}`}>
+      {formatReturn(value)}
+    </td>
+  );
+}
+
+function FundReturnsTable({ funds }: { funds: FundWithReturns[] }) {
+  if (funds.length === 0) return null;
+  return (
+    <div className="mt-3 overflow-x-auto rounded-lg border border-slate-200">
+      <table className="w-full text-left text-[11px]">
+        <thead>
+          <tr className="border-b border-slate-200 bg-slate-50 text-slate-500">
+            <th className="px-2 py-1.5 font-medium">Fund Name</th>
+            <th className="px-2 py-1.5 text-right font-medium">1Y</th>
+            <th className="px-2 py-1.5 text-right font-medium">3Y</th>
+            <th className="px-2 py-1.5 text-right font-medium">5Y</th>
+          </tr>
+        </thead>
+        <tbody>
+          {funds.map((f, i) => (
+            <tr key={f.schemeCode || i} className="border-b border-slate-100 last:border-0">
+              <td className="px-2 py-1.5 text-slate-700" title={f.name}>
+                {truncateName(f.name)}
+              </td>
+              <ReturnCell value={f.r1y} />
+              <ReturnCell value={f.r3y} />
+              <ReturnCell value={f.r5y} />
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }
 
 interface MarketData {
@@ -55,6 +114,7 @@ function formatIndexLevel(n: number): string {
 
 export default function RecommendationsClient({ userEmail }: { userEmail: string }) {
   const [owner, setOwner] = useState<OwnerFilter>("family");
+  const [mode, setMode] = useState<Mode>("ai");
   const [result, setResult] = useState<LumpsumResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -69,7 +129,7 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
     const timeoutId = setTimeout(() => controller.abort(), 90_000);
 
     try {
-      const res = await fetch(`/api/mf/lumpsum-recommendations?owner=${owner}`, {
+      const res = await fetch(`/api/mf/lumpsum-recommendations?owner=${owner}&mode=${mode}`, {
         signal: controller.signal,
       });
       const json = await res.json().catch(() => ({}));
@@ -99,6 +159,12 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
     setError(null);
   };
 
+  const handleModeChange = (next: Mode) => {
+    setMode(next);
+    setResult(null);
+    setError(null);
+  };
+
   return (
     <div className="min-h-screen bg-slate-50">
       <AppHeader userEmail={userEmail} />
@@ -112,18 +178,40 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
             </p>
           </div>
 
-          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1">
-            {OWNERS.map((o) => (
+          <div className="flex flex-col items-end gap-2">
+            <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1">
+              {OWNERS.map((o) => (
+                <button
+                  key={o.id}
+                  onClick={() => handleOwnerChange(o.id)}
+                  className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
+                    owner === o.id ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
+                  }`}
+                >
+                  {o.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Small, unobtrusive — most users will never need to touch this. */}
+            <div className="inline-flex rounded-full border border-slate-200 bg-white p-0.5 text-[11px]">
               <button
-                key={o.id}
-                onClick={() => handleOwnerChange(o.id)}
-                className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
-                  owner === o.id ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
+                onClick={() => handleModeChange("ai")}
+                className={`rounded-full px-2.5 py-1 font-medium transition ${
+                  mode === "ai" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-slate-600"
                 }`}
               >
-                {o.label}
+                AI Pick
               </button>
-            ))}
+              <button
+                onClick={() => handleModeChange("curated")}
+                className={`rounded-full px-2.5 py-1 font-medium transition ${
+                  mode === "curated" ? "bg-slate-800 text-white" : "text-slate-400 hover:text-slate-600"
+                }`}
+              >
+                Curated
+              </button>
+            </div>
           </div>
         </div>
 
@@ -186,6 +274,7 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
                           <span className="mt-2 inline-block rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">
                             Suggested: {rec.suggested_allocation_pct}%
                           </span>
+                          {rec.funds && <FundReturnsTable funds={rec.funds} />}
                         </div>
                       ))
                     )}
