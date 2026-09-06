@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import Anthropic from "@anthropic-ai/sdk";
+import { GoogleGenAI } from "@google/genai";
 import { createClient } from "@/lib/supabase/server";
 import { createServiceClient } from "@/lib/supabase/service";
 import { isRealSchemeCode } from "@/lib/peers/peerSync";
@@ -7,11 +7,15 @@ import type { Owner } from "@/types/mf";
 
 export const maxDuration = 60;
 
-// The task that specified this route named "claude-opus-4-5" / "claude-sonnet-4-5"
-// as the models to use — those are outdated identifiers. The current Claude
-// model family is Claude 5 (opus-5 / sonnet-5); using the current Opus-tier
-// model per that same "opus, else sonnet" intent.
-const CLAUDE_MODEL = "claude-opus-5";
+// The task that specified this swap named the package "@google/generative-ai"
+// and model "gemini-1.5-flash" — both are dead: that SDK was fully deprecated
+// 2025-11-30 (Google's own repo is renamed "deprecated-generative-ai-js"), and
+// the 1.5 model family now 404s. Using the current unified SDK (@google/genai).
+// Model verified live: gemini-3.8-flash returned 503 (overloaded) on this
+// key, and gemini-2.5-flash 404'd with "no longer available to new users —
+// use models/gemini-3.6-flash" straight from Google's own API error, which
+// then completed successfully end-to-end in testing.
+const GEMINI_MODEL = "gemini-3.6-flash";
 
 type OwnerFilter = Owner | "family";
 
@@ -25,9 +29,9 @@ interface TopPeer {
   r1y: number | null;
 }
 
-// Internal, per-fund working data — a superset of what's sent to Claude
+// Internal, per-fund working data — a superset of what's sent to Gemini
 // (earliest_date is kept back for the deterministic LTCG-date calculation
-// done after Claude responds, rather than trusting the model's date math).
+// done after Gemini responds, rather than trusting the model's date math).
 interface FundSummary {
   scheme_code: string;
   scheme_name: string;
@@ -50,7 +54,7 @@ interface FundSummary {
   top_peers_in_category: TopPeer[];
 }
 
-interface ClaudeRecommendation {
+interface GeminiRecommendation {
   scheme_code: string;
   owner: string;
   action: string;
@@ -101,7 +105,7 @@ function formatDMY(iso: string): string {
   return `${d}-${m}-${y}`;
 }
 
-// Deterministic LTCG note — computed here rather than trusted from Claude's
+// Deterministic LTCG note — computed here rather than trusted from Gemini's
 // output, since exact date arithmetic ("365 days from purchase") is a poor
 // fit for an LLM to get right consistently.
 function computeLtcgNote(action: Action, holdingDays: number, earliestDate: string): string | null {
@@ -295,19 +299,19 @@ function stripCodeFences(text: string): string {
     .trim();
 }
 
-async function callClaude(
+async function callGemini(
   funds: FundSummary[],
   categoryTotals: Record<string, number>,
   overallTotal: number
-): Promise<ClaudeRecommendation[]> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not set");
+): Promise<GeminiRecommendation[]> {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY is not set");
 
-  const anthropic = new Anthropic({ apiKey });
+  const genAI = new GoogleGenAI({ apiKey });
 
-  // earliest_date is intentionally omitted from what Claude sees — it's only
-  // used server-side for the deterministic LTCG date calculation.
-  const claudeFunds = funds.map((f) => ({
+  // earliest_date is intentionally omitted from what the model sees — it's
+  // only used server-side for the deterministic LTCG date calculation.
+  const geminiFunds = funds.map((f) => ({
     scheme_code: f.scheme_code,
     scheme_name: f.scheme_name,
     owner: f.owner,
@@ -330,7 +334,7 @@ async function callClaude(
 
   const userPrompt = JSON.stringify(
     {
-      funds: claudeFunds,
+      funds: geminiFunds,
       portfolio_total_by_category: categoryTotals,
       overall_total_invested: overallTotal,
     },
@@ -338,32 +342,40 @@ async function callClaude(
     2
   );
 
-  const response = await anthropic.messages.create({
-    model: CLAUDE_MODEL,
-    max_tokens: 4096,
-    system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: userPrompt }],
-  });
-
-  const textBlock = response.content.find((b) => b.type === "text");
-  if (!textBlock || textBlock.type !== "text") {
-    throw new Error("Claude returned no text content");
+  let responseText: string;
+  try {
+    const response = await genAI.models.generateContent({
+      model: GEMINI_MODEL,
+      contents: userPrompt,
+      config: {
+        systemInstruction: SYSTEM_PROMPT,
+        temperature: 0.2,
+        responseMimeType: "application/json",
+      },
+    });
+    responseText = response.text ?? "";
+  } catch (err) {
+    throw new Error(`Gemini API error: ${err instanceof Error ? err.message : String(err)}`);
   }
 
-  const cleaned = stripCodeFences(textBlock.text);
+  if (!responseText.trim()) {
+    throw new Error("Gemini returned no text content");
+  }
+
+  const cleaned = stripCodeFences(responseText);
   let parsed: unknown;
   try {
     parsed = JSON.parse(cleaned);
   } catch (err) {
     throw new Error(
-      `Failed to parse Claude response as JSON: ${err instanceof Error ? err.message : String(err)}`
+      `Failed to parse Gemini response as JSON: ${err instanceof Error ? err.message : String(err)}`
     );
   }
   if (!Array.isArray(parsed)) {
-    throw new Error("Claude response was not a JSON array");
+    throw new Error("Gemini response was not a JSON array");
   }
 
-  return parsed as ClaudeRecommendation[];
+  return parsed as GeminiRecommendation[];
 }
 
 async function generateRecommendationsForOwner(
@@ -374,18 +386,18 @@ async function generateRecommendationsForOwner(
   const { funds, categoryTotals, overallTotal } = await buildFundSummaries(serviceClient, userId, owner);
   if (funds.length === 0) return [];
 
-  const claudeRecs = await callClaude(funds, categoryTotals, overallTotal);
+  const geminiRecs = await callGemini(funds, categoryTotals, overallTotal);
   const fundByCode = new Map(funds.map((f) => [f.scheme_code, f]));
 
   const results: RecommendationView[] = [];
-  for (const rec of claudeRecs) {
+  for (const rec of geminiRecs) {
     const fund = fundByCode.get(rec.scheme_code);
     if (!fund) {
-      console.warn(`Claude referenced unknown scheme_code "${rec.scheme_code}" for owner ${owner} — skipped`);
+      console.warn(`Gemini referenced unknown scheme_code "${rec.scheme_code}" for owner ${owner} — skipped`);
       continue;
     }
     if (!VALID_ACTIONS.includes(rec.action as Action)) {
-      console.warn(`Claude returned invalid action "${rec.action}" for ${rec.scheme_code} — skipped`);
+      console.warn(`Gemini returned invalid action "${rec.action}" for ${rec.scheme_code} — skipped`);
       continue;
     }
     const action = rec.action as Action;
