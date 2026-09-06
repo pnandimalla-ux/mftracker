@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getAuthedUser } from "@/lib/supabase/getAuthedUser";
-import AppHeader from "@/components/AppHeader";
+import RecommendationsClient from "./RecommendationsClient";
 
 export default async function RecommendationsPage() {
   const { user, failed } = await getAuthedUser();
@@ -13,17 +13,5 @@ export default async function RecommendationsPage() {
     redirect("/login");
   }
 
-  return (
-    <div className="min-h-screen bg-slate-50">
-      <AppHeader userEmail={user.email ?? ""} />
-
-      <main className="mx-auto max-w-6xl px-4 py-8">
-        <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center">
-          <p className="text-sm font-medium text-slate-700">
-            AI recommendations are coming soon
-          </p>
-        </div>
-      </main>
-    </div>
-  );
+  return <RecommendationsClient userEmail={user.email ?? ""} />;
 }
