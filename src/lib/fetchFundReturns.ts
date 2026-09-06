@@ -35,7 +35,9 @@ async function fetchWithTimeout(url: string, timeoutMs = TIMEOUT_MS): Promise<Re
 
 // NAV history has gaps (weekends, holidays), so a fixed array index doesn't
 // land on a consistent calendar distance back. Instead, walk the (newest-first)
-// data and take the first entry whose date is on or before the target date.
+// data and take the first entry whose date is on or before the target date,
+// then annualize using the *actual* elapsed days (not the nominal 365/1095/1825)
+// so 3Y/5Y figures are true CAGR rather than simple cumulative return.
 function returnForDaysBack(data: NavEntry[], latestTime: number, latestNav: number, days: number): number | null {
   const targetTime = latestTime - days * DAY_MS;
 
@@ -52,7 +54,10 @@ function returnForDaysBack(data: NavEntry[], latestTime: number, latestNav: numb
   const pastNav = Number(pastEntry.nav);
   if (!Number.isFinite(pastNav) || pastNav <= 0) return null;
 
-  const ret = ((latestNav - pastNav) / pastNav) * 100;
+  const daysBetween = (latestTime - parseMfapiDate(pastEntry.date).getTime()) / DAY_MS;
+  const years = daysBetween / 365;
+
+  const ret = (Math.pow(latestNav / pastNav, 1 / years) - 1) * 100;
   return Math.round(ret * 100) / 100;
 }
 

@@ -41,15 +41,25 @@ interface FundWithReturns {
   r5y: number | null;
 }
 
+// Raw from Gemini in mode=ai only — Gemini supplies its own approximate
+// CAGR figures for these funds (from training data), since it picked funds
+// freeform and there's no scheme code yet to look historical NAV up by.
+interface GeminiSuggestedFund {
+  name: string;
+  return_1y: number | null;
+  return_3y: number | null;
+  return_5y: number | null;
+}
+
 interface LumpsumRecommendation {
   asset_class: string;
   category: string;
   rationale: string;
   risk_level: RiskLevel;
   suggested_allocation_pct: number;
-  // Raw from Gemini in mode=ai only — consumed by enrichWithAiFunds, not
-  // sent to the client (replaced by `funds` after enrichment).
-  suggested_funds?: string[];
+  // Raw from Gemini in mode=ai only — consumed by enrichAi, not sent to the
+  // client (replaced by `funds` after enrichment).
+  suggested_funds?: GeminiSuggestedFund[];
   funds?: FundWithReturns[];
 }
 
@@ -171,7 +181,7 @@ async function callGeminiForLumpsum(
 
   const suggestedFundsInstruction =
     mode === "ai"
-      ? `\n\nFor each recommendation, also suggest 2-3 specific well-known Indian mutual fund names within that category. Use full fund names as commonly known (e.g. "Parag Parikh Flexi Cap Fund - Direct Plan"). Return them in a "suggested_funds": string[] field on that recommendation.`
+      ? `\n\nFor each recommendation, also suggest 2-3 specific well-known Indian mutual fund names within that category. Use full fund names as commonly known (e.g. "Parag Parikh Flexi Cap Fund - Direct Plan"). For each fund, include approximate 1Y, 3Y, and 5Y CAGR returns (annualized %) from your training data. Use null if you are not confident about a figure. Return them in a "suggested_funds" field on that recommendation, as an array of objects: { "name": string, "return_1y": number | null, "return_3y": number | null, "return_5y": number | null }.`
       : "";
 
   const systemPrompt = `You are a mutual fund and lumpsum investment advisor for an Indian retail investor. Given current market conditions and the investor's existing portfolio allocation, recommend where to deploy a fresh lumpsum investment across three horizons: 3 months, 6 months, and 1 year.
@@ -187,7 +197,7 @@ Return ONLY valid JSON, no prose, no markdown code fences, in this exact shape:
 {
   "market_context": string (1-2 sentence summary of current conditions and what it means for lumpsum timing),
   "recommendations": {
-    "3m": [{ "asset_class": string, "category": string, "rationale": string, "risk_level": "Low" | "Medium" | "High", "suggested_allocation_pct": number${mode === "ai" ? ', "suggested_funds": string[]' : ""} }, ...],
+    "3m": [{ "asset_class": string, "category": string, "rationale": string, "risk_level": "Low" | "Medium" | "High", "suggested_allocation_pct": number${mode === "ai" ? ', "suggested_funds": [{ "name": string, "return_1y": number | null, "return_3y": number | null, "return_5y": number | null }]' : ""} }, ...],
     "6m": [...],
     "1yr": [...]
   }
@@ -309,18 +319,24 @@ async function fetchWithTimeout(url: string, timeoutMs = 5000): Promise<Response
   }
 }
 
-// mode=ai: Gemini suggested 2-3 fund names freeform — resolve each to a real
-// scheme via mfapi.in search. A fund that can't be found or whose returns
-// fetch fails still shows up with null returns rather than being dropped.
+// mode=ai: Gemini suggested 2-3 fund names freeform, along with its own
+// approximate 1Y/3Y/5Y CAGR figures from training data — used directly here,
+// no mfapi NAV lookup. We still resolve each name to a real scheme via
+// mfapi.in search purely to get a clean canonical name and a schemeCode for
+// the UI's React key; a fund that can't be matched still shows up (using
+// Gemini's own name) with Gemini's returns rather than being dropped.
 async function enrichAi(rec: LumpsumRecommendation): Promise<LumpsumRecommendation> {
-  const names = Array.isArray(rec.suggested_funds) ? rec.suggested_funds.slice(0, 3) : [];
+  const suggested = Array.isArray(rec.suggested_funds) ? rec.suggested_funds.slice(0, 3) : [];
   const funds = await Promise.all(
-    names.map(async (name): Promise<FundWithReturns> => {
-      const match = await findCleanDirectGrowthMatch(name);
-      if (!match) {
-        return { name, schemeCode: "", r1y: null, r3y: null, r5y: null };
-      }
-      return toFundWithReturns(match.scheme_name || name, match.scheme_code);
+    suggested.map(async (sf): Promise<FundWithReturns> => {
+      const match = await findCleanDirectGrowthMatch(sf.name);
+      return {
+        name: match?.scheme_name || sf.name,
+        schemeCode: match?.scheme_code ?? "",
+        r1y: sf.return_1y ?? null,
+        r3y: sf.return_3y ?? null,
+        r5y: sf.return_5y ?? null,
+      };
     })
   );
   return {
