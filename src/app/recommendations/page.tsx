@@ -1,5 +1,6 @@
 import { redirect } from "next/navigation";
 import { getAuthedUser } from "@/lib/supabase/getAuthedUser";
+import ErrorBoundary from "@/components/ErrorBoundary";
 import RecommendationsClient from "./RecommendationsClient";
 
 export default async function RecommendationsPage() {
@@ -13,5 +14,9 @@ export default async function RecommendationsPage() {
     redirect("/login");
   }
 
-  return <RecommendationsClient userEmail={user.email ?? ""} />;
+  return (
+    <ErrorBoundary>
+      <RecommendationsClient userEmail={user.email ?? ""} />
+    </ErrorBoundary>
+  );
 }

@@ -3,6 +3,7 @@
 import { useState } from "react";
 import AppHeader from "@/components/AppHeader";
 import type { Owner } from "@/types/mf";
+import type { ReactElement } from "react";
 
 type OwnerFilter = "family" | Owner;
 type Horizon = "3m" | "6m" | "1yr";
@@ -165,7 +166,10 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
     setError(null);
   };
 
-  return (
+  let renderError: unknown = null;
+  let content: ReactElement | null = null;
+  try {
+    content = (
     <div className="min-h-screen bg-slate-50">
       <AppHeader userEmail={userEmail} />
 
@@ -250,7 +254,7 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
               <p className="mt-1 text-xs text-blue-700">{result.market_context}</p>
             </div>
 
-            <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-3">
+            <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-3">
               {(["3m", "6m", "1yr"] as Horizon[]).map((horizon) => (
                 <div key={horizon} className="rounded-xl border border-slate-200 bg-white p-4">
                   <h2 className="mb-3 text-sm font-semibold text-slate-800">{HORIZON_LABELS[horizon]}</h2>
@@ -294,5 +298,24 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
         )}
       </main>
     </div>
-  );
+    );
+  } catch (err) {
+    renderError = err;
+  }
+
+  if (renderError) {
+    console.error("RecommendationsClient render error:", renderError);
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-50 p-6">
+        <div className="max-w-md rounded-xl border border-red-200 bg-red-50 p-5 text-center">
+          <p className="text-sm font-semibold text-red-700">Something went wrong rendering this page</p>
+          <p className="mt-2 break-words text-xs text-red-600">
+            {renderError instanceof Error ? renderError.message : String(renderError)}
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return content;
 }

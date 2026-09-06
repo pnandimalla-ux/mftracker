@@ -189,7 +189,7 @@ export default function InsightsClient({ userEmail }: { userEmail: string }) {
         </div>
 
         {loadingSaved ? (
-          <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
             {Array.from({ length: 3 }).map((_, i) => (
               <div key={i} className="animate-pulse rounded-xl border border-slate-200 bg-white p-4">
                 <div className="h-4 w-2/3 rounded bg-slate-200" />
@@ -205,7 +205,7 @@ export default function InsightsClient({ userEmail }: { userEmail: string }) {
             </p>
           </div>
         ) : (
-          <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+          <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
             {sorted.map((rec) => (
               <div
                 key={rec.id ?? `${rec.owner}:${rec.scheme_code}`}

@@ -39,13 +39,14 @@ const PERIODS: { id: Period; label: string }[] = [
   { id: "5y", label: "5Y" },
 ];
 
-// Main grouped-fund row: 4 columns on mobile (<md), 9 on md+. The 5 desktop-only
-// columns (Owner, Category, Current ₹, {period} Return, Peer rank) are hidden
-// via `hidden md:...` on the cells themselves — they sit in DOM order between
-// Fund name and Invested ₹/P&L/Actions, so hiding them still leaves the 4
-// mobile columns lining up against the 4-track mobile grid.
+// Main grouped-fund row: 3 columns on mobile (<md), 9 on md+. The 6 desktop-only
+// columns (Owner, Category, Invested ₹, Current ₹, {period} Return, Peer rank)
+// are hidden via `hidden md:...` on the cells themselves — they sit in DOM order
+// between Fund name and P&L/Actions, so hiding them still leaves the 3 mobile
+// columns lining up against the 3-track mobile grid. On mobile, the invested
+// amount is instead shown stacked under the fund name (see the fund-name cell).
 const MAIN_GRID =
-  "grid grid-cols-[minmax(0,1fr)_92px_140px_84px] md:grid-cols-[minmax(200px,2fr)_56px_96px_96px_96px_140px_76px_76px_150px]";
+  "grid grid-cols-[minmax(0,1fr)_140px_84px] md:grid-cols-[minmax(200px,2fr)_56px_96px_96px_96px_140px_76px_76px_150px]";
 
 // Individual lot sub-row: Date | Owner | Invested ₹ | Current ₹ | P&L | Avg NAV | Units | Actions
 const SUB_GRID = "grid grid-cols-[90px_56px_96px_96px_140px_84px_84px_96px]";
@@ -136,6 +137,16 @@ function periodRankKey(period: Period) {
 
 function formatInr(value: number) {
   return `₹${Math.round(value).toLocaleString("en-IN")}`;
+}
+
+// Indian-number-format axis abbreviation: K below 1 lakh, L below 1 crore, Cr above.
+function formatInrAbbreviated(value: number): string {
+  const sign = value < 0 ? "-" : "";
+  const abs = Math.abs(value);
+  const trimZero = (s: string) => s.replace(/\.0$/, "");
+  if (abs >= 10000000) return `${sign}₹${trimZero((abs / 10000000).toFixed(1))}Cr`;
+  if (abs >= 100000) return `${sign}₹${trimZero((abs / 100000).toFixed(1))}L`;
+  return `${sign}₹${Math.round(abs / 1000)}K`;
 }
 
 function formatPct(value: number | null) {
@@ -483,6 +494,14 @@ export default function DashboardClient({
   const [owner, setOwner] = useState<OwnerFilter>("family");
   const [period, setPeriod] = useState<Period>("1y");
   const [loading, setLoading] = useState(true);
+  const [isMobile, setIsMobile] = useState(false);
+
+  useEffect(() => {
+    const checkMobile = () => setIsMobile(window.innerWidth < 768);
+    checkMobile();
+    window.addEventListener("resize", checkMobile);
+    return () => window.removeEventListener("resize", checkMobile);
+  }, []);
   const [holdings, setHoldings] = useState<HoldingWithPeer[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -1422,21 +1441,25 @@ export default function DashboardClient({
                 <p className="mb-3 text-sm font-medium text-slate-600 dark:text-slate-400">
                   Invested vs Current Value
                 </p>
-                <ResponsiveContainer width="100%" height={340}>
-                  <BarChart data={topFundsByValue} layout="vertical" margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-                    <CartesianGrid strokeDasharray="3 3" />
-                    <XAxis type="number" />
-                    <YAxis type="category" dataKey="name" width={180} />
-                    <Tooltip content={<FundValueTooltip />} />
-                    <Legend />
-                    <Bar dataKey="invested" name="Invested" fill="#94a3b8" />
-                    <Bar dataKey="current" name="Current">
-                      {topFundsByValue.map((entry) => (
-                        <Cell key={entry.key} fill={entry.current >= entry.invested ? "#10b981" : "#f43f5e"} />
-                      ))}
-                    </Bar>
-                  </BarChart>
-                </ResponsiveContainer>
+                <div className="overflow-x-auto">
+                  <div className="min-w-[480px]">
+                    <ResponsiveContainer width="100%" height={340}>
+                      <BarChart data={topFundsByValue} layout="vertical" margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis type="number" tickFormatter={formatInrAbbreviated} />
+                        <YAxis type="category" dataKey="name" width={180} />
+                        <Tooltip content={<FundValueTooltip />} />
+                        <Legend />
+                        <Bar dataKey="invested" name="Invested" fill="#94a3b8" />
+                        <Bar dataKey="current" name="Current">
+                          {topFundsByValue.map((entry) => (
+                            <Cell key={entry.key} fill={entry.current >= entry.invested ? "#10b981" : "#f43f5e"} />
+                          ))}
+                        </Bar>
+                      </BarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -1447,7 +1470,11 @@ export default function DashboardClient({
               <ResponsiveContainer width="100%" height={300}>
                 <BarChart data={pnlByFund} margin={{ top: 5, right: 20, left: 0, bottom: 30 }}>
                   <CartesianGrid strokeDasharray="3 3" />
-                  <XAxis dataKey="name" angle={-35} textAnchor="end" interval={0} height={60} />
+                  {isMobile ? (
+                    <XAxis dataKey="name" tick={false} height={4} />
+                  ) : (
+                    <XAxis dataKey="name" angle={-35} textAnchor="end" interval={0} height={60} />
+                  )}
                   <YAxis tickFormatter={(v) => `${v.toFixed(1)}%`} />
                   <Tooltip content={<FundPnlTooltip />} />
                   <Bar dataKey="pnl_pct" name="P&L %">
@@ -1457,6 +1484,9 @@ export default function DashboardClient({
                   </Bar>
                 </BarChart>
               </ResponsiveContainer>
+              {isMobile && (
+                <p className="mt-2 text-center text-xs text-slate-400">Tap bars to see fund details</p>
+              )}
             </div>
           </section>
         )}
@@ -1548,7 +1578,7 @@ export default function DashboardClient({
                   <span className="font-medium">Fund name</span>
                   <span className="hidden font-medium md:block">Owner</span>
                   <span className="hidden font-medium md:block">Category</span>
-                  <span className="font-medium">Invested ₹</span>
+                  <span className="hidden font-medium md:block">Invested ₹</span>
                   <span className="hidden font-medium md:block">Current ₹</span>
                   <span className="font-medium">P&L</span>
                   <span className="hidden font-medium md:block">{periodLabel} Return</span>
@@ -1592,11 +1622,14 @@ export default function DashboardClient({
                             <button
                               type="button"
                               onClick={() => handleOpenAlternatives(group)}
-                              className="line-clamp-2 cursor-pointer text-left text-sm font-semibold text-slate-800 hover:text-blue-600"
+                              className="block max-w-[160px] cursor-pointer truncate text-left text-sm font-semibold text-slate-800 hover:text-blue-600 md:max-w-none md:line-clamp-2 md:whitespace-normal"
                               title="View better alternatives"
                             >
                               {group.scheme_name}
                             </button>
+                            <span className="mt-0.5 text-xs text-gray-500 md:hidden">
+                              {formatInr(group.total_invested)}
+                            </span>
                             <div className="mt-0.5 flex items-center gap-1.5">
                               {group.scheme_code && (
                                 <Link
@@ -1621,7 +1654,7 @@ export default function DashboardClient({
                           <OwnerBadge owner={group.owner} />
                         </div>
                         <span className="hidden truncate text-slate-600 md:block">{group.category}</span>
-                        <span className="text-slate-800">{formatInr(group.total_invested)}</span>
+                        <span className="hidden text-slate-800 md:block">{formatInr(group.total_invested)}</span>
                         <span className="hidden text-slate-800 md:block">{formatInr(group.current_value)}</span>
                         <span className={`font-medium ${group.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
                           {group.pnl >= 0 ? "+" : "-"}
