@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import AppHeader from "@/components/AppHeader";
 import type { Owner } from "@/types/mf";
 import type { ReactElement } from "react";
@@ -113,12 +113,59 @@ function formatIndexLevel(n: number): string {
   return n.toLocaleString("en-IN", { maximumFractionDigits: 0 });
 }
 
+function cacheKey(owner: OwnerFilter, mode: Mode): string {
+  return `mf_reco_${owner}_${mode}`;
+}
+
+function cacheTsKey(owner: OwnerFilter, mode: Mode): string {
+  return `mf_reco_ts_${owner}_${mode}`;
+}
+
+function loadCachedResult(owner: OwnerFilter, mode: Mode): LumpsumResult | null {
+  try {
+    const raw = localStorage.getItem(cacheKey(owner, mode));
+    return raw ? (JSON.parse(raw) as LumpsumResult) : null;
+  } catch {
+    return null;
+  }
+}
+
+function loadCachedTimestamp(owner: OwnerFilter, mode: Mode): number | null {
+  try {
+    const raw = localStorage.getItem(cacheTsKey(owner, mode));
+    return raw ? Number(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+function formatLastUpdated(ts: number): string {
+  const minutes = Math.max(0, Math.round((Date.now() - ts) / 60_000));
+  if (minutes < 60) {
+    return `Last updated: ${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  }
+  const hours = Math.round(minutes / 60);
+  return `Last updated: ${hours} hour${hours === 1 ? "" : "s"} ago`;
+}
+
 export default function RecommendationsClient({ userEmail }: { userEmail: string }) {
   const [owner, setOwner] = useState<OwnerFilter>("family");
   const [mode, setMode] = useState<Mode>("ai");
   const [result, setResult] = useState<LumpsumResult | null>(null);
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  // Load cached results for the currently selected owner/mode on mount so
+  // the page shows something immediately without clicking Fetch.
+  useEffect(() => {
+    const cached = loadCachedResult(owner, mode);
+    if (cached) {
+      setResult(cached);
+      setLastUpdated(loadCachedTimestamp(owner, mode));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const handleGetRecommendations = async () => {
     setLoading(true);
@@ -138,7 +185,16 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
         console.error("Lumpsum recommendations failed:", json.error, json.stack);
         throw new Error(json.error ?? "Failed to fetch recommendations");
       }
-      setResult(json as LumpsumResult);
+      const data = json as LumpsumResult;
+      const now = Date.now();
+      setResult(data);
+      setLastUpdated(now);
+      try {
+        localStorage.setItem(cacheKey(owner, mode), JSON.stringify(data));
+        localStorage.setItem(cacheTsKey(owner, mode), String(now));
+      } catch {
+        // localStorage may be unavailable (e.g. private browsing) — ignore.
+      }
     } catch (err) {
       console.error("Failed to fetch lumpsum recommendations:", err);
       const message =
@@ -156,14 +212,18 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
 
   const handleOwnerChange = (next: OwnerFilter) => {
     setOwner(next);
-    setResult(null);
     setError(null);
+    const cached = loadCachedResult(next, mode);
+    setResult(cached);
+    setLastUpdated(cached ? loadCachedTimestamp(next, mode) : null);
   };
 
   const handleModeChange = (next: Mode) => {
     setMode(next);
-    setResult(null);
     setError(null);
+    const cached = loadCachedResult(owner, next);
+    setResult(cached);
+    setLastUpdated(cached ? loadCachedTimestamp(owner, next) : null);
   };
 
   let renderError: unknown = null;
@@ -253,6 +313,10 @@ export default function RecommendationsClient({ userEmail }: { userEmail: string
               </p>
               <p className="mt-1 text-xs text-blue-700">{result.market_context}</p>
             </div>
+
+            {lastUpdated && (
+              <p className="mt-1.5 text-[11px] text-slate-400">{formatLastUpdated(lastUpdated)}</p>
+            )}
 
             <div className="mt-6 grid grid-cols-1 gap-4 lg:grid-cols-3">
               {(["3m", "6m", "1yr"] as Horizon[]).map((horizon) => (

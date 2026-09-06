@@ -16,14 +16,11 @@ export interface FundReturns {
 
 const TIMEOUT_MS = 5000;
 const DAY_MS = 24 * 60 * 60 * 1000;
-// Nearest-date tolerance when looking for the NAV ~N days back — beyond this,
-// treat it as "history doesn't go back far enough" rather than a bad match.
-const TOLERANCE_MS = 10 * DAY_MS;
 
 // mfapi.in dates are "DD-MM-YYYY", not ISO.
-function parseMfapiDate(d: string): number {
+function parseMfapiDate(d: string): Date {
   const [day, month, year] = d.split("-").map(Number);
-  return new Date(year, month - 1, day).getTime();
+  return new Date(year, month - 1, day);
 }
 
 async function fetchWithTimeout(url: string, timeoutMs = TIMEOUT_MS): Promise<Response> {
@@ -36,23 +33,23 @@ async function fetchWithTimeout(url: string, timeoutMs = TIMEOUT_MS): Promise<Re
   }
 }
 
+// NAV history has gaps (weekends, holidays), so a fixed array index doesn't
+// land on a consistent calendar distance back. Instead, walk the (newest-first)
+// data and take the first entry whose date is on or before the target date.
 function returnForDaysBack(data: NavEntry[], latestTime: number, latestNav: number, days: number): number | null {
   const targetTime = latestTime - days * DAY_MS;
-  let closest: NavEntry | null = null;
-  let closestDiff = Infinity;
 
+  let pastEntry: NavEntry | null = null;
   for (const entry of data) {
-    const entryTime = parseMfapiDate(entry.date);
-    const diff = Math.abs(entryTime - targetTime);
-    if (diff < closestDiff) {
-      closestDiff = diff;
-      closest = entry;
+    if (parseMfapiDate(entry.date).getTime() <= targetTime) {
+      pastEntry = entry;
+      break;
     }
   }
 
-  if (!closest || closestDiff > TOLERANCE_MS) return null;
+  if (!pastEntry) return null;
 
-  const pastNav = Number(closest.nav);
+  const pastNav = Number(pastEntry.nav);
   if (!Number.isFinite(pastNav) || pastNav <= 0) return null;
 
   const ret = ((latestNav - pastNav) / pastNav) * 100;
@@ -72,7 +69,7 @@ export async function fetchFundReturns(schemeCode: string): Promise<FundReturns 
     const latest = data[0];
     const latestNav = Number(latest.nav);
     if (!Number.isFinite(latestNav) || latestNav <= 0) return null;
-    const latestTime = parseMfapiDate(latest.date);
+    const latestTime = parseMfapiDate(latest.date).getTime();
 
     return {
       r1y: returnForDaysBack(data, latestTime, latestNav, 365),
