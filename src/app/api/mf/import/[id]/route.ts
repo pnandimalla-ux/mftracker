@@ -44,7 +44,7 @@ export async function DELETE(
 
     const { data: importedHoldings, count: deletedHoldingsCount } = await supabase
       .from("mf_holdings")
-      .select("owner, scheme_code", { count: "exact" })
+      .select("owner, scheme_code, scheme_name", { count: "exact" })
       .eq("user_id", user.id)
       .eq("import_id", params.id);
 
@@ -69,7 +69,7 @@ export async function DELETE(
     );
 
     let deletedSipSchedules = 0;
-    for (const { owner, scheme_code } of uniquePairs) {
+    for (const { owner, scheme_code, scheme_name } of uniquePairs) {
       if (!scheme_code) continue;
 
       const { count } = await supabase
@@ -87,6 +87,19 @@ export async function DELETE(
           .eq("owner", owner)
           .eq("scheme_code", scheme_code);
         deletedSipSchedules += sipDeleteCount ?? 0;
+
+        // A SIP created without a resolved scheme_code (manual add, or the
+        // SIP-detect wizard when mfapi.in had no match) can never match the
+        // .eq("scheme_code", ...) delete above — null never equals a value
+        // in SQL — so it has to be matched by scheme_name instead.
+        const { count: sipDeleteByNameCount } = await serviceClient
+          .from("mf_sip_schedules")
+          .delete({ count: "exact" })
+          .eq("user_id", user.id)
+          .eq("owner", owner)
+          .is("scheme_code", null)
+          .eq("scheme_name", scheme_name);
+        deletedSipSchedules += sipDeleteByNameCount ?? 0;
       }
     }
 

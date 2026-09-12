@@ -191,6 +191,9 @@ export default function SettingsClient({
   const [backfilling, setBackfilling] = useState(false);
   const [backfillResult, setBackfillResult] = useState<string | null>(null);
 
+  const [cleaningUpSips, setCleaningUpSips] = useState(false);
+  const [sipCleanupResult, setSipCleanupResult] = useState<string | null>(null);
+
   const showToast = (message: string) => {
     setToast(message);
     setTimeout(() => setToast(null), 3000);
@@ -370,6 +373,30 @@ export default function SettingsClient({
     }
   };
 
+  const handleCleanupOrphanedSips = async () => {
+    setCleaningUpSips(true);
+    setSipCleanupResult(null);
+    try {
+      const res = await fetch("/api/mf/sip/cleanup-orphaned", { method: "POST" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Cleanup failed");
+      setSipCleanupResult(
+        json.deleted_count === 0
+          ? "No orphaned SIP schedules found."
+          : `Removed ${json.deleted_count} SIP schedule${json.deleted_count === 1 ? "" : "s"} with no matching holdings: ${json.deleted
+              .map((d: { scheme_name: string; owner: string }) => `${d.scheme_name} (${d.owner})`)
+              .join(", ")}`
+      );
+      showToast("SIP schedules cleaned up");
+    } catch (err) {
+      console.error("SIP cleanup failed:", err);
+      setSipCleanupResult("Cleanup failed. Please try again.");
+      showToast("Cleanup failed");
+    } finally {
+      setCleaningUpSips(false);
+    }
+  };
+
   const latestTier1Weekly = syncLog.find((l) => l.cron_name === "tier1-weekly") ?? null;
   const isStale = latestTier1Weekly
     ? Date.now() - new Date(latestTier1Weekly.run_at).getTime() > STALE_MS
@@ -484,6 +511,28 @@ export default function SettingsClient({
             {backfilling ? "Backfilling..." : "Backfill transactions"}
           </button>
           {backfillResult && <p className="mt-2 text-sm text-slate-600">{backfillResult}</p>}
+        </div>
+
+        {/* SIP schedule cleanup */}
+        <div className="mt-6 rounded-xl border border-slate-200 bg-white p-5">
+          <h2 className="text-base font-semibold text-slate-800">SIP schedules</h2>
+          <p className="mt-2 text-sm text-slate-500">
+            Removes SIP schedules left behind by a deleted import — a SIP whose fund has no
+            matching holdings anymore. Safe to run anytime; it only removes schedules with
+            nothing behind them.
+          </p>
+          <button
+            type="button"
+            onClick={handleCleanupOrphanedSips}
+            disabled={cleaningUpSips}
+            className="mt-3 inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {cleaningUpSips && (
+              <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
+            )}
+            {cleaningUpSips ? "Cleaning up..." : "Clean up orphaned SIP schedules"}
+          </button>
+          {sipCleanupResult && <p className="mt-2 text-sm text-slate-600">{sipCleanupResult}</p>}
         </div>
 
         {/* Sync history */}
