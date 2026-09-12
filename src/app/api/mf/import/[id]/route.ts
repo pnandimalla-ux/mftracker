@@ -8,6 +8,12 @@ import { createServiceClient } from "@/lib/supabase/service";
 // added lots) are untouched. mf_cas_imports is read-only for regular users
 // per this project's RLS convention, so it's verified with the regular
 // client (SELECT is allowed) but deleted with the service client.
+//
+// A SIP schedule isn't tied to any one import_id (it's a standalone
+// recurring plan, not a lot), so it never cascade-deletes on its own —
+// deleting the fund's last lot has to explicitly clean up the matching
+// mf_sip_schedules row too, or the calendar keeps showing a SIP for a fund
+// that no longer has any holdings.
 export async function DELETE(
   _request: Request,
   { params }: { params: { id: string } }
@@ -36,9 +42,9 @@ export async function DELETE(
       return NextResponse.json({ error: "Import not found" }, { status: 404 });
     }
 
-    const { count: deletedHoldingsCount } = await supabase
+    const { data: importedHoldings, count: deletedHoldingsCount } = await supabase
       .from("mf_holdings")
-      .select("id", { count: "exact", head: true })
+      .select("owner, scheme_code", { count: "exact" })
       .eq("user_id", user.id)
       .eq("import_id", params.id);
 
@@ -53,7 +59,41 @@ export async function DELETE(
       return NextResponse.json({ error: deleteImportError.message }, { status: 500 });
     }
 
-    return NextResponse.json({ deleted_holdings: deletedHoldingsCount ?? 0 });
+    // Only drop the SIP schedule for a fund once every lot behind it (across
+    // every import, not just this one) is actually gone — a fund with lots
+    // from an earlier import too should keep its SIP schedule.
+    const uniquePairs = Array.from(
+      new Map(
+        (importedHoldings ?? []).map((h) => [`${h.owner}:${h.scheme_code}`, h])
+      ).values()
+    );
+
+    let deletedSipSchedules = 0;
+    for (const { owner, scheme_code } of uniquePairs) {
+      if (!scheme_code) continue;
+
+      const { count } = await supabase
+        .from("mf_holdings")
+        .select("id", { count: "exact", head: true })
+        .eq("user_id", user.id)
+        .eq("owner", owner)
+        .eq("scheme_code", scheme_code);
+
+      if (count === 0) {
+        const { count: sipDeleteCount } = await serviceClient
+          .from("mf_sip_schedules")
+          .delete({ count: "exact" })
+          .eq("user_id", user.id)
+          .eq("owner", owner)
+          .eq("scheme_code", scheme_code);
+        deletedSipSchedules += sipDeleteCount ?? 0;
+      }
+    }
+
+    return NextResponse.json({
+      deleted_holdings: deletedHoldingsCount ?? 0,
+      deleted_sip_schedules: deletedSipSchedules,
+    });
   } catch (err) {
     console.error(`DELETE /api/mf/import/${params.id} failed:`, err);
     return NextResponse.json(
