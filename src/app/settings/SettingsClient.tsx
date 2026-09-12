@@ -188,6 +188,9 @@ export default function SettingsClient({
 
   const [navSyncing, setNavSyncing] = useState(false);
 
+  const [backfilling, setBackfilling] = useState(false);
+  const [backfillResult, setBackfillResult] = useState<string | null>(null);
+
   const showToast = (message: string) => {
     setToast(message);
     setTimeout(() => setToast(null), 3000);
@@ -345,6 +348,28 @@ export default function SettingsClient({
     }
   };
 
+  const handleBackfillTransactions = async () => {
+    setBackfilling(true);
+    setBackfillResult(null);
+    try {
+      const res = await fetch("/api/mf/transactions/backfill", { method: "POST" });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Backfill failed");
+      setBackfillResult(
+        json.total_inserted === 0
+          ? "Already up to date — nothing to backfill."
+          : `Backfilled ${json.total_inserted} transaction${json.total_inserted === 1 ? "" : "s"} (${json.buy_inserted} buy, ${json.sell_inserted} sell)`
+      );
+      showToast("Transactions backfilled");
+    } catch (err) {
+      console.error("Backfill failed:", err);
+      setBackfillResult("Backfill failed. Please try again.");
+      showToast("Backfill failed");
+    } finally {
+      setBackfilling(false);
+    }
+  };
+
   const latestTier1Weekly = syncLog.find((l) => l.cron_name === "tier1-weekly") ?? null;
   const isStale = latestTier1Weekly
     ? Date.now() - new Date(latestTier1Weekly.run_at).getTime() > STALE_MS
@@ -438,6 +463,27 @@ export default function SettingsClient({
             )}
             {navSyncing ? "Syncing..." : "Sync NAV now"}
           </button>
+        </div>
+
+        {/* Transactions ledger */}
+        <div className="mt-6 rounded-xl border border-slate-200 bg-white p-5">
+          <h2 className="text-base font-semibold text-slate-800">Transactions ledger</h2>
+          <p className="mt-2 text-sm text-slate-500">
+            Powers the Reports page. One-time fix for imports made before the ledger existed —
+            safe to run again, it only fills in rows that are missing.
+          </p>
+          <button
+            type="button"
+            onClick={handleBackfillTransactions}
+            disabled={backfilling}
+            className="mt-3 inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {backfilling && (
+              <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
+            )}
+            {backfilling ? "Backfilling..." : "Backfill transactions"}
+          </button>
+          {backfillResult && <p className="mt-2 text-sm text-slate-600">{backfillResult}</p>}
         </div>
 
         {/* Sync history */}
