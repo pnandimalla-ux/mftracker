@@ -10,6 +10,7 @@ const NAV_ITEMS = [
   { href: "/import", label: "Import" },
   { href: "/insights", label: "Insights" },
   { href: "/recommendations", label: "Recommendations" },
+  { href: "/reports", label: "Reports" },
   { href: "/settings", label: "Settings" },
 ];
 

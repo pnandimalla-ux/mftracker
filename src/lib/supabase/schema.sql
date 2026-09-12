@@ -185,3 +185,52 @@ create table if not exists mf_sync_log (
 alter table mf_sync_log enable row level security;
 drop policy if exists "Authenticated users read sync log" on mf_sync_log;
 create policy "Authenticated users read sync log" on mf_sync_log for select using (auth.role() = 'authenticated');
+
+-- ============================================================
+-- TABLE 9: mf_sell_transactions
+-- ============================================================
+-- Added in migration_007_sell_transactions.sql. Records every parsed SELL
+-- row from a Coin CSV import (netted-in-CSV or applied against existing
+-- mf_holdings) purely for calendar/history display.
+create table if not exists mf_sell_transactions (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users(id) on delete cascade not null,
+  owner text not null check (owner in ('praveen', 'geetha')),
+  scheme_code text,
+  scheme_name text not null,
+  units numeric(18,4) not null default 0,
+  amount numeric(18,2) not null default 0,
+  trade_date date not null,
+  settlement_id text,
+  import_id uuid references mf_cas_imports(id) on delete cascade,
+  created_at timestamptz default now()
+);
+alter table mf_sell_transactions enable row level security;
+drop policy if exists "Users see own sell transactions" on mf_sell_transactions;
+create policy "Users see own sell transactions" on mf_sell_transactions for all using (auth.uid() = user_id);
+
+-- ============================================================
+-- TABLE 10: mf_transactions
+-- ============================================================
+-- Added in migration_008_transactions_ledger.sql. Full immutable ledger —
+-- one row per transaction event (BUY or SELL) — powering the Reports page.
+create table if not exists mf_transactions (
+  id uuid default gen_random_uuid() primary key,
+  user_id uuid references auth.users(id) on delete cascade not null,
+  import_id uuid references mf_cas_imports(id) on delete cascade,
+  owner text not null check (owner in ('praveen', 'geetha')),
+  scheme_code text,
+  scheme_name text not null,
+  category text,
+  transaction_type text not null check (transaction_type in ('BUY', 'SELL')),
+  lot_type text check (lot_type in ('sip', 'lumpsum')),
+  amount numeric not null,
+  units numeric,
+  nav numeric,
+  trade_date date not null,
+  settlement_id text,
+  created_at timestamptz default now()
+);
+alter table mf_transactions enable row level security;
+drop policy if exists "Users see own transactions" on mf_transactions;
+create policy "Users see own transactions" on mf_transactions for all using (auth.uid() = user_id);

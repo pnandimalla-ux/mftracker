@@ -497,6 +497,29 @@ export async function POST(request: Request) {
         return NextResponse.json({ error: error.message }, { status: 500 });
       }
       inserted = data;
+
+      // Ledger copy of every BUY lot just inserted, for the Reports page.
+      // Uses the service client — like mf_cas_imports, this is a
+      // write-only-by-import audit table, not a user-editable one.
+      const buyTransactionRows = rows.map((r) => ({
+        user_id: r.user_id,
+        import_id: r.import_id,
+        owner: r.owner,
+        scheme_code: r.scheme_code,
+        scheme_name: r.scheme_name,
+        category: r.category,
+        transaction_type: "BUY",
+        lot_type: r.lot_type,
+        amount: r.invested_amount,
+        units: r.units,
+        nav: r.avg_nav,
+        trade_date: r.as_on_date,
+        settlement_id: r.settlement_id,
+      }));
+      const { error: buyTxnError } = await serviceClient.from("mf_transactions").insert(buyTransactionRows);
+      if (buyTxnError) {
+        console.error("Failed to record BUY transactions in ledger:", buyTxnError.message);
+      }
     }
 
     // Apply orphan sells (no matching BUY in this CSV) against existing
@@ -543,6 +566,27 @@ export async function POST(request: Request) {
         const { error: sellInsertError } = await serviceClient.from("mf_sell_transactions").insert(sellRows);
         if (sellInsertError) {
           console.error("Failed to record sell transactions for calendar display:", sellInsertError.message);
+        }
+
+        // Same deduped set, mirrored into the ledger for the Reports page.
+        const sellTransactionRows = sellRows.map((s) => ({
+          user_id: s.user_id,
+          import_id: s.import_id,
+          owner: s.owner,
+          scheme_code: s.scheme_code,
+          scheme_name: s.scheme_name,
+          category: null,
+          transaction_type: "SELL",
+          lot_type: null,
+          amount: s.amount,
+          units: s.units,
+          nav: s.units > 0 ? s.amount / s.units : null,
+          trade_date: s.trade_date,
+          settlement_id: s.settlement_id,
+        }));
+        const { error: sellTxnError } = await serviceClient.from("mf_transactions").insert(sellTransactionRows);
+        if (sellTxnError) {
+          console.error("Failed to record SELL transactions in ledger:", sellTxnError.message);
         }
       }
     }
