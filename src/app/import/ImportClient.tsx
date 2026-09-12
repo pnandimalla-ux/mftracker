@@ -375,6 +375,10 @@ export default function ImportClient({
         existing.total_invested += fund.total_invested;
         existing.total_units += fund.total_units;
         existing.avg_nav = existing.total_units > 0 ? existing.total_invested / existing.total_units : 0;
+        existing.fully_exited = existing.fully_exited || fund.fully_exited;
+        existing.adjusted_for_sell = existing.adjusted_for_sell || fund.adjusted_for_sell;
+        existing.sell_txn_count = (existing.sell_txn_count ?? 0) + (fund.sell_txn_count ?? 0);
+        existing.sell_units_excess = (existing.sell_units_excess ?? 0) + (fund.sell_units_excess ?? 0);
       }
     }
 
@@ -511,6 +515,55 @@ export default function ImportClient({
   const isDuplicateFund = (f: PreviewFund) =>
     !!f.scheme_code && duplicates.some((d) => d.owner === f.owner && d.scheme_code === f.scheme_code);
 
+  interface SellsAppliedRow {
+    key: string;
+    scheme_name: string;
+    owner: Owner;
+    units_sold: number;
+    status: "fully_exited" | "netted_in_csv" | "applied_to_db";
+  }
+
+  // Summarizes, per fund, what SELL rows in this CSV did to it — netted
+  // against a same-CSV buy (fully or partially) or, when the fund had no
+  // BUY rows here at all, queued to reduce existing DB holdings on confirm.
+  const sellsAppliedRows: SellsAppliedRow[] = (() => {
+    const rows = new Map<string, SellsAppliedRow>();
+
+    for (const fund of previewFunds) {
+      if (!fund.fully_exited && !fund.adjusted_for_sell) continue;
+      const key = `${fund.isin}::${fund.owner}`;
+      const units_sold = sellTransactions
+        .filter((s) => s.isin === fund.isin && s.owner === fund.owner && s.matched_in_csv)
+        .reduce((sum, s) => sum + s.units, 0);
+      rows.set(key, {
+        key,
+        scheme_name: fund.scheme_name,
+        owner: fund.owner,
+        units_sold,
+        status: fund.fully_exited ? "fully_exited" : "netted_in_csv",
+      });
+    }
+
+    for (const s of sellTransactions) {
+      if (s.matched_in_csv) continue;
+      const key = `${s.isin}::${s.owner}`;
+      const existing = rows.get(key);
+      if (existing) {
+        existing.units_sold += s.units;
+      } else {
+        rows.set(key, {
+          key,
+          scheme_name: s.scheme_name,
+          owner: s.owner,
+          units_sold: s.units,
+          status: "applied_to_db",
+        });
+      }
+    }
+
+    return Array.from(rows.values());
+  })();
+
   const selectedFunds = previewFunds.filter((f) => f.selected);
   const selectedTotal = selectedFunds.reduce((sum, f) => sum + f.total_invested, 0);
   const selectedLots = selectedFunds.reduce((sum, f) => sum + f.lots.length, 0);
@@ -540,7 +593,11 @@ export default function ImportClient({
             category: f.category,
             amc: f.amc,
             lots: f.lots,
+            fully_exited: f.fully_exited,
+            sell_txn_count: f.sell_txn_count ?? 0,
+            sell_units_excess: f.sell_units_excess ?? 0,
           })),
+          sells: sellTransactions,
         }),
       });
       const json = await res.json();
@@ -548,8 +605,14 @@ export default function ImportClient({
         setParseError(json.error ?? "Import failed.");
         return;
       }
+      const extras = [
+        json.sells_applied > 0 ? `${json.sells_applied} sell${json.sells_applied === 1 ? "" : "s"} applied` : null,
+        json.funds_exited > 0 ? `${json.funds_exited} fund${json.funds_exited === 1 ? "" : "s"} fully exited` : null,
+        json.lots_reduced > 0 ? `${json.lots_reduced} lot${json.lots_reduced === 1 ? "" : "s"} reduced` : null,
+      ].filter(Boolean);
       setImportSuccess(
-        `${json.funds_imported} fund${json.funds_imported === 1 ? "" : "s"} imported (${json.lots_imported} lot${json.lots_imported === 1 ? "" : "s"} total)`
+        `${json.funds_imported} fund${json.funds_imported === 1 ? "" : "s"} imported (${json.lots_imported} lot${json.lots_imported === 1 ? "" : "s"} total)` +
+          (extras.length > 0 ? ` · ${extras.join(" · ")}` : "")
       );
 
       const detected = detectActiveSips(selectedFunds);
@@ -1491,7 +1554,7 @@ export default function ImportClient({
                   </tr>
                 </thead>
                 <tbody>
-                  {previewFunds.map((f) => (
+                  {previewFunds.filter((f) => !f.fully_exited).map((f) => (
                     <>
                       <tr
                         key={f.key}
@@ -1510,6 +1573,14 @@ export default function ImportClient({
                           <div className="flex items-center gap-1.5">
                             {isDuplicateFund(f) && <span title="Already in MFTracker">⚠️</span>}
                             <span className="truncate">{f.scheme_name}</span>
+                            {f.adjusted_for_sell && (
+                              <span
+                                title="Position netted against SELL rows in this CSV"
+                                className="shrink-0 rounded-full bg-slate-200 px-1.5 py-0.5 text-[10px] font-medium text-slate-600"
+                              >
+                                Adjusted for sells
+                              </span>
+                            )}
                           </div>
                           {!f.scheme_code && (
                             <p className="mt-0.5 text-xs text-slate-400">Scheme code not matched</p>
@@ -1618,7 +1689,7 @@ export default function ImportClient({
               </p>
             )}
 
-            {sellTransactions.length > 0 && (
+            {sellsAppliedRows.length > 0 && (
               <div className="mt-4 rounded-lg border border-slate-200">
                 <button
                   type="button"
@@ -1626,18 +1697,52 @@ export default function ImportClient({
                   className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm font-medium text-slate-700"
                 >
                   <span>{sellsOpen ? "▼" : "▶"}</span>
-                  ℹ️ {sellTransactions.length} sell transaction{sellTransactions.length === 1 ? "" : "s"} found — not
-                  imported (redemptions reduce units)
+                  💸 Sells applied — {sellsAppliedRows.length} fund{sellsAppliedRows.length === 1 ? "" : "s"} affected
+                  by SELL transactions
                 </button>
                 {sellsOpen && (
-                  <ul className="space-y-1 border-t border-slate-100 px-3 py-2 text-xs text-slate-600">
-                    {sellTransactions.map((s, i) => (
-                      <li key={i}>
-                        {s.trade_date} · {s.scheme_name} · {formatMoney(s.amount)} ·{" "}
-                        {s.units.toLocaleString("en-IN", { maximumFractionDigits: 4 })} units
-                      </li>
-                    ))}
-                  </ul>
+                  <div className="overflow-x-auto border-t border-slate-100">
+                    <table className="w-full text-left text-xs">
+                      <thead>
+                        <tr className="text-slate-500">
+                          <th className="px-3 py-1.5 font-medium">Fund</th>
+                          <th className="px-3 py-1.5 font-medium">Owner</th>
+                          <th className="px-3 py-1.5 font-medium">Units sold</th>
+                          <th className="px-3 py-1.5 font-medium">Effect</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {sellsAppliedRows.map((row) => (
+                          <tr key={row.key} className="border-t border-slate-100">
+                            <td className="px-3 py-1.5 text-slate-700">{row.scheme_name}</td>
+                            <td className="px-3 py-1.5">
+                              <span
+                                className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold ${
+                                  row.owner === "praveen" ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700"
+                                }`}
+                              >
+                                {row.owner === "praveen" ? "P" : "G"}
+                              </span>
+                            </td>
+                            <td className="px-3 py-1.5 text-slate-600">
+                              {row.units_sold.toLocaleString("en-IN", { maximumFractionDigits: 4 })}
+                            </td>
+                            <td className="px-3 py-1.5">
+                              {row.status === "fully_exited" ? (
+                                <span className="font-medium text-red-600">
+                                  Fully Exited — holdings will be removed
+                                </span>
+                              ) : row.status === "netted_in_csv" ? (
+                                <span className="text-slate-600">Netted within this CSV</span>
+                              ) : (
+                                <span className="text-slate-600">Will reduce existing DB holdings</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
                 )}
               </div>
             )}
