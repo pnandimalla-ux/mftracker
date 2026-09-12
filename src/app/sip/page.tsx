@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getAuthedUser } from "@/lib/supabase/getAuthedUser";
-import SIPCalendarClient, { type LumpsumEntry } from "./SIPCalendarClient";
+import SIPCalendarClient, { type LumpsumEntry, type SellEntry } from "./SIPCalendarClient";
 import type { MFSIPSchedule, Owner } from "@/types/mf";
 
 function SIPPageError({ message }: { message: string }) {
@@ -67,11 +67,34 @@ export default async function SIPPage() {
     lumpsums = [];
   }
 
+  let sells: SellEntry[] = [];
+
+  try {
+    const { data, error } = await supabase
+      .from("mf_sell_transactions")
+      .select("trade_date, amount, units, scheme_name, owner")
+      .eq("user_id", user.id)
+      .order("trade_date", { ascending: false });
+
+    if (error) throw error;
+    sells = (data ?? []).map((row) => ({
+      trade_date: row.trade_date as string,
+      amount: row.amount as number,
+      units: row.units as number,
+      scheme_name: row.scheme_name as string,
+      owner: row.owner as Owner,
+    }));
+  } catch (err) {
+    console.error("SIP page: failed to load sell transactions", err);
+    sells = [];
+  }
+
   return (
     <SIPCalendarClient
       userEmail={user.email ?? ""}
       initialSips={sips}
       initialLumpsums={lumpsums}
+      initialSells={sells}
     />
   );
 }

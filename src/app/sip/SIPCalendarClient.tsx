@@ -47,6 +47,22 @@ export interface LumpsumEntry {
   owner: Owner;
 }
 
+export interface SellEntry {
+  trade_date: string;
+  amount: number;
+  units: number;
+  scheme_name: string;
+  owner: Owner;
+}
+
+// Compact Indian-format money: "₹2.77L" above 1 lakh, "₹42k" below. Shared by
+// the SELL and lumpsum (BUY) calendar chips so the two read consistently.
+function formatMoneyAbbrev(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 100000) return `₹${(abs / 100000).toFixed(2)}L`;
+  return `₹${Math.round(abs / 1000)}k`;
+}
+
 // Groups lumpsum holdings into the days of the viewed month — parsed from
 // local Y/M/D components (not `new Date(iso)`, which parses a date-only
 // string as UTC midnight and shifts the day under IST).
@@ -62,6 +78,19 @@ function computeLumpsumsByDay(
     const existing = map.get(ld) ?? [];
     existing.push(l);
     map.set(ld, existing);
+  }
+  return map;
+}
+
+// Same grouping as computeLumpsumsByDay, for SELL transactions.
+function computeSellsByDay(sells: SellEntry[], year: number, month: number): Map<number, SellEntry[]> {
+  const map = new Map<number, SellEntry[]>();
+  for (const s of sells) {
+    const [sy, sm, sd] = s.trade_date.split("-").map(Number);
+    if (sy !== year || sm - 1 !== month) continue;
+    const existing = map.get(sd) ?? [];
+    existing.push(s);
+    map.set(sd, existing);
   }
   return map;
 }
@@ -182,15 +211,18 @@ export default function SIPCalendarClient({
   userEmail,
   initialSips,
   initialLumpsums,
+  initialSells,
 }: {
   userEmail: string;
   initialSips: MFSIPSchedule[];
   initialLumpsums: LumpsumEntry[];
+  initialSells: SellEntry[];
 }) {
   const today = useMemo(() => new Date(), []);
 
   const [sips, setSips] = useState<MFSIPSchedule[]>(initialSips);
   const [lumpsums] = useState<LumpsumEntry[]>(initialLumpsums);
+  const [sells] = useState<SellEntry[]>(initialSells);
   const [viewYear, setViewYear] = useState(today.getFullYear());
   const [viewMonth, setViewMonth] = useState(today.getMonth());
   const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>("all");
@@ -260,6 +292,11 @@ export default function SIPCalendarClient({
   const lumpsumsByDay = useMemo(
     () => computeLumpsumsByDay(lumpsums, viewYear, viewMonth),
     [lumpsums, viewYear, viewMonth]
+  );
+
+  const sellsByDay = useMemo(
+    () => computeSellsByDay(sells, viewYear, viewMonth),
+    [sells, viewYear, viewMonth]
   );
 
   const totalThisMonth = useMemo(() => {
@@ -576,6 +613,11 @@ export default function SIPCalendarClient({
                     (l) => ownerFilter === "all" || l.owner === ownerFilter
                   )
                 : [];
+              const daySells = day
+                ? (sellsByDay.get(day) ?? []).filter(
+                    (s) => ownerFilter === "all" || s.owner === ownerFilter
+                  )
+                : [];
 
               return (
                 <div
@@ -637,7 +679,26 @@ export default function SIPCalendarClient({
                               title={`Lumpsum — ${l.scheme_name} — ₹${l.amount.toLocaleString("en-IN")}`}
                               className="block flex-1 truncate rounded-full border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[9px] font-medium text-slate-600"
                             >
-                              ₹ {l.scheme_name} · ₹{l.amount.toLocaleString("en-IN")}
+                              {l.scheme_name} · {formatMoneyAbbrev(l.amount)}
+                            </span>
+                          </div>
+                        ))}
+                        {daySells.map((s, si) => (
+                          <div key={`sell-${si}`} className="flex items-center gap-1">
+                            <span
+                              className={`inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full text-[8px] font-bold ${
+                                s.owner === "praveen"
+                                  ? "bg-blue-100 text-blue-700"
+                                  : "bg-amber-100 text-amber-700"
+                              }`}
+                            >
+                              {s.owner === "praveen" ? "P" : "G"}
+                            </span>
+                            <span
+                              title={`Sell — ${s.scheme_name} — ${formatMoneyAbbrev(s.amount)}`}
+                              className="block flex-1 truncate rounded-full border border-red-200 bg-red-100 px-1.5 py-0.5 text-[9px] font-medium text-red-700"
+                            >
+                              ↓ {s.scheme_name} · {formatMoneyAbbrev(s.amount)}
                             </span>
                           </div>
                         ))}

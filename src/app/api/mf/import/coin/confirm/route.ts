@@ -39,7 +39,10 @@ interface RawConfirmSell {
   scheme_code?: unknown;
   scheme_name?: unknown;
   owner?: unknown;
+  trade_date?: unknown;
+  amount?: unknown;
   units?: unknown;
+  settlement_id?: unknown;
   matched_in_csv?: unknown;
 }
 
@@ -382,26 +385,44 @@ export async function POST(request: Request) {
     // SELL rows whose fund had no BUY rows in this CSV — apply against
     // existing mf_holdings (FIFO, oldest lot first) rather than importing.
     const validSells: { owner: Owner; scheme_code: string; scheme_name: string; units: number }[] = [];
+    // Every parseable SELL row, netted or not — recorded for calendar/history
+    // display only (mf_sell_transactions is never read by any balance math).
+    const sellsToRecord: {
+      owner: Owner;
+      scheme_code: string | null;
+      scheme_name: string;
+      trade_date: string;
+      amount: number;
+      units: number;
+      settlement_id: string | null;
+    }[] = [];
     if (Array.isArray(sells)) {
       for (const raw of sells as RawConfirmSell[]) {
-        if (!raw || raw.matched_in_csv === true) continue;
+        if (!raw) continue;
         const owner = raw.owner === "praveen" || raw.owner === "geetha" ? raw.owner : null;
         const schemeCode =
           typeof raw.scheme_code === "string" && raw.scheme_code.trim() ? raw.scheme_code.trim() : null;
+        const schemeName = typeof raw.scheme_name === "string" ? raw.scheme_name : "";
+        const tradeDate = typeof raw.trade_date === "string" ? raw.trade_date : "";
+        const amount = Number(raw.amount);
         const units = Number(raw.units);
+        const settlementId =
+          typeof raw.settlement_id === "string" && raw.settlement_id.trim() ? raw.settlement_id.trim() : null;
+
         if (!owner || !Number.isFinite(units) || units <= 0) continue;
+
+        if (tradeDate && Number.isFinite(amount)) {
+          sellsToRecord.push({ owner, scheme_code: schemeCode, scheme_name: schemeName, trade_date: tradeDate, amount, units, settlement_id: settlementId });
+        }
+
+        if (raw.matched_in_csv === true) continue;
         if (!schemeCode) {
           console.warn(
-            `Skipping sell of ${units} units for "${typeof raw.scheme_name === "string" ? raw.scheme_name : "unknown fund"}" — no scheme_code to match against existing holdings`
+            `Skipping sell of ${units} units for "${schemeName || "unknown fund"}" — no scheme_code to match against existing holdings`
           );
           continue;
         }
-        validSells.push({
-          owner,
-          scheme_code: schemeCode,
-          scheme_name: typeof raw.scheme_name === "string" ? raw.scheme_name : "",
-          units,
-        });
+        validSells.push({ owner, scheme_code: schemeCode, scheme_name: schemeName, units });
       }
     }
 
@@ -422,7 +443,11 @@ export async function POST(request: Request) {
       addToSellGroup(s.owner, s.scheme_code, s.scheme_name, s.total_units);
     }
 
-    if (rows.length === 0 && sellGroupMap.size === 0) {
+    // A fund that's fully bought-and-sold within this CSV, with no prior
+    // holdings to reduce, produces neither a row to insert nor a sellGroupMap
+    // entry — but its SELL rows still need to reach mf_sell_transactions for
+    // calendar display, so that alone must not trip this guard.
+    if (rows.length === 0 && sellGroupMap.size === 0 && sellsToRecord.length === 0) {
       const reason =
         lotsSkippedDuplicates > 0
           ? "all lots were already imported"
@@ -481,6 +506,46 @@ export async function POST(request: Request) {
       user.id,
       Array.from(sellGroupMap.values())
     );
+
+    // Persist every parsed SELL row (netted-in-CSV or applied-to-DB) purely
+    // for calendar/history display — dedup by settlement_id per
+    // owner+scheme_code so re-importing the same CSV doesn't duplicate rows,
+    // mirroring the mf_holdings dedup above. Nothing else reads this table.
+    if (sellsToRecord.length > 0) {
+      const existingSellSettlementIds = new Set<string>();
+      const { data: existingSells } = await serviceClient
+        .from("mf_sell_transactions")
+        .select("owner, scheme_code, settlement_id")
+        .eq("user_id", user.id)
+        .not("settlement_id", "is", null);
+      for (const row of existingSells ?? []) {
+        existingSellSettlementIds.add(`${row.owner}:${row.scheme_code ?? ""}:${row.settlement_id}`);
+      }
+
+      const sellRows = sellsToRecord
+        .filter((s) => {
+          if (!s.settlement_id) return true;
+          return !existingSellSettlementIds.has(`${s.owner}:${s.scheme_code ?? ""}:${s.settlement_id}`);
+        })
+        .map((s) => ({
+          user_id: user.id,
+          owner: s.owner,
+          scheme_code: s.scheme_code,
+          scheme_name: s.scheme_name,
+          units: s.units,
+          amount: s.amount,
+          trade_date: s.trade_date,
+          settlement_id: s.settlement_id,
+          import_id: importIdMap.get(s.owner) ?? null,
+        }));
+
+      if (sellRows.length > 0) {
+        const { error: sellInsertError } = await serviceClient.from("mf_sell_transactions").insert(sellRows);
+        if (sellInsertError) {
+          console.error("Failed to record sell transactions for calendar display:", sellInsertError.message);
+        }
+      }
+    }
 
     // Best-effort background follow-up — never block the response on mfapi.in.
     for (const schemeCode of Array.from(schemeCodeCategories.keys())) {
