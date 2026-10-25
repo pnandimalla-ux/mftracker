@@ -1,6 +1,6 @@
 // One-off: re-run detectCategory over existing mf_holdings after the v2
 // categoriser rules (Focused; defence / manufacturing / innovation / special
-// opportunities → Sectoral/Thematic; multi asset → Hybrid).
+// opportunities → Sectoral/Thematic; multi asset → Multi Asset Allocation).
 //
 // A holding is only changed when its stored category equals what the OLD (v1)
 // rules produce for its name — i.e. it was auto-assigned, not chosen by the

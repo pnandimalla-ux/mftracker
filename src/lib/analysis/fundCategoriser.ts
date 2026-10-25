@@ -84,11 +84,13 @@ const RULES: Rule[] = [
     test: (n) => includesAny(n, ["nasdaq", "s&p 500", "global", "international", "overseas", "world", "us equity"]),
   },
   { category: "Commodity", confidence: "high", test: (n) => includesAny(n, ["gold", "silver"]) },
-  // Multi-asset → Hybrid, checked before Fund of Funds — but a multi-asset
-  // FoF wrapper ("... Multi Asset Omni FoF", "Passive Multi-Asset Fund of
-  // Funds") stays Fund of Funds.
+  // Multi-asset → Multi Asset Allocation (its own SEBI hybrid sub-category,
+  // matching CATEGORY_OPTIONS, the peer universe and derivePeerGroup's
+  // peer_group), checked before Fund of Funds — but a multi-asset FoF wrapper
+  // ("... Multi Asset Omni FoF", "Passive Multi-Asset Fund of Funds") stays
+  // Fund of Funds.
   {
-    category: "Hybrid",
+    category: "Multi Asset Allocation",
     confidence: "high",
     since: 2,
     test: (n) =>
