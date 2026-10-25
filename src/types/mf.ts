@@ -24,6 +24,8 @@ export interface MFHolding {
 export interface EnrichedMFHolding extends MFHolding {
   current_nav: number;
   nav_date: string | null;
+  // True when no cached NAV exists and current_value fell back to cost.
+  nav_missing?: boolean;
   current_value: number;
   pnl: number;
   pnl_pct: number;

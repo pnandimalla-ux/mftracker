@@ -60,30 +60,106 @@ export async function fetchSchemeMeta(schemeCode: string): Promise<MfapiSchemeMe
   }
 }
 
-// Searches mfapi.in for a fund name and returns the first Direct Plan +
+interface MfapiSearchResult {
+  schemeCode?: number | string;
+  schemeName?: string;
+}
+
+function isDirectGrowth(name: string): boolean {
+  return /direct/i.test(name) && /growth/i.test(name) && !/idcw|dividend/i.test(name);
+}
+
+// Plan/option words that every candidate shares — ignored when scoring how
+// well a search result's name matches the fund we're looking for.
+const NAME_NOISE_WORDS = new Set(["direct", "plan", "growth", "option", "regular", "fund", "scheme", "the"]);
+
+// Lower-cases and splits a fund name into comparable tokens, normalising the
+// spellings brokers and AMFI disagree on: "Midcap" vs "Mid Cap", "&" vs "and".
+function nameTokens(name: string): string[] {
+  return name
+    .toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/\b(mid|small|large|flexi|multi|micro)cap\b/g, "$1 cap")
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .split(/\s+/)
+    .filter((t) => t && !NAME_NOISE_WORDS.has(t));
+}
+
+// Share of the query's tokens present in the candidate, penalised slightly
+// for extra candidate tokens (so "Mid Cap" beats "Mid Cap Opportunities").
+function nameMatchScore(query: string, candidate: string): number {
+  const q = nameTokens(query);
+  const c = new Set(nameTokens(candidate));
+  if (q.length === 0 || c.size === 0) return 0;
+  const hits = q.filter((t) => c.has(t)).length;
+  const extra = Math.max(0, c.size - hits);
+  return hits / q.length - extra * 0.05;
+}
+
+// mfapi.in's search is a plain substring match, so a broker's spelling
+// ("Invesco India Midcap Fund", "... Banking and Financial Services") can
+// return nothing even though the scheme exists as "Mid Cap" / "&". These are
+// the alternative spellings tried, in order, when the literal name misses.
+function searchQueryVariants(query: string): string[] {
+  const base = query
+    .replace(/\s*-\s*/g, " ")
+    .replace(/\b(direct|regular|plan|growth|option)\b/gi, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const spaced = base.replace(/\b(mid|small|large|flexi|multi|micro)cap\b/gi, "$1 Cap");
+  const joined = base.replace(/\b(mid|small|large|flexi|multi|micro) cap\b/gi, "$1cap");
+  const variants = [
+    query,
+    base,
+    spaced,
+    joined,
+    base.replace(/\band\b/gi, "&"),
+    base.replace(/&/g, "and"),
+    spaced.replace(/\band\b/gi, "&"),
+    // Drop the trailing "Fund" — e.g. "Kotak Banking & Financial Services".
+    spaced.replace(/\bfund\b.*$/i, "").trim(),
+  ];
+  return Array.from(new Set(variants.filter((v) => v.length >= 4)));
+}
+
+async function runMfapiSearch(q: string): Promise<MfapiSearchResult[]> {
+  const res = await fetchWithTimeout(`https://api.mfapi.in/mf/search?q=${encodeURIComponent(q)}`);
+  if (!res.ok) return [];
+  const results = await res.json();
+  return Array.isArray(results) ? results : [];
+}
+
+// Searches mfapi.in for a fund name and returns the best Direct Plan +
 // Growth option result — used when importing holdings from a source (Coin
 // CSV, CAS) whose ISIN isn't in a known local mapping. Falls back to the
-// first result of any kind if no Direct+Growth match is found.
+// first result of any kind if the literal name finds no Direct+Growth match.
+// When the literal name finds nothing at all, alternative spellings are
+// tried (see searchQueryVariants), accepting only a confident Direct+Growth
+// name match — a wrong scheme_code is worse than a manual placeholder.
 export async function searchDirectGrowthScheme(query: string): Promise<MfapiSchemeMatch | null> {
   try {
-    const res = await fetchWithTimeout(`https://api.mfapi.in/mf/search?q=${encodeURIComponent(query)}`);
-    if (!res.ok) return null;
+    const variants = searchQueryVariants(query);
+    for (let i = 0; i < variants.length; i++) {
+      const results = await runMfapiSearch(variants[i]);
+      if (results.length === 0) continue;
 
-    const results = await res.json();
-    if (!Array.isArray(results) || results.length === 0) return null;
+      const candidates = results
+        .filter((r) => typeof r.schemeName === "string" && typeof r.schemeCode !== "undefined")
+        .filter((r) => isDirectGrowth(r.schemeName as string))
+        .map((r) => ({ r, score: nameMatchScore(query, r.schemeName as string) }))
+        .sort((a, b) => b.score - a.score);
 
-    const directGrowth = results.find(
-      (r: { schemeName?: string }) =>
-        typeof r.schemeName === "string" &&
-        /direct/i.test(r.schemeName) &&
-        /growth/i.test(r.schemeName) &&
-        !/idcw|dividend/i.test(r.schemeName)
-    );
-
-    const match = directGrowth ?? results[0];
-    if (!match || typeof match.schemeCode === "undefined") return null;
-
-    return { scheme_code: String(match.schemeCode), scheme_name: String(match.schemeName) };
+      const best = candidates[0];
+      if (i === 0) {
+        const match = best?.r ?? results[0];
+        if (!match || typeof match.schemeCode === "undefined") return null;
+        return { scheme_code: String(match.schemeCode), scheme_name: String(match.schemeName) };
+      }
+      if (best && best.score >= 0.75) {
+        return { scheme_code: String(best.r.schemeCode), scheme_name: String(best.r.schemeName) };
+      }
+    }
+    return null;
   } catch (err) {
     console.error(`searchDirectGrowthScheme("${query}") failed:`, err);
     return null;

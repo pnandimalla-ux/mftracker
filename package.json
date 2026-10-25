@@ -8,7 +8,8 @@
     "postbuild": "node -e \"console.log('ACTION REQUIRED: Run src/lib/supabase/tier2-schema.sql in Supabase SQL Editor before using tier 2 sync')\"",
     "start": "next start",
     "lint": "next lint",
-    "migrate": "npx ts-node src/lib/db/runMigration.ts"
+    "migrate": "npx ts-node src/lib/db/runMigration.ts",
+    "test:xirr": "npx ts-node scripts/check-xirr.ts"
   },
   "dependencies": {
     "@google/genai": "^2.21.0",

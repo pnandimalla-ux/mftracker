@@ -8,6 +8,7 @@ import type { EnrichedMFHolding, MFHolding, Owner } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import AlternativesPanel, { type AlternativesData } from "@/components/AlternativesPanel";
 import { detectCategory } from "@/lib/analysis/fundCategoriser";
+import { xirr, type Cashflow } from "@/lib/analysis/xirr";
 import {
   ResponsiveContainer,
   PieChart,
@@ -91,6 +92,8 @@ export interface HoldingGroup {
   earliest_date: string;
   latest_date: string;
   peer: PeerInfo | null;
+  // At least one lot has no cached NAV, so current_value is just cost.
+  nav_missing: boolean;
 }
 
 function todayIso() {
@@ -152,6 +155,50 @@ function formatInrAbbreviated(value: number): string {
 function formatPct(value: number | null) {
   if (value === null) return "—";
   return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+// Portfolio XIRR from the lots on screen: each lot's invested amount is an
+// outflow on its purchase date, and the combined current value is one inflow
+// today. Lots left after a partial sell carry their remaining cost basis, so
+// this is the XIRR of what's currently held. Returned as a percentage.
+function portfolioXirrPct(lots: EnrichedMFHolding[]): number | null {
+  if (lots.length === 0) return null;
+  const flows: Cashflow[] = lots.map((l) => ({
+    date: new Date(`${l.as_on_date}T00:00:00Z`),
+    amount: -Number(l.invested_amount),
+  }));
+  const currentValue = lots.reduce((s, l) => s + Number(l.current_value), 0);
+  flows.push({ date: new Date(`${todayIso()}T00:00:00Z`), amount: currentValue });
+  const rate = xirr(flows);
+  return rate === null ? null : rate * 100;
+}
+
+// How many funds trail their category average for `period` — falls back to
+// 1Y when no fund has peer data for the chosen period yet.
+function countBelowCategoryAvg(
+  groups: HoldingGroup[],
+  period: Period
+): { below: number; compared: number; total: number; periodUsed: Period } {
+  const countFor = (p: Period) => {
+    const key = periodReturnKey(p);
+    let below = 0;
+    let compared = 0;
+    for (const g of groups) {
+      const own = g.peer?.[key];
+      const avg = g.peer?.category_avg[key];
+      if (own === null || own === undefined || avg === null || avg === undefined) continue;
+      compared++;
+      if (own < avg) below++;
+    }
+    return { below, compared };
+  };
+  let periodUsed = period;
+  let result = countFor(period);
+  if (result.compared === 0 && period !== "1y") {
+    periodUsed = "1y";
+    result = countFor("1y");
+  }
+  return { ...result, total: groups.length, periodUsed };
 }
 
 function formatDateDMY(iso: string): string {
@@ -411,6 +458,17 @@ function ExternalLinkIcon() {
         strokeLinejoin="round"
       />
     </svg>
+  );
+}
+
+function NavMissingBadge() {
+  return (
+    <span
+      className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
+      title="No NAV found for this fund's scheme code — value shown at cost and excluded from P&L % charts. Try Sync NAV."
+    >
+      NAV missing
+    </span>
   );
 }
 
@@ -695,10 +753,12 @@ export default function DashboardClient({
           earliest_date: h.as_on_date,
           latest_date: h.as_on_date,
           peer: h.peer,
+          nav_missing: false,
         };
         map.set(key, g);
       }
       g.lots.push(h);
+      if (h.nav_missing) g.nav_missing = true;
       if (g.owner !== "mixed" && g.owner !== h.owner) g.owner = "mixed";
       if (h.as_on_date < g.earliest_date) g.earliest_date = h.as_on_date;
       if (h.as_on_date > g.latest_date) g.latest_date = h.as_on_date;
@@ -735,27 +795,18 @@ export default function DashboardClient({
     );
     const pnl = currentValue - totalInvested;
     const pnlPct = totalInvested > 0 ? (pnl / totalInvested) * 100 : 0;
-    const underperforming = filteredHoldings.filter((h) => h.pnl < 0).length;
+    const xirrPct = portfolioXirrPct(filteredHoldings);
 
-    const withR1y = filteredHoldings.filter((h) => h.peer?.r1y !== null && h.peer?.r1y !== undefined);
-    const investedWithR1y = withR1y.reduce((sum, h) => sum + Number(h.invested_amount), 0);
-    const avg1y =
-      investedWithR1y > 0
-        ? withR1y.reduce((sum, h) => sum + (h.peer!.r1y as number) * Number(h.invested_amount), 0) /
-          investedWithR1y
-        : null;
-
-    const underperformingPeers = filteredHoldings.filter(
-      (h) =>
-        h.peer?.r1y !== null &&
-        h.peer?.r1y !== undefined &&
-        h.peer?.category_avg.r1y !== null &&
-        h.peer?.category_avg.r1y !== undefined &&
-        (h.peer.r1y as number) < (h.peer.category_avg.r1y as number)
-    ).length;
-
-    return { totalInvested, currentValue, pnl, pnlPct, underperforming, avg1y, underperformingPeers };
+    return { totalInvested, currentValue, pnl, pnlPct, xirrPct };
   }, [filteredHoldings]);
+
+  // Counted per fund (groupedHoldings), not per lot — a fund bought via 12
+  // SIP lots is still one underperformer. Follows the selected return period
+  // when peer data for it exists, otherwise falls back to 1Y.
+  const belowCategory = useMemo(
+    () => countBelowCategoryAvg(groupedHoldings, period),
+    [groupedHoldings, period]
+  );
 
   // Portfolio Overview charts derive from groupedHoldings (one entry per
   // fund, already summed across lots) rather than filteredHoldings (one
@@ -783,7 +834,8 @@ export default function DashboardClient({
   );
 
   const topFundsByValue = useMemo<FundValueBar[]>(() => {
-    return [...groupedHoldings]
+    return groupedHoldings
+      .filter((g) => !g.nav_missing)
       .sort((a, b) => b.current_value - a.current_value)
       .slice(0, 10)
       .map((g) => ({
@@ -796,8 +848,10 @@ export default function DashboardClient({
       }));
   }, [groupedHoldings]);
 
+  // Funds without a NAV have a meaningless ~0% P&L — leave them out.
   const pnlByFund = useMemo<FundPnlBar[]>(() => {
     return groupedHoldings
+      .filter((g) => !g.nav_missing)
       .map((g) => ({
         key: g.key,
         name: truncateName(g.scheme_name, 12),
@@ -809,7 +863,6 @@ export default function DashboardClient({
   }, [groupedHoldings]);
 
   const hasAnyHoldings = holdings.length > 0;
-  const hasPeerKpiData = filteredHoldings.some((h) => h.peer?.r1y !== null && h.peer?.r1y !== undefined);
 
   const handleSyncNav = async () => {
     setSyncingNav(true);
@@ -817,7 +870,12 @@ export default function DashboardClient({
       const res = await fetch("/api/mf/nav/sync", { method: "POST" });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Sync failed");
-      showToast("NAV updated");
+      const resolvedCount = Array.isArray(json.resolved) ? json.resolved.length : 0;
+      showToast(
+        resolvedCount > 0
+          ? `NAV updated · matched ${resolvedCount} fund${resolvedCount === 1 ? "" : "s"} to a scheme code`
+          : "NAV updated"
+      );
       await loadHoldings();
     } catch (err) {
       console.error("NAV sync failed:", err);
@@ -1390,14 +1448,23 @@ export default function DashboardClient({
                 tone={kpis.pnl >= 0 ? "positive" : "negative"}
               />
               <KpiCard
-                label="Avg 1Y return"
-                value={hasPeerKpiData ? formatPct(kpis.avg1y) : "—"}
-                tone={kpis.avg1y !== null ? (kpis.avg1y >= 0 ? "positive" : "negative") : undefined}
+                label="XIRR"
+                value={kpis.xirrPct !== null ? formatPct(kpis.xirrPct) : "—"}
+                sub="annualised"
+                tone={kpis.xirrPct !== null ? (kpis.xirrPct >= 0 ? "positive" : "negative") : undefined}
               />
               <KpiCard
-                label="Underperforming"
-                value={hasAnyHoldings ? String(kpis.underperformingPeers) : "—"}
-                sub={hasAnyHoldings ? "vs category avg 1Y" : undefined}
+                label="Below category avg"
+                value={
+                  hasAnyHoldings && belowCategory.compared > 0
+                    ? `${belowCategory.below} of ${belowCategory.compared}`
+                    : "—"
+                }
+                sub={
+                  hasAnyHoldings
+                    ? `funds (${PERIODS.find((p) => p.id === belowCategory.periodUsed)?.label ?? "1Y"})`
+                    : undefined
+                }
               />
             </>
           )}
@@ -1449,7 +1516,6 @@ export default function DashboardClient({
                         <XAxis type="number" tickFormatter={formatInrAbbreviated} />
                         <YAxis type="category" dataKey="name" width={180} />
                         <Tooltip content={<FundValueTooltip />} />
-                        <Legend />
                         <Bar dataKey="invested" name="Invested" fill="#94a3b8" />
                         <Bar dataKey="current" name="Current">
                           {topFundsByValue.map((entry) => (
@@ -1459,6 +1525,19 @@ export default function DashboardClient({
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
+                </div>
+                {/* Hand-rolled legend: the "Current" bars are coloured per cell, so
+                    Recharts' default legend swatch (the Bar's own fill) never matched. */}
+                <div className="mt-2 flex flex-wrap justify-center gap-4 text-xs text-slate-600">
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-sm bg-slate-400" /> Invested
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-sm bg-emerald-500" /> Current (gain)
+                  </span>
+                  <span className="inline-flex items-center gap-1.5">
+                    <span className="h-2.5 w-2.5 rounded-sm bg-rose-500" /> Current (loss)
+                  </span>
                 </div>
               </div>
             </div>
@@ -1646,6 +1725,7 @@ export default function DashboardClient({
                                   {group.lot_count} lots
                                 </span>
                               )}
+                              {group.nav_missing && <NavMissingBadge />}
                             </div>
                           </div>
                         </div>

@@ -48,7 +48,11 @@ export async function GET() {
 
     const enriched = (holdings ?? []).map((h) => {
       const navInfo = navMap[h.scheme_code];
-      const currentNav = navInfo && navInfo.nav > 0 ? navInfo.nav : Number(h.avg_nav);
+      // No cached NAV (manual-* placeholder code, or a scheme the NAV sync
+      // never reached) — value the lot at cost so totals still add up, but
+      // flag it so the dashboard can say so instead of showing a fake ~₹0 P&L.
+      const navMissing = !(navInfo && navInfo.nav > 0);
+      const currentNav = navMissing ? Number(h.avg_nav) : navInfo!.nav;
       const invested = Number(h.invested_amount);
       const current_value = Number(h.units) * currentNav;
       const pnl = current_value - invested;
@@ -68,6 +72,7 @@ export async function GET() {
         ...h,
         current_nav: currentNav,
         nav_date: navInfo?.nav_date ?? null,
+        nav_missing: navMissing,
         current_value,
         pnl,
         pnl_pct,
