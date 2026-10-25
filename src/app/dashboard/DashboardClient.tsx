@@ -543,7 +543,7 @@ export default function DashboardClient({
   const [isDesktop, setIsDesktop] = useState(true);
 
   useEffect(() => {
-    const mq = window.matchMedia("(min-width: 768px)");
+    const mq = window.matchMedia("(min-width: 1024px)");
     const update = () => setIsDesktop(mq.matches);
     update();
     mq.addEventListener("change", update);
@@ -1937,7 +1937,7 @@ export default function DashboardClient({
         <button
           type="button"
           onClick={() => handleOpenAlternatives(group)}
-          className="min-w-0 text-left text-sm font-semibold leading-snug text-slate-800 hover:text-blue-600 md:line-clamp-2"
+          className="min-w-0 text-left text-sm font-semibold leading-snug text-slate-800 hover:text-blue-600 lg:line-clamp-2"
           title={`${group.scheme_name} — view better alternatives`}
         >
           {displayFundName(group.scheme_name)}
