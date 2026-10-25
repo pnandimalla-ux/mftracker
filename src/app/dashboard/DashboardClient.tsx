@@ -1,31 +1,58 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, useCallback } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import AppHeader from "@/components/AppHeader";
 import { createClient } from "@/lib/supabase/client";
-import type { EnrichedMFHolding, MFHolding, Owner } from "@/types/mf";
+import type { EnrichedMFHolding, MFHolding, MFSIPSchedule, Owner } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import AlternativesPanel, { type AlternativesData } from "@/components/AlternativesPanel";
 import { detectCategory } from "@/lib/analysis/fundCategoriser";
 import { xirr, type Cashflow } from "@/lib/analysis/xirr";
+import { nextSipAcross } from "@/lib/sipSchedule";
 import {
-  ResponsiveContainer,
-  PieChart,
-  Pie,
-  Cell,
-  BarChart,
-  Bar,
-  XAxis,
-  YAxis,
-  CartesianGrid,
-  Tooltip,
-  Legend,
-} from "recharts";
+  formatInrFull,
+  formatInrShort,
+  formatPct,
+  formatSignedInrFull,
+  GAIN_BG,
+  LOSS_BG,
+  toneText,
+} from "@/lib/format";
+import {
+  PERIODS,
+  periodRankKey,
+  periodReturnKey,
+  shortCategory,
+  type DayChange,
+  type GroupOwner,
+  type HistoryPoint,
+  type HoldingGroup,
+  type HoldingWithPeer,
+  type OwnerFilter,
+  type Period,
+  type PeerInfo,
+} from "./types";
+import {
+  ActionsMenu,
+  AllocationCard,
+  ChartsSkeleton,
+  HeroCard,
+  MoversCard,
+  OwnerCompareStrip,
+  StatCard,
+  TableSkeleton,
+  TopSectionSkeleton,
+  ValueHistoryCard,
+  type AllocationSlice,
+  type ConcentrationWarning,
+  type MoverRow,
+  type OwnerSummary,
+} from "./DashboardWidgets";
 
-type OwnerFilter = "family" | "praveen" | "geetha";
-type Period = "6m" | "1y" | "3y" | "5y";
-type GroupOwner = Owner | "mixed";
+// AlternativesPanel imports this type from here.
+export type { HoldingGroup } from "./types";
 
 const OWNERS: { id: OwnerFilter; label: string }[] = [
   { id: "family", label: "Family" },
@@ -33,68 +60,27 @@ const OWNERS: { id: OwnerFilter; label: string }[] = [
   { id: "geetha", label: "Geetha" },
 ];
 
-const PERIODS: { id: Period; label: string }[] = [
-  { id: "6m", label: "6M" },
-  { id: "1y", label: "1Y" },
-  { id: "3y", label: "3Y" },
-  { id: "5y", label: "5Y" },
-];
-
-// Main grouped-fund row: 3 columns on mobile (<md), 9 on md+. The 6 desktop-only
-// columns (Owner, Category, Invested ₹, Current ₹, {period} Return, Peer rank)
-// are hidden via `hidden md:...` on the cells themselves — they sit in DOM order
-// between Fund name and P&L/Actions, so hiding them still leaves the 3 mobile
-// columns lining up against the 3-track mobile grid. On mobile, the invested
-// amount is instead shown stacked under the fund name (see the fund-name cell).
+// Desktop holdings row: Fund | Value | P&L | Alloc | Return & rank | ⋯
 const MAIN_GRID =
-  "grid grid-cols-[minmax(0,1fr)_140px_84px] md:grid-cols-[minmax(200px,2fr)_56px_96px_96px_96px_140px_76px_76px_150px]";
+  "grid grid-cols-[minmax(0,1fr)_128px_168px_64px_150px_40px] lg:grid-cols-[minmax(0,1fr)_136px_184px_72px_164px_40px]";
 
 // Individual lot sub-row: Date | Owner | Invested ₹ | Current ₹ | P&L | Avg NAV | Units | Actions
 const SUB_GRID = "grid grid-cols-[90px_56px_96px_96px_140px_84px_84px_96px]";
 
-interface PeerInfo {
-  r6m: number | null;
-  r1y: number | null;
-  r3y: number | null;
-  r5y: number | null;
-  rank_6m: number | null;
-  rank_1y: number | null;
-  rank_3y: number | null;
-  rank_5y: number | null;
-  peer_count: number | null;
-  category_avg: {
-    r6m: number | null;
-    r1y: number | null;
-    r3y: number | null;
-    r5y: number | null;
-  };
-}
+// Concentration thresholds for the hero card warning chips.
+const FUND_CONCENTRATION_PCT = 15;
+const CATEGORY_CONCENTRATION_PCT = 35;
 
-interface HoldingWithPeer extends EnrichedMFHolding {
-  peer: PeerInfo | null;
-}
+type SortKey = "value" | "pnl_pct" | "allocation" | "return" | "rank";
+type SortDir = "asc" | "desc";
 
-export interface HoldingGroup {
-  key: string;
-  scheme_code: string | null;
-  scheme_name: string;
-  category: string;
-  amc: string | null;
-  owner: GroupOwner;
-  lots: HoldingWithPeer[];
-  total_invested: number;
-  total_units: number;
-  avg_nav: number;
-  current_value: number;
-  pnl: number;
-  pnl_pct: number;
-  lot_count: number;
-  earliest_date: string;
-  latest_date: string;
-  peer: PeerInfo | null;
-  // At least one lot has no cached NAV, so current_value is just cost.
-  nav_missing: boolean;
-}
+const SORT_OPTIONS: { id: SortKey; label: string; defaultDir: SortDir }[] = [
+  { id: "value", label: "Value", defaultDir: "desc" },
+  { id: "pnl_pct", label: "P&L %", defaultDir: "desc" },
+  { id: "allocation", label: "Allocation", defaultDir: "desc" },
+  { id: "return", label: "Return", defaultDir: "desc" },
+  { id: "rank", label: "Peer rank", defaultDir: "asc" },
+];
 
 function todayIso() {
   return new Date().toISOString().split("T")[0];
@@ -124,37 +110,6 @@ function shiftDate(iso: string, days: number) {
   const d = new Date(`${iso}T00:00:00Z`);
   d.setUTCDate(d.getUTCDate() + days);
   return d.toISOString().slice(0, 10);
-}
-
-function periodReturnKey(period: Period) {
-  return (
-    { "6m": "r6m", "1y": "r1y", "3y": "r3y", "5y": "r5y" } as const
-  )[period];
-}
-
-function periodRankKey(period: Period) {
-  return (
-    { "6m": "rank_6m", "1y": "rank_1y", "3y": "rank_3y", "5y": "rank_5y" } as const
-  )[period];
-}
-
-function formatInr(value: number) {
-  return `₹${Math.round(value).toLocaleString("en-IN")}`;
-}
-
-// Indian-number-format axis abbreviation: K below 1 lakh, L below 1 crore, Cr above.
-function formatInrAbbreviated(value: number): string {
-  const sign = value < 0 ? "-" : "";
-  const abs = Math.abs(value);
-  const trimZero = (s: string) => s.replace(/\.0$/, "");
-  if (abs >= 10000000) return `${sign}₹${trimZero((abs / 10000000).toFixed(1))}Cr`;
-  if (abs >= 100000) return `${sign}₹${trimZero((abs / 100000).toFixed(1))}L`;
-  return `${sign}₹${Math.round(abs / 1000)}K`;
-}
-
-function formatPct(value: number | null) {
-  if (value === null) return "—";
-  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
 }
 
 // Portfolio XIRR from the lots on screen: each lot's invested amount is an
@@ -207,115 +162,17 @@ function formatDateDMY(iso: string): string {
   return iso;
 }
 
-// --- Portfolio Overview charts (Recharts) ---
-
-const CATEGORY_COLORS = [
-  "#6366f1",
-  "#10b981",
-  "#f59e0b",
-  "#f43f5e",
-  "#8b5cf6",
-  "#0ea5e9",
-  "#94a3b8",
-];
-
-function truncateName(name: string, maxLen: number): string {
-  return name.length > maxLen ? `${name.slice(0, maxLen)}…` : name;
-}
-
-interface CategoryAllocationSlice {
-  category: string;
-  value: number;
-}
-
-interface FundValueBar {
-  key: string;
-  name: string;
-  fullName: string;
-  invested: number;
-  current: number;
-  pnl_pct: number;
-}
-
-interface FundPnlBar {
-  key: string;
-  name: string;
-  fullName: string;
-  pnl_pct: number;
-  pnl: number;
-}
-
-function CategoryAllocationTooltip({
-  active,
-  payload,
-  total,
-}: {
-  active?: boolean;
-  payload?: readonly { payload?: CategoryAllocationSlice }[];
-  total: number;
-}) {
-  if (!active || !payload || payload.length === 0 || !payload[0].payload) return null;
-  const { category, value } = payload[0].payload;
-  const pct = total > 0 ? ((value / total) * 100).toFixed(1) : "0.0";
-  return (
-    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-lg dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100">
-      {category}: {formatInr(value)} ({pct}%)
-    </div>
-  );
-}
-
-function FundValueTooltip({
-  active,
-  payload,
-}: {
-  active?: boolean;
-  payload?: readonly { payload?: FundValueBar }[];
-}) {
-  if (!active || !payload || payload.length === 0 || !payload[0].payload) return null;
-  const { fullName, invested, current, pnl_pct } = payload[0].payload;
-  return (
-    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-lg dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100">
-      <p className="font-medium">{fullName}</p>
-      <p className="mt-1 text-slate-500 dark:text-slate-400">Invested: {formatInr(invested)}</p>
-      <p className="text-slate-500 dark:text-slate-400">Current: {formatInr(current)}</p>
-      <p className={pnl_pct >= 0 ? "text-emerald-600" : "text-rose-600"}>P&L: {formatPct(pnl_pct)}</p>
-    </div>
-  );
-}
-
-function FundPnlTooltip({
-  active,
-  payload,
-}: {
-  active?: boolean;
-  payload?: readonly { payload?: FundPnlBar }[];
-}) {
-  if (!active || !payload || payload.length === 0 || !payload[0].payload) return null;
-  const { fullName, pnl_pct, pnl } = payload[0].payload;
-  return (
-    <div className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs shadow-lg dark:border-slate-700 dark:bg-slate-800 dark:text-slate-100">
-      <p className="font-medium">{fullName}</p>
-      <p className={pnl_pct >= 0 ? "text-emerald-600" : "text-rose-600"}>
-        {formatPct(pnl_pct)} ({pnl >= 0 ? "+" : "-"}
-        {formatInr(Math.abs(pnl))})
-      </p>
-    </div>
-  );
-}
-
 const PEER_SYNC_STALE_MS = 7 * 24 * 60 * 60 * 1000;
 
-function formatRelativeTime(iso: string | null): string {
+function formatAgo(iso: string | null): string {
   if (!iso) return "never";
   const diffMs = Date.now() - new Date(iso).getTime();
-  if (diffMs < 0) return "just now";
   const minutes = Math.floor(diffMs / 60000);
   if (minutes < 1) return "just now";
-  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  if (minutes < 60) return `${minutes}m ago`;
   const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
-  const days = Math.floor(hours / 24);
-  return `${days} day${days === 1 ? "" : "s"} ago`;
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.floor(hours / 24)}d ago`;
 }
 
 function formatNav(n: number): string {
@@ -342,10 +199,10 @@ function groupKeyFor(h: EnrichedMFHolding): string {
 
 function rankBadgeTone(rank: number, peerCount: number) {
   const pct = rank / peerCount;
-  if (pct <= 0.25) return "bg-green-100 text-green-700";
+  if (pct <= 0.25) return "bg-emerald-100 text-emerald-700";
   if (pct <= 0.5) return "bg-blue-100 text-blue-700";
   if (pct <= 0.75) return "bg-amber-100 text-amber-700";
-  return "bg-red-100 text-red-700";
+  return "bg-rose-100 text-rose-700";
 }
 
 type SignalDot = "hold" | "watch" | "switch";
@@ -363,15 +220,37 @@ function computeSignalDot(rank: number | null, peerCount: number | null): Signal
 
 function SignalDot({ signal }: { signal: SignalDot }) {
   const color =
-    signal === "hold" ? "bg-green-500" : signal === "watch" ? "bg-amber-500" : "bg-red-500";
+    signal === "hold" ? "bg-emerald-500" : signal === "watch" ? "bg-amber-500" : "bg-rose-500";
   const label =
     signal === "hold" ? "Hold — strong performer" : signal === "watch" ? "Watch — moderate underperformance" : "Consider switching";
   return <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${color}`} title={label} />;
 }
 
+function sortValue(
+  g: HoldingGroup,
+  key: SortKey,
+  returnKey: ReturnType<typeof periodReturnKey>,
+  rankKey: ReturnType<typeof periodRankKey>
+): number | null {
+  switch (key) {
+    case "value":
+    case "allocation":
+      return g.current_value;
+    case "pnl_pct":
+      return g.nav_missing ? null : g.pnl_pct;
+    case "return":
+      return g.peer?.[returnKey] ?? null;
+    case "rank": {
+      const rank = g.peer?.[rankKey];
+      const count = g.peer?.peer_count;
+      return rank && count ? rank / count : null;
+    }
+  }
+}
+
 function PencilIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4">
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden>
       <path
         d="M13.5 3.5l3 3L6 17H3v-3L13.5 3.5z"
         stroke="currentColor"
@@ -385,7 +264,7 @@ function PencilIcon() {
 
 function CheckIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden>
       <path
         d="M4 10.5l3.5 3.5L16 5"
         stroke="currentColor"
@@ -399,7 +278,7 @@ function CheckIcon() {
 
 function XIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden>
       <path
         d="M5 5l10 10M15 5L5 15"
         stroke="currentColor"
@@ -413,7 +292,7 @@ function XIcon() {
 
 function ChevronIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden>
       <path
         d="M7 4l6 6-6 6"
         stroke="currentColor"
@@ -427,7 +306,7 @@ function ChevronIcon() {
 
 function PlusIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden>
       <path d="M10 4v12M4 10h12" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round" />
     </svg>
   );
@@ -435,7 +314,7 @@ function PlusIcon() {
 
 function TrashIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden>
       <path
         d="M4 6h12M8 6V4h4v2M6 6l1 10h6l1-10"
         stroke="currentColor"
@@ -449,7 +328,7 @@ function TrashIcon() {
 
 function ExternalLinkIcon() {
   return (
-    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5">
+    <svg viewBox="0 0 20 20" fill="none" className="h-3.5 w-3.5" aria-hidden>
       <path
         d="M8 5H5a1 1 0 00-1 1v9a1 1 0 001 1h9a1 1 0 001-1v-3M11 4h5v5M9 11l6.5-6.5"
         stroke="currentColor"
@@ -461,33 +340,118 @@ function ExternalLinkIcon() {
   );
 }
 
+function RefreshIcon({ spinning }: { spinning: boolean }) {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className={`h-3.5 w-3.5 ${spinning ? "animate-spin" : ""}`} aria-hidden>
+      <path
+        d="M16 10a6 6 0 01-10.3 4.2M4 10a6 6 0 0110.3-4.2M14.5 2.5v3.5H11M5.5 17.5V14H9"
+        stroke="currentColor"
+        strokeWidth={1.6}
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
+}
+
+function SearchIcon() {
+  return (
+    <svg viewBox="0 0 20 20" fill="none" className="h-4 w-4" aria-hidden>
+      <circle cx="9" cy="9" r="5.5" stroke="currentColor" strokeWidth={1.6} />
+      <path d="M13.5 13.5L17 17" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" />
+    </svg>
+  );
+}
+
 function NavMissingBadge() {
   return (
     <span
       className="shrink-0 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
-      title="No NAV found for this fund's scheme code — value shown at cost and excluded from P&L % charts. Try Sync NAV."
+      title="No NAV found for this fund's scheme code — value shown at cost and excluded from P&L % comparisons. Try Sync NAV."
     >
       NAV missing
     </span>
   );
 }
 
-function OwnerBadge({ owner }: { owner: GroupOwner }) {
+function CategoryTag({ category }: { category: string }) {
+  return (
+    <span
+      className="shrink-0 rounded bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-600"
+      title={category}
+    >
+      {shortCategory(category)}
+    </span>
+  );
+}
+
+function OwnerBadge({ owner, size = "md" }: { owner: GroupOwner; size?: "sm" | "md" }) {
+  const dims = size === "sm" ? "h-5 min-w-5 text-[10px]" : "h-6 min-w-6 text-xs";
   if (owner === "mixed") {
     return (
-      <span className="inline-flex h-6 items-center rounded-full bg-slate-200 px-2 text-[10px] font-semibold text-slate-700">
+      <span
+        className={`inline-flex ${dims} items-center rounded-full bg-slate-200 px-1.5 font-semibold text-slate-700`}
+        title="Held by Praveen and Geetha"
+      >
         P+G
       </span>
     );
   }
   return (
     <span
-      className={`inline-flex h-6 w-6 items-center justify-center rounded-full text-xs font-semibold ${
+      className={`inline-flex ${dims} items-center justify-center rounded-full font-semibold ${
         owner === "praveen" ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700"
       }`}
+      title={owner === "praveen" ? "Praveen" : "Geetha"}
     >
       {owner === "praveen" ? "P" : "G"}
     </span>
+  );
+}
+
+// Thin horizontal bar, length proportional to |P&L %| relative to the
+// largest move in the table.
+function PnlBar({ pct, maxAbs }: { pct: number; maxAbs: number }) {
+  const width = maxAbs > 0 ? Math.min(100, (Math.abs(pct) / maxAbs) * 100) : 0;
+  return (
+    <div className="mt-1 h-1 w-full max-w-[120px] overflow-hidden rounded-full bg-slate-100" aria-hidden>
+      <div className={`h-full rounded-full ${pct >= 0 ? GAIN_BG : LOSS_BG}`} style={{ width: `${width}%` }} />
+    </div>
+  );
+}
+
+function ReturnRank({
+  group,
+  returnKey,
+  rankKey,
+}: {
+  group: HoldingGroup;
+  returnKey: ReturnType<typeof periodReturnKey>;
+  rankKey: ReturnType<typeof periodRankKey>;
+}) {
+  const returnValue = group.peer ? group.peer[returnKey] : null;
+  const rankValue = group.peer ? group.peer[rankKey] : null;
+  const peerCount = group.peer?.peer_count ?? null;
+  const signalDot = computeSignalDot(group.peer?.rank_1y ?? null, peerCount);
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span className={`text-sm font-medium tabular-nums ${toneText(returnValue)}`}>{formatPct(returnValue)}</span>
+      {rankValue && peerCount ? (
+        <span
+          className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[11px] font-medium tabular-nums ${rankBadgeTone(
+            rankValue,
+            peerCount
+          )}`}
+          title={`Rank ${rankValue} of ${peerCount} in its peer group`}
+        >
+          {signalDot && <SignalDot signal={signalDot} />}#{rankValue}/{peerCount}
+        </span>
+      ) : (
+        <span className="text-xs text-slate-300" title="No peer rank yet — sync peer data in Settings">
+          —
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -511,37 +475,11 @@ interface AddLotDraft {
   navError: string | null;
 }
 
-function KpiCard({
-  label,
-  value,
-  sub,
-  tone,
-}: {
-  label: string;
-  value: string;
-  sub?: string;
-  tone?: "positive" | "negative";
-}) {
-  const valueTone =
-    tone === "positive"
-      ? "text-green-600"
-      : tone === "negative"
-        ? "text-red-600"
-        : "text-slate-900";
-  const subTone =
-    tone === "positive"
-      ? "text-green-600"
-      : tone === "negative"
-        ? "text-red-600"
-        : "text-slate-500";
-
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white p-4">
-      <p className="text-xs font-medium text-slate-500">{label}</p>
-      <p className={`mt-2 text-2xl font-semibold ${valueTone}`}>{value}</p>
-      {sub && <p className={`mt-0.5 text-xs font-medium ${subTone}`}>{sub}</p>}
-    </div>
-  );
+interface CategorySection {
+  category: string;
+  rows: HoldingGroup[];
+  value: number;
+  invested: number;
 }
 
 export default function DashboardClient({
@@ -549,24 +487,40 @@ export default function DashboardClient({
 }: {
   userEmail: string;
 }) {
+  const router = useRouter();
   const [owner, setOwner] = useState<OwnerFilter>("family");
   const [period, setPeriod] = useState<Period>("1y");
   const [loading, setLoading] = useState(true);
-  const [isMobile, setIsMobile] = useState(false);
+  const [isDesktop, setIsDesktop] = useState(true);
 
   useEffect(() => {
-    const checkMobile = () => setIsMobile(window.innerWidth < 768);
-    checkMobile();
-    window.addEventListener("resize", checkMobile);
-    return () => window.removeEventListener("resize", checkMobile);
+    const mq = window.matchMedia("(min-width: 768px)");
+    const update = () => setIsDesktop(mq.matches);
+    update();
+    mq.addEventListener("change", update);
+    return () => mq.removeEventListener("change", update);
   }, []);
   const [holdings, setHoldings] = useState<HoldingWithPeer[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [peersLoading, setPeersLoading] = useState(false);
 
   const [syncingNav, setSyncingNav] = useState(false);
   const [lastSynced, setLastSynced] = useState<string | null>(null);
   const [peersLastSynced, setPeersLastSynced] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
+
+  const [history, setHistory] = useState<{ points: HistoryPoint[]; day_change: DayChange | null } | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(true);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const historyRequestRef = useRef(0);
+
+  const [sips, setSips] = useState<MFSIPSchedule[] | null>(null);
+
+  // --- Holdings table controls ---
+  const [sortKey, setSortKey] = useState<SortKey>("value");
+  const [sortDir, setSortDir] = useState<SortDir>("desc");
+  const [search, setSearch] = useState("");
+  const [groupByCategory, setGroupByCategory] = useState(false);
 
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
 
@@ -622,7 +576,7 @@ export default function DashboardClient({
     }
 
     // Holdings are the must-have — show them immediately and unblock the
-    // skeleton. Peer comparison (1Y return, peer rank) is nice-to-have and
+    // skeleton. Peer comparison (period return, peer rank) is nice-to-have and
     // fetched below in the background; it renders "—" until it arrives, and
     // a failure there must never wipe out the holdings already on screen.
     setHoldings(base.map((h) => ({ ...h, peer: null })));
@@ -660,6 +614,7 @@ export default function DashboardClient({
       }
     })();
 
+    setPeersLoading(true);
     try {
       const peerResults = await Promise.allSettled(
         schemeCodes.map(async (code) => {
@@ -696,6 +651,8 @@ export default function DashboardClient({
     } catch (err) {
       // Non-fatal — holdings are already showing; peer columns just stay "—".
       console.error("Failed to load peer comparison data:", err);
+    } finally {
+      setPeersLoading(false);
     }
   }, []);
 
@@ -721,6 +678,51 @@ export default function DashboardClient({
       clearTimeout(safetyTimer);
     };
   }, [loadHoldings]);
+
+  // Value-over-time series is computed server-side (NAV histories are too
+  // heavy to ship here). Its own loading state, so a slow mfapi.in never
+  // holds up the rest of the page. Stale responses (owner switched mid-flight)
+  // are dropped.
+  const loadHistory = useCallback(async (forOwner: OwnerFilter) => {
+    const requestId = ++historyRequestRef.current;
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const res = await fetchWithTimeout(`/api/mf/portfolio/history?owner=${forOwner}`, 12000);
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error ?? "Failed to load history");
+      if (requestId !== historyRequestRef.current) return;
+      setHistory({
+        points: Array.isArray(json.data?.points) ? json.data.points : [],
+        day_change: json.data?.day_change ?? null,
+      });
+    } catch (err) {
+      console.error("Failed to load portfolio history:", err);
+      if (requestId !== historyRequestRef.current) return;
+      setHistory(null);
+      setHistoryError("Couldn't load value history.");
+    } finally {
+      if (requestId === historyRequestRef.current) setHistoryLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    loadHistory(owner);
+  }, [owner, loadHistory]);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await fetchWithTimeout("/api/mf/sip");
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.error ?? "Failed to load SIPs");
+        setSips(Array.isArray(json.data) ? json.data : []);
+      } catch (err) {
+        console.error("Failed to load SIP schedules:", err);
+        setSips([]);
+      }
+    })();
+  }, []);
 
   const filteredHoldings = useMemo(() => {
     const list =
@@ -808,11 +810,35 @@ export default function DashboardClient({
     [groupedHoldings, period]
   );
 
-  // Portfolio Overview charts derive from groupedHoldings (one entry per
+  const ownerSummaries = useMemo<OwnerSummary[]>(() => {
+    return (["praveen", "geetha"] as const)
+      .map((id) => {
+        const lots = holdings.filter((h) => h.owner === id);
+        const invested = lots.reduce((s, l) => s + Number(l.invested_amount), 0);
+        const value = lots.reduce((s, l) => s + Number(l.current_value), 0);
+        return {
+          id,
+          label: id === "praveen" ? "Praveen" : "Geetha",
+          value,
+          pnlPct: invested > 0 ? ((value - invested) / invested) * 100 : 0,
+          xirrPct: portfolioXirrPct(lots),
+          lotCount: lots.length,
+        };
+      })
+      .filter((s) => s.lotCount > 0);
+  }, [holdings]);
+
+  const nextSip = useMemo(() => {
+    if (!sips) return null;
+    const relevant = owner === "family" ? sips : sips.filter((s) => s.owner === owner);
+    return nextSipAcross(relevant);
+  }, [sips, owner]);
+
+  // Portfolio Overview widgets derive from groupedHoldings (one entry per
   // fund, already summed across lots) rather than filteredHoldings (one
   // entry per individual lot) — otherwise a fund with many SIP lots would
-  // show up as many separate slices/bars instead of one.
-  const categoryAllocation = useMemo<CategoryAllocationSlice[]>(() => {
+  // show up as many separate slices/rows instead of one.
+  const categoryAllocation = useMemo<AllocationSlice[]>(() => {
     const byCategory = new Map<string, number>();
     for (const g of groupedHoldings) {
       byCategory.set(g.category, (byCategory.get(g.category) ?? 0) + g.current_value);
@@ -821,48 +847,115 @@ export default function DashboardClient({
       .map(([category, value]) => ({ category, value }))
       .sort((a, b) => b.value - a.value);
 
-    if (sorted.length <= 6) return sorted;
+    if (sorted.length <= 8) return sorted;
 
-    const top = sorted.slice(0, 6);
-    const othersTotal = sorted.slice(6).reduce((sum, c) => sum + c.value, 0);
+    const top = sorted.slice(0, 7);
+    const othersTotal = sorted.slice(7).reduce((sum, c) => sum + c.value, 0);
     return [...top, { category: "Others", value: othersTotal }];
   }, [groupedHoldings]);
 
-  const categoryAllocationTotal = useMemo(
-    () => categoryAllocation.reduce((sum, c) => sum + c.value, 0),
-    [categoryAllocation]
-  );
-
-  const topFundsByValue = useMemo<FundValueBar[]>(() => {
-    return groupedHoldings
-      .filter((g) => !g.nav_missing)
-      .sort((a, b) => b.current_value - a.current_value)
-      .slice(0, 10)
-      .map((g) => ({
-        key: g.key,
-        name: truncateName(g.scheme_name, 22),
-        fullName: g.scheme_name,
-        invested: g.total_invested,
-        current: g.current_value,
-        pnl_pct: g.pnl_pct,
-      }));
-  }, [groupedHoldings]);
+  const concentrationWarnings = useMemo<ConcentrationWarning[]>(() => {
+    const total = kpis.currentValue;
+    if (total <= 0) return [];
+    const warnings: ConcentrationWarning[] = [];
+    for (const g of groupedHoldings) {
+      const pct = (g.current_value / total) * 100;
+      if (pct > FUND_CONCENTRATION_PCT) {
+        warnings.push({
+          key: `fund:${g.key}`,
+          label: `${g.scheme_name.replace(/\s*-\s*Direct.*$/i, "")} is ${pct.toFixed(0)}% of portfolio`,
+          detail: `${g.scheme_name} is ${pct.toFixed(1)}% of this portfolio (above the ${FUND_CONCENTRATION_PCT}% single-fund guideline).`,
+        });
+      }
+    }
+    const byCategory = new Map<string, number>();
+    for (const g of groupedHoldings) {
+      byCategory.set(g.category, (byCategory.get(g.category) ?? 0) + g.current_value);
+    }
+    for (const [category, value] of Array.from(byCategory.entries())) {
+      const pct = (value / total) * 100;
+      if (pct > CATEGORY_CONCENTRATION_PCT) {
+        warnings.push({
+          key: `cat:${category}`,
+          label: `${shortCategory(category)} is ${pct.toFixed(0)}% of portfolio`,
+          detail: `${category} funds are ${pct.toFixed(1)}% of this portfolio (above the ${CATEGORY_CONCENTRATION_PCT}% single-category guideline).`,
+        });
+      }
+    }
+    return warnings;
+  }, [groupedHoldings, kpis.currentValue]);
 
   // Funds without a NAV have a meaningless ~0% P&L — leave them out.
-  const pnlByFund = useMemo<FundPnlBar[]>(() => {
-    return groupedHoldings
-      .filter((g) => !g.nav_missing)
+  const movers = useMemo(() => {
+    const rows: MoverRow[] = groupedHoldings
+      .filter((g) => !g.nav_missing && g.total_invested > 0)
       .map((g) => ({
         key: g.key,
-        name: truncateName(g.scheme_name, 12),
-        fullName: g.scheme_name,
-        pnl_pct: g.pnl_pct,
+        name: g.scheme_name,
+        scheme_code: g.scheme_code,
         pnl: g.pnl,
-      }))
-      .sort((a, b) => b.pnl_pct - a.pnl_pct);
+        pnl_pct: g.pnl_pct,
+      }));
+    const gainers = rows
+      .filter((r) => r.pnl_pct > 0)
+      .sort((a, b) => b.pnl_pct - a.pnl_pct)
+      .slice(0, 3);
+    const losers = rows
+      .filter((r) => r.pnl_pct < 0)
+      .sort((a, b) => a.pnl_pct - b.pnl_pct)
+      .slice(0, 3);
+    return { gainers, losers };
   }, [groupedHoldings]);
 
   const hasAnyHoldings = holdings.length > 0;
+  const portfolioValue = kpis.currentValue;
+  const returnKey = periodReturnKey(period);
+  const rankKey = periodRankKey(period);
+  const periodLabel = PERIODS.find((p) => p.id === period)?.label ?? "1Y";
+
+  const maxAbsPnlPct = useMemo(
+    () =>
+      groupedHoldings.reduce((m, g) => (g.nav_missing ? m : Math.max(m, Math.abs(g.pnl_pct))), 0),
+    [groupedHoldings]
+  );
+
+  const tableRows = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    const rows = q ? groupedHoldings.filter((g) => g.scheme_name.toLowerCase().includes(q)) : groupedHoldings;
+    const dir = sortDir === "asc" ? 1 : -1;
+    return [...rows].sort((a, b) => {
+      const av = sortValue(a, sortKey, returnKey, rankKey);
+      const bv = sortValue(b, sortKey, returnKey, rankKey);
+      // Missing values always sink to the bottom, whatever the direction.
+      if (av === null && bv === null) return b.current_value - a.current_value;
+      if (av === null) return 1;
+      if (bv === null) return -1;
+      if (av === bv) return b.current_value - a.current_value;
+      return (av - bv) * dir;
+    });
+  }, [groupedHoldings, search, sortKey, sortDir, returnKey, rankKey]);
+
+  const categorySections = useMemo<CategorySection[]>(() => {
+    if (!groupByCategory) return [];
+    const map = new Map<string, CategorySection>();
+    for (const g of tableRows) {
+      const s = map.get(g.category) ?? { category: g.category, rows: [], value: 0, invested: 0 };
+      s.rows.push(g);
+      s.value += g.current_value;
+      s.invested += g.total_invested;
+      map.set(g.category, s);
+    }
+    return Array.from(map.values()).sort((a, b) => b.value - a.value);
+  }, [groupByCategory, tableRows]);
+
+  const handleSort = (key: SortKey) => {
+    if (key === sortKey) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(SORT_OPTIONS.find((o) => o.id === key)?.defaultDir ?? "desc");
+    }
+  };
 
   const handleSyncNav = async () => {
     setSyncingNav(true);
@@ -877,6 +970,7 @@ export default function DashboardClient({
           : "NAV updated"
       );
       await loadHoldings();
+      loadHistory(owner);
     } catch (err) {
       console.error("NAV sync failed:", err);
       showToast("NAV sync failed");
@@ -1124,6 +1218,7 @@ export default function DashboardClient({
       editOriginalRef.current = null;
       setSavedFlashId(h.id);
       setTimeout(() => setSavedFlashId(null), 1500);
+      loadHistory(owner);
     } catch (err) {
       console.error("Failed to save holding edit:", err);
       setEditError("Failed to save");
@@ -1292,6 +1387,7 @@ export default function DashboardClient({
       setHoldings((prev) => [...prev, newLot]);
       handleCancelAddLot();
       showToast("Lot added");
+      loadHistory(owner);
     } catch (err) {
       console.error("Failed to add lot:", err);
       setAddLotError("Failed to add lot");
@@ -1313,6 +1409,7 @@ export default function DashboardClient({
       setHoldings((prev) => prev.filter((row) => row.id !== h.id));
       setDeleteLotConfirmId(null);
       showToast("Lot deleted");
+      loadHistory(owner);
     } catch (err) {
       console.error("Failed to delete lot:", err);
       showToast("Failed to delete lot");
@@ -1347,6 +1444,7 @@ export default function DashboardClient({
         ? "All lots deleted"
         : `Deleted ${deletedIds.length} of ${ids.length} lots`
     );
+    loadHistory(owner);
   };
 
   const deleteGroupTarget = groupedHoldings.find((g) => g.key === deleteGroupConfirmKey) ?? null;
@@ -1354,31 +1452,623 @@ export default function DashboardClient({
   const isPeerSyncStale =
     !peersLastSynced || Date.now() - new Date(peersLastSynced).getTime() > PEER_SYNC_STALE_MS;
 
-  const periodLabel = PERIODS.find((p) => p.id === period)?.label ?? "1Y";
-  const returnKey = periodReturnKey(period);
-  const rankKey = periodRankKey(period);
+  const groupActions = (group: HoldingGroup) => [
+    { label: "Edit", icon: <PencilIcon />, onSelect: () => handleEditGroup(group) },
+    { label: "Add lot", icon: <PlusIcon />, onSelect: () => handleOpenAddLot(group) },
+    ...(group.scheme_code
+      ? [
+          {
+            label: "Fund details",
+            icon: <ExternalLinkIcon />,
+            onSelect: () => router.push(`/fund/${group.scheme_code}`),
+          },
+        ]
+      : []),
+    {
+      label: "Delete",
+      icon: <TrashIcon />,
+      tone: "danger" as const,
+      onSelect: () => {
+        setDeleteGroupConfirmKey(group.key);
+        window.scrollTo({ top: document.getElementById("holdings")?.offsetTop ?? 0, behavior: "smooth" });
+      },
+    },
+  ];
+
+  // --- Lot sub-rows + add-lot form, shared by the desktop table and mobile cards ---
+
+  const renderLotsPanel = (group: HoldingGroup) => {
+    const sortedLots = [...group.lots].sort((a, b) =>
+      a.as_on_date < b.as_on_date ? -1 : a.as_on_date > b.as_on_date ? 1 : 0
+    );
+    return (
+      <div className="overflow-x-auto">
+        <div className="ml-4 min-w-max border-l-2 border-slate-200 py-1 pl-4">
+          {sortedLots.map((lot) => {
+            const isEditingLot = editingId === lot.id;
+            const isSavedFlash = savedFlashId === lot.id;
+            const isDeleteConfirming = deleteLotConfirmId === lot.id;
+            const lotPnlPct = lot.invested_amount > 0 ? (lot.pnl / lot.invested_amount) * 100 : 0;
+
+            if (isDeleteConfirming) {
+              return (
+                <div
+                  key={lot.id}
+                  className="my-1 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-rose-50 px-3 py-2"
+                >
+                  <p className="text-xs text-rose-700">
+                    Delete lot of {formatInrFull(lot.invested_amount)} from {formatDateDMY(lot.as_on_date)}?
+                  </p>
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmDeleteLot(lot)}
+                      disabled={deleteLotDeleting}
+                      className="rounded-md bg-rose-600 px-2 py-1 text-xs font-semibold text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Confirm delete
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeleteLotConfirmId(null)}
+                      disabled={deleteLotDeleting}
+                      className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              );
+            }
+
+            return (
+              <div key={lot.id}>
+                <div
+                  className={`${SUB_GRID} items-center gap-2 rounded py-2 pl-0 pr-2 text-xs transition-colors duration-700 ${
+                    isSavedFlash ? "bg-emerald-50" : ""
+                  }`}
+                >
+                  <span className="truncate text-slate-500">
+                    {isEditingLot && editDraft ? (
+                      <input
+                        type="date"
+                        value={editDraft.as_on_date}
+                        max={todayIso()}
+                        onChange={(e) => setEditDraft({ ...editDraft, as_on_date: e.target.value })}
+                        className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+                        aria-label="Purchase date"
+                      />
+                    ) : (
+                      formatDateDMY(lot.as_on_date)
+                    )}
+                  </span>
+                  <span>
+                    {isEditingLot && editDraft ? (
+                      <div className="inline-flex rounded-md border border-slate-200 p-0.5">
+                        <button
+                          type="button"
+                          onClick={() => setEditDraft({ ...editDraft, owner: "praveen" })}
+                          className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
+                            editDraft.owner === "praveen" ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-100"
+                          }`}
+                        >
+                          P
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setEditDraft({ ...editDraft, owner: "geetha" })}
+                          className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
+                            editDraft.owner === "geetha" ? "bg-amber-500 text-white" : "text-slate-500 hover:bg-slate-100"
+                          }`}
+                        >
+                          G
+                        </button>
+                      </div>
+                    ) : (
+                      <OwnerBadge owner={lot.owner} />
+                    )}
+                  </span>
+                  <span className="tabular-nums text-slate-700">
+                    {isEditingLot && editDraft ? (
+                      <input
+                        type="number"
+                        min="0"
+                        step="0.01"
+                        value={editDraft.invested_amount}
+                        onChange={(e) => setEditDraft({ ...editDraft, invested_amount: e.target.value })}
+                        className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
+                        aria-label="Invested amount"
+                      />
+                    ) : (
+                      formatInrFull(Number(lot.invested_amount))
+                    )}
+                  </span>
+                  <span className="tabular-nums text-slate-700">{formatInrFull(Number(lot.current_value))}</span>
+                  {lot.nav_missing ? (
+                    <span className="text-slate-400" title="No NAV — valued at cost">
+                      —
+                    </span>
+                  ) : (
+                    <span className={`font-medium tabular-nums ${toneText(lot.pnl)}`}>
+                      {formatSignedInrFull(lot.pnl)} ({formatPct(lotPnlPct)})
+                    </span>
+                  )}
+                  <span className="tabular-nums text-slate-500">
+                    {isEditingLot ? (
+                      editNavLoading ? (
+                        <span className="inline-block h-3 w-10 animate-pulse rounded bg-slate-200" />
+                      ) : (
+                        `₹${formatNav(Number(editDraft?.avg_nav ?? lot.avg_nav))}`
+                      )
+                    ) : (
+                      `₹${formatNav(Number(lot.avg_nav))}`
+                    )}
+                  </span>
+                  <span className="tabular-nums text-slate-500">
+                    {isEditingLot ? (
+                      editNavLoading ? (
+                        <span className="inline-block h-3 w-10 animate-pulse rounded bg-slate-200" />
+                      ) : (
+                        formatUnits(Number(editDraft?.units ?? lot.units))
+                      )
+                    ) : (
+                      formatUnits(Number(lot.units))
+                    )}
+                  </span>
+                  <span className="flex items-center justify-end gap-1">
+                    {isEditingLot ? (
+                      <div className="flex flex-col items-end gap-1">
+                        <div className="flex items-center gap-1">
+                          <button
+                            type="button"
+                            onClick={() => handleSaveEdit(lot)}
+                            disabled={editSaving || editNavLoading}
+                            aria-label="Save"
+                            className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-600 text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <CheckIcon />
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleCancelEdit}
+                            disabled={editSaving}
+                            aria-label="Cancel"
+                            className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-200 text-slate-600 transition hover:bg-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
+                          >
+                            <XIcon />
+                          </button>
+                        </div>
+                        {editError && <span className="text-[10px] font-medium text-rose-600">{editError}</span>}
+                      </div>
+                    ) : (
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleStartEdit(lot)}
+                          aria-label="Edit lot"
+                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
+                        >
+                          <PencilIcon />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setDeleteLotConfirmId(lot.id)}
+                          aria-label="Delete lot"
+                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-rose-50 hover:text-rose-600"
+                        >
+                          <TrashIcon />
+                        </button>
+                      </>
+                    )}
+                  </span>
+                </div>
+                {isEditingLot && editDraft && (
+                  <div className="mb-1 flex flex-col gap-1 pb-1 pl-1">
+                    <div className="flex items-center gap-2">
+                      <label className="text-[10px] font-medium text-slate-500">Category</label>
+                      <select
+                        value={editDraft.category}
+                        onChange={(e) => setEditDraft({ ...editDraft, category: e.target.value })}
+                        className="rounded border border-slate-300 px-2 py-1 text-xs"
+                      >
+                        {CATEGORY_OPTIONS.map((c) => (
+                          <option key={c} value={c}>
+                            {c}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    {editDraft.category !== lot.category && (
+                      <p className="pl-1 text-[10px] text-blue-600">
+                        Detected: {detectCategory(lot.scheme_name).category}
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+            );
+          })}
+
+          {addLotGroupKey === group.key && addLotDraft && (
+            <div className="my-1 max-w-3xl rounded-lg bg-blue-50 p-3">
+              {(() => {
+                const detected = detectCategory(group.scheme_name);
+                const mismatch = detected.confidence !== "low" && detected.category !== group.category;
+                if (!mismatch) return null;
+                return (
+                  <div className="mb-3 flex flex-wrap items-start justify-between gap-2 rounded-md bg-amber-50 px-2 py-1.5">
+                    <p className="text-xs text-amber-700">
+                      ⚠️ Category mismatch detected. This fund appears to be {detected.category} based on its
+                      name. Edit the fund to correct it.
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => handleEditGroup(group)}
+                      className="shrink-0 text-xs font-semibold text-blue-600 hover:underline"
+                    >
+                      Fix category
+                    </button>
+                  </div>
+                );
+              })()}
+              <div className="flex flex-wrap items-end gap-3">
+                <div>
+                  <label className="mb-1 block text-[10px] font-medium text-slate-600">Category</label>
+                  <div className="flex h-[30px] items-center rounded border border-slate-200 bg-white px-2 text-xs text-slate-600">
+                    {group.category}
+                  </div>
+                </div>
+
+                <div>
+                  <label className="mb-1 block text-[10px] font-medium text-slate-600">Owner</label>
+                  <div className="inline-flex rounded-md border border-slate-200 bg-white p-0.5">
+                    <button
+                      type="button"
+                      onClick={() => setAddLotDraft({ ...addLotDraft, owner: "praveen" })}
+                      className={`rounded px-2 py-1 text-xs font-semibold transition ${
+                        addLotDraft.owner === "praveen" ? "bg-blue-600 text-white" : "text-slate-500 hover:bg-slate-100"
+                      }`}
+                    >
+                      P
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setAddLotDraft({ ...addLotDraft, owner: "geetha" })}
+                      className={`rounded px-2 py-1 text-xs font-semibold transition ${
+                        addLotDraft.owner === "geetha" ? "bg-amber-500 text-white" : "text-slate-500 hover:bg-slate-100"
+                      }`}
+                    >
+                      G
+                    </button>
+                  </div>
+                </div>
+
+                <div>
+                  <label className="mb-1 block text-[10px] font-medium text-slate-600">Invested ₹</label>
+                  <input
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    value={addLotDraft.invested_amount}
+                    onChange={(e) => setAddLotDraft({ ...addLotDraft, invested_amount: e.target.value })}
+                    className="w-28 rounded border border-slate-300 px-2 py-1 text-xs"
+                  />
+                </div>
+
+                <div>
+                  <label className="mb-1 block text-[10px] font-medium text-slate-600">As on date</label>
+                  <input
+                    type="date"
+                    value={addLotDraft.as_on_date}
+                    max={todayIso()}
+                    onChange={(e) => setAddLotDraft({ ...addLotDraft, as_on_date: e.target.value })}
+                    className="rounded border border-slate-300 px-2 py-1 text-xs"
+                  />
+                </div>
+
+                <div>
+                  <label className="mb-1 block text-[10px] font-medium text-slate-600">Avg NAV (₹)</label>
+                  {addLotDraft.navLoading ? (
+                    <div className="flex h-[30px] w-24 items-center rounded border border-slate-200 bg-slate-100 px-2">
+                      <div className="h-3 w-12 animate-pulse rounded bg-slate-300" />
+                    </div>
+                  ) : addLotDraft.manualMode ? (
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.0001"
+                      value={addLotDraft.avg_nav}
+                      onChange={(e) => setAddLotDraft({ ...addLotDraft, avg_nav: e.target.value })}
+                      placeholder="Enter NAV"
+                      className="w-24 rounded border border-slate-300 px-2 py-1 text-xs"
+                    />
+                  ) : (
+                    <input
+                      type="text"
+                      readOnly
+                      value={addLotDraft.avg_nav ? `₹${formatNav(Number(addLotDraft.avg_nav))}` : ""}
+                      placeholder="Auto-filled"
+                      className="w-24 cursor-not-allowed rounded border border-slate-200 bg-slate-100 px-2 py-1 text-xs text-slate-600"
+                    />
+                  )}
+                </div>
+
+                <div>
+                  <label className="mb-1 block text-[10px] font-medium text-slate-600">Units</label>
+                  {addLotDraft.navLoading ? (
+                    <div className="flex h-[30px] w-24 items-center rounded border border-slate-200 bg-slate-100 px-2">
+                      <div className="h-3 w-12 animate-pulse rounded bg-slate-300" />
+                    </div>
+                  ) : addLotDraft.manualMode ? (
+                    <input
+                      type="number"
+                      min="0"
+                      step="0.0001"
+                      value={addLotDraft.units}
+                      onChange={(e) => setAddLotDraft({ ...addLotDraft, units: e.target.value })}
+                      placeholder="Enter units"
+                      className="w-24 rounded border border-slate-300 px-2 py-1 text-xs"
+                    />
+                  ) : (
+                    <input
+                      type="text"
+                      readOnly
+                      value={addLotDraft.units ? formatUnits(Number(addLotDraft.units)) : ""}
+                      placeholder="Auto-calculated"
+                      className="w-24 cursor-not-allowed rounded border border-slate-200 bg-slate-100 px-2 py-1 text-xs text-slate-600"
+                    />
+                  )}
+                </div>
+
+                {group.scheme_code && (
+                  <button
+                    type="button"
+                    onClick={addLotDraft.manualMode ? switchAddLotToAutoFetch : switchAddLotToManual}
+                    className="text-xs font-medium text-blue-600 hover:underline"
+                  >
+                    {addLotDraft.manualMode ? "Auto-fetch" : "Enter manually"}
+                  </button>
+                )}
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => handleSaveAddLot(group)}
+                    disabled={addLotSaving || addLotDraft.navLoading}
+                    className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {addLotSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleCancelAddLot}
+                    disabled={addLotSaving}
+                    className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+              {(addLotError || addLotDraft.navError) && (
+                <p className="mt-2 text-xs text-rose-600">{addLotError ?? addLotDraft.navError}</p>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // --- Fund name block (name button, details link, tags) ---
+
+  const renderFundIdentity = (group: HoldingGroup) => (
+    <div className="min-w-0">
+      <div className="flex min-w-0 items-start gap-1">
+        <button
+          type="button"
+          onClick={() => handleOpenAlternatives(group)}
+          className="min-w-0 text-left text-sm font-semibold leading-snug text-slate-800 hover:text-blue-600 md:line-clamp-2"
+          title={`${group.scheme_name} — view better alternatives`}
+        >
+          {group.scheme_name}
+        </button>
+        {group.scheme_code && (
+          <Link
+            href={`/fund/${group.scheme_code}`}
+            aria-label={`${group.scheme_name} details`}
+            className="mt-0.5 shrink-0 text-slate-300 hover:text-blue-600"
+          >
+            <ExternalLinkIcon />
+          </Link>
+        )}
+      </div>
+      <div className="mt-1 flex flex-wrap items-center gap-1.5">
+        <CategoryTag category={group.category} />
+        {group.lot_count > 1 && (
+          <span className="shrink-0 text-[10px] font-medium text-slate-500">{group.lot_count} lots</span>
+        )}
+        {owner === "family" && <OwnerBadge owner={group.owner} size="sm" />}
+        {group.nav_missing && <NavMissingBadge />}
+      </div>
+    </div>
+  );
+
+  const renderExpandButton = (group: HoldingGroup, isExpanded: boolean) => (
+    <button
+      type="button"
+      onClick={() => toggleGroup(group.key)}
+      aria-label={isExpanded ? `Hide lots of ${group.scheme_name}` : `Show lots of ${group.scheme_name}`}
+      aria-expanded={isExpanded}
+      className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 transition hover:bg-slate-200 hover:text-slate-600"
+    >
+      <span className={`inline-block transition-transform duration-200 ${isExpanded ? "rotate-90" : "rotate-0"}`}>
+        <ChevronIcon />
+      </span>
+    </button>
+  );
+
+  const allocationPct = (g: HoldingGroup) => (portfolioValue > 0 ? (g.current_value / portfolioValue) * 100 : 0);
+
+  const renderDesktopRow = (group: HoldingGroup) => {
+    const isExpanded = expandedGroups.has(group.key);
+    return (
+      <div key={group.key} className="border-b border-slate-100 last:border-0">
+        <div className={`${MAIN_GRID} items-center gap-3 px-4 py-3 transition-colors hover:bg-slate-50/70`}>
+          <div className="flex min-w-0 items-start gap-1.5">
+            {renderExpandButton(group, isExpanded)}
+            {renderFundIdentity(group)}
+          </div>
+          <div className="text-right">
+            <p className="text-sm font-medium tabular-nums text-slate-900">{formatInrFull(group.current_value)}</p>
+            <p className="text-xs tabular-nums text-slate-400">Inv {formatInrFull(group.total_invested)}</p>
+          </div>
+          <div>
+            {group.nav_missing ? (
+              <p className="text-sm text-slate-400" title="No NAV — valued at cost">
+                —
+              </p>
+            ) : (
+              <>
+                <p className={`text-sm font-medium tabular-nums ${toneText(group.pnl)}`}>
+                  {formatSignedInrFull(group.pnl)}{" "}
+                  <span className="text-xs">({formatPct(group.pnl_pct)})</span>
+                </p>
+                <PnlBar pct={group.pnl_pct} maxAbs={maxAbsPnlPct} />
+              </>
+            )}
+          </div>
+          <p className="text-right text-sm tabular-nums text-slate-600">{allocationPct(group).toFixed(1)}%</p>
+          <ReturnRank group={group} returnKey={returnKey} rankKey={rankKey} />
+          <div className="flex justify-end">
+            <ActionsMenu label={`Actions for ${group.scheme_name}`} actions={groupActions(group)} />
+          </div>
+        </div>
+        {isExpanded && renderLotsPanel(group)}
+      </div>
+    );
+  };
+
+  const renderMobileCard = (group: HoldingGroup) => {
+    const isExpanded = expandedGroups.has(group.key);
+    return (
+      <div key={group.key} className="rounded-xl border border-slate-200 bg-white p-3">
+        <div className="flex items-start gap-2">
+          <div className="min-w-0 flex-1">{renderFundIdentity(group)}</div>
+          <ActionsMenu label={`Actions for ${group.scheme_name}`} actions={groupActions(group)} />
+        </div>
+        <dl className="mt-3 grid grid-cols-3 gap-2 text-xs">
+          <div className="min-w-0">
+            <dt className="text-slate-500">Value</dt>
+            <dd className="truncate text-sm font-medium tabular-nums text-slate-900">
+              {formatInrShort(group.current_value, 2)}
+            </dd>
+            <dd className="truncate tabular-nums text-slate-400">Inv {formatInrShort(group.total_invested, 2)}</dd>
+          </div>
+          <div className="min-w-0">
+            <dt className="text-slate-500">P&L</dt>
+            {group.nav_missing ? (
+              <dd className="text-sm text-slate-400">—</dd>
+            ) : (
+              <>
+                <dd className={`truncate text-sm font-medium tabular-nums ${toneText(group.pnl)}`}>
+                  {formatPct(group.pnl_pct, 1)}
+                </dd>
+                <dd className={`truncate tabular-nums ${toneText(group.pnl)}`}>
+                  {group.pnl >= 0 ? "+" : "-"}
+                  {formatInrShort(Math.abs(group.pnl))}
+                </dd>
+              </>
+            )}
+          </div>
+          <div className="min-w-0">
+            <dt className="text-slate-500">{periodLabel} return</dt>
+            <dd className="mt-0.5">
+              <ReturnRank group={group} returnKey={returnKey} rankKey={rankKey} />
+            </dd>
+          </div>
+        </dl>
+        <button
+          type="button"
+          onClick={() => toggleGroup(group.key)}
+          aria-expanded={isExpanded}
+          className="mt-2 inline-flex items-center gap-1 text-xs font-medium text-slate-500 hover:text-blue-600"
+        >
+          <span className={`inline-block transition-transform duration-200 ${isExpanded ? "rotate-90" : ""}`}>
+            <ChevronIcon />
+          </span>
+          {isExpanded ? "Hide lots" : `Show ${group.lot_count} lot${group.lot_count === 1 ? "" : "s"}`}
+          <span className="text-slate-400">· {allocationPct(group).toFixed(1)}% of portfolio</span>
+        </button>
+        {isExpanded && <div className="-mx-3 mt-2">{renderLotsPanel(group)}</div>}
+      </div>
+    );
+  };
+
+  const renderRow = (group: HoldingGroup) => (isDesktop ? renderDesktopRow(group) : renderMobileCard(group));
+
+  const renderSectionHeader = (s: CategorySection) => {
+    const pnl = s.value - s.invested;
+    const pnlPct = s.invested > 0 ? (pnl / s.invested) * 100 : 0;
+    const share = portfolioValue > 0 ? (s.value / portfolioValue) * 100 : 0;
+    return (
+      <div
+        className={`flex flex-wrap items-baseline justify-between gap-x-4 gap-y-0.5 bg-slate-50 px-4 py-2 text-xs ${
+          isDesktop ? "border-b border-slate-100" : "rounded-lg"
+        }`}
+      >
+        <span className="font-semibold text-slate-700">
+          {s.category} <span className="font-normal text-slate-400">· {s.rows.length}</span>
+        </span>
+        <span className="tabular-nums text-slate-600">
+          {formatInrFull(s.value)} · <span className={toneText(pnl)}>{formatPct(pnlPct)}</span> ·{" "}
+          {share.toFixed(1)}%
+        </span>
+      </div>
+    );
+  };
+
+  const renderSortButton = (id: SortKey, label: string) => {
+    const active = sortKey === id;
+    return (
+      <button
+        type="button"
+        onClick={() => handleSort(id)}
+        aria-label={`Sort by ${label}${active ? (sortDir === "asc" ? ", ascending" : ", descending") : ""}`}
+        className={`inline-flex items-center gap-1 font-medium transition hover:text-slate-800 ${
+          active ? "text-slate-800" : ""
+        }`}
+      >
+        {label}
+        <span aria-hidden className={`text-[10px] ${active ? "text-blue-600" : "text-slate-300"}`}>
+          {active ? (sortDir === "asc" ? "▲" : "▼") : "↕"}
+        </span>
+      </button>
+    );
+  };
 
   return (
     <div className="min-h-screen bg-slate-50">
       <AppHeader userEmail={userEmail} />
 
       {toast && (
-        <div className="fixed right-4 top-4 z-50 rounded-lg bg-slate-900 px-4 py-2 text-sm text-white shadow-lg">
+        <div
+          role="status"
+          className="fixed right-4 top-4 z-50 rounded-lg bg-slate-900 px-4 py-2 text-sm text-white shadow-lg"
+        >
           {toast}
         </div>
       )}
 
       <div className="border-b border-slate-200 bg-white">
-        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-3 px-4 py-3">
-          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1">
+        <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-x-3 gap-y-2 px-4 py-2.5">
+          <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1" role="group" aria-label="Owner">
             {OWNERS.map((o) => (
               <button
                 key={o.id}
                 onClick={() => setOwner(o.id)}
+                aria-pressed={owner === o.id}
                 className={`rounded-md px-3 py-1.5 text-sm font-medium transition ${
-                  owner === o.id
-                    ? "bg-white text-blue-600 shadow-sm"
-                    : "text-slate-500 hover:text-slate-700"
+                  owner === o.id ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
                 }`}
               >
                 {o.label}
@@ -1386,36 +2076,36 @@ export default function DashboardClient({
             ))}
           </div>
 
-          <div className="text-right">
-            <div className="flex items-center gap-2">
-              <button
-                onClick={handleSyncNav}
-                disabled={syncingNav}
-                className="inline-flex items-center gap-2 rounded-lg border border-slate-300 px-3 py-1.5 text-sm font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+          <div className="flex min-w-0 items-center gap-2.5">
+            <p className="truncate text-xs text-slate-400">
+              <span title={lastSynced ? `NAV last synced ${new Date(lastSynced).toLocaleString("en-IN")}` : undefined}>
+                Updated {formatAgo(lastSynced)}
+              </span>
+              {" · "}
+              <Link
+                href="/settings"
+                className={isPeerSyncStale ? "text-amber-600 hover:underline" : "hover:text-slate-600 hover:underline"}
+                title={isPeerSyncStale ? "Peer data is over a week old — sync it in Settings" : "Peer data sync settings"}
               >
-                {syncingNav && (
-                  <span className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-slate-400 border-t-transparent" />
-                )}
-                {syncingNav ? "Syncing..." : "Sync NAV"}
-              </button>
-            </div>
-            <p className="mt-1 text-xs text-slate-400">
-              Last synced: {lastSynced ? new Date(lastSynced).toLocaleString("en-IN") : "—"}
-            </p>
-            <p className={`mt-0.5 text-xs ${isPeerSyncStale ? "text-amber-600" : "text-slate-400"}`}>
-              Peers last synced: {formatRelativeTime(peersLastSynced)} ·{" "}
-              <Link href="/settings" className="font-medium text-blue-600 hover:underline">
-                Settings
+                Peers {formatAgo(peersLastSynced)}
               </Link>
             </p>
+            <button
+              onClick={handleSyncNav}
+              disabled={syncingNav}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-md border border-slate-300 px-2.5 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              <RefreshIcon spinning={syncingNav} />
+              {syncingNav ? "Syncing…" : "Sync NAV"}
+            </button>
           </div>
         </div>
       </div>
 
-      <main className="mx-auto max-w-6xl px-4 py-8">
+      <main className="mx-auto max-w-6xl space-y-4 px-4 py-6">
         {loadError && (
-          <div className="mb-4 flex items-center justify-between gap-3 rounded-lg bg-red-50 px-3 py-2">
-            <p className="text-sm text-red-600">{loadError}</p>
+          <div className="flex items-center justify-between gap-3 rounded-lg bg-rose-50 px-3 py-2">
+            <p className="text-sm text-rose-600">{loadError}</p>
             <button
               type="button"
               onClick={() => loadHoldings()}
@@ -1426,171 +2116,17 @@ export default function DashboardClient({
           </div>
         )}
 
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-5">
-          {loading ? (
-            Array.from({ length: 5 }).map((_, i) => (
-              <div
-                key={i}
-                className="animate-pulse rounded-xl border border-slate-200 bg-white p-4"
-              >
-                <div className="h-3 w-20 rounded bg-slate-200" />
-                <div className="mt-3 h-6 w-16 rounded bg-slate-200" />
-              </div>
-            ))
-          ) : (
-            <>
-              <KpiCard label="Total invested" value={formatInr(kpis.totalInvested)} />
-              <KpiCard label="Current value" value={formatInr(kpis.currentValue)} />
-              <KpiCard
-                label="Total P&L"
-                value={`${kpis.pnl >= 0 ? "+" : "-"}${formatInr(Math.abs(kpis.pnl))}`}
-                sub={`${kpis.pnl >= 0 ? "+" : ""}${kpis.pnlPct.toFixed(2)}%`}
-                tone={kpis.pnl >= 0 ? "positive" : "negative"}
-              />
-              <KpiCard
-                label="XIRR"
-                value={kpis.xirrPct !== null ? formatPct(kpis.xirrPct) : "—"}
-                sub="annualised"
-                tone={kpis.xirrPct !== null ? (kpis.xirrPct >= 0 ? "positive" : "negative") : undefined}
-              />
-              <KpiCard
-                label="Below category avg"
-                value={
-                  hasAnyHoldings && belowCategory.compared > 0
-                    ? `${belowCategory.below} of ${belowCategory.compared}`
-                    : "—"
-                }
-                sub={
-                  hasAnyHoldings
-                    ? `funds (${PERIODS.find((p) => p.id === belowCategory.periodUsed)?.label ?? "1Y"})`
-                    : undefined
-                }
-              />
-            </>
-          )}
-        </div>
-
-        {!loading && hasAnyHoldings && (
-          <section className="mb-8 mt-8">
-            <h2 className="mb-4 text-lg font-semibold text-slate-800 dark:text-slate-100">
-              Portfolio Overview
-            </h2>
-
-            <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900 md:col-span-1">
-                <p className="mb-3 text-sm font-medium text-slate-600 dark:text-slate-400">
-                  Category Allocation
-                </p>
-                <ResponsiveContainer width="100%" height={280}>
-                  <PieChart>
-                    <Pie
-                      data={categoryAllocation}
-                      dataKey="value"
-                      nameKey="category"
-                      innerRadius={60}
-                      outerRadius={100}
-                    >
-                      {categoryAllocation.map((entry, i) => (
-                        <Cell key={entry.category} fill={CATEGORY_COLORS[i % CATEGORY_COLORS.length]} />
-                      ))}
-                    </Pie>
-                    <Tooltip
-                      content={(props) => (
-                        <CategoryAllocationTooltip {...props} total={categoryAllocationTotal} />
-                      )}
-                    />
-                    <Legend />
-                  </PieChart>
-                </ResponsiveContainer>
-              </div>
-
-              <div className="rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900 md:col-span-1">
-                <p className="mb-3 text-sm font-medium text-slate-600 dark:text-slate-400">
-                  Invested vs Current Value
-                </p>
-                <div className="overflow-x-auto">
-                  <div className="min-w-[480px]">
-                    <ResponsiveContainer width="100%" height={340}>
-                      <BarChart data={topFundsByValue} layout="vertical" margin={{ top: 5, right: 20, left: 0, bottom: 5 }}>
-                        <CartesianGrid strokeDasharray="3 3" />
-                        <XAxis type="number" tickFormatter={formatInrAbbreviated} />
-                        <YAxis type="category" dataKey="name" width={180} />
-                        <Tooltip content={<FundValueTooltip />} />
-                        <Bar dataKey="invested" name="Invested" fill="#94a3b8" />
-                        <Bar dataKey="current" name="Current">
-                          {topFundsByValue.map((entry) => (
-                            <Cell key={entry.key} fill={entry.current >= entry.invested ? "#10b981" : "#f43f5e"} />
-                          ))}
-                        </Bar>
-                      </BarChart>
-                    </ResponsiveContainer>
-                  </div>
-                </div>
-                {/* Hand-rolled legend: the "Current" bars are coloured per cell, so
-                    Recharts' default legend swatch (the Bar's own fill) never matched. */}
-                <div className="mt-2 flex flex-wrap justify-center gap-4 text-xs text-slate-600">
-                  <span className="inline-flex items-center gap-1.5">
-                    <span className="h-2.5 w-2.5 rounded-sm bg-slate-400" /> Invested
-                  </span>
-                  <span className="inline-flex items-center gap-1.5">
-                    <span className="h-2.5 w-2.5 rounded-sm bg-emerald-500" /> Current (gain)
-                  </span>
-                  <span className="inline-flex items-center gap-1.5">
-                    <span className="h-2.5 w-2.5 rounded-sm bg-rose-500" /> Current (loss)
-                  </span>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-4 rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-700 dark:bg-slate-900">
-              <p className="mb-3 text-sm font-medium text-slate-600 dark:text-slate-400">
-                P&L by Fund (%)
-              </p>
-              <ResponsiveContainer width="100%" height={300}>
-                <BarChart data={pnlByFund} margin={{ top: 5, right: 20, left: 0, bottom: 30 }}>
-                  <CartesianGrid strokeDasharray="3 3" />
-                  {isMobile ? (
-                    <XAxis dataKey="name" tick={false} height={4} />
-                  ) : (
-                    <XAxis dataKey="name" angle={-35} textAnchor="end" interval={0} height={60} />
-                  )}
-                  <YAxis tickFormatter={(v) => `${v.toFixed(1)}%`} />
-                  <Tooltip content={<FundPnlTooltip />} />
-                  <Bar dataKey="pnl_pct" name="P&L %">
-                    {pnlByFund.map((entry) => (
-                      <Cell key={entry.key} fill={entry.pnl_pct >= 0 ? "#10b981" : "#f43f5e"} />
-                    ))}
-                  </Bar>
-                </BarChart>
-              </ResponsiveContainer>
-              {isMobile && (
-                <p className="mt-2 text-center text-xs text-slate-400">Tap bars to see fund details</p>
-              )}
-            </div>
-          </section>
-        )}
-
         {loading && (
-          <div className="mt-8 overflow-hidden rounded-xl border border-slate-200 bg-white">
-            <div className="divide-y divide-slate-100">
-              {Array.from({ length: 4 }).map((_, i) => (
-                <div key={i} className="flex animate-pulse items-center gap-4 px-4 py-3">
-                  <div className="h-4 w-1/3 rounded bg-slate-200" />
-                  <div className="h-4 w-6 rounded-full bg-slate-200" />
-                  <div className="h-4 w-20 rounded bg-slate-200" />
-                  <div className="h-4 w-20 rounded bg-slate-200" />
-                  <div className="h-4 w-20 rounded bg-slate-200" />
-                </div>
-              ))}
-            </div>
-          </div>
+          <>
+            <TopSectionSkeleton />
+            <ChartsSkeleton />
+            <TableSkeleton />
+          </>
         )}
 
         {!loading && !hasAnyHoldings && !loadError && (
-          <div className="mt-8 flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center">
-            <p className="text-sm font-medium text-slate-700">
-              No holdings yet — import your CAMS CAS statement
-            </p>
+          <div className="flex flex-col items-center justify-center rounded-xl border border-dashed border-slate-300 bg-white px-6 py-16 text-center">
+            <p className="text-sm font-medium text-slate-700">No holdings yet — import your CAMS CAS statement</p>
             <Link
               href="/import"
               className="mt-4 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition hover:bg-blue-700"
@@ -1602,631 +2138,229 @@ export default function DashboardClient({
 
         {!loading && hasAnyHoldings && (
           <>
-            <div className="mt-8 flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-slate-700">Holdings</h2>
-              <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-1">
-                {PERIODS.map((p) => (
-                  <button
-                    key={p.id}
-                    onClick={() => setPeriod(p.id)}
-                    className={`rounded-md px-3 py-1 text-xs font-medium transition ${
-                      period === p.id
-                        ? "bg-white text-blue-600 shadow-sm"
-                        : "text-slate-500 hover:text-slate-700"
-                    }`}
-                  >
-                    {p.label}
-                  </button>
-                ))}
+            <section aria-label="Summary" className="grid gap-4 lg:grid-cols-[minmax(0,1.3fr)_minmax(0,2fr)]">
+              <HeroCard
+                value={kpis.currentValue}
+                pnl={kpis.pnl}
+                pnlPct={kpis.pnlPct}
+                xirrPct={kpis.xirrPct}
+                dayChange={history?.day_change ?? null}
+                warnings={concentrationWarnings}
+              />
+              <div className="grid grid-cols-2 gap-3">
+                <StatCard label="Invested" value={formatInrShort(kpis.totalInvested, 2)} sub={formatInrFull(kpis.totalInvested)} />
+                <StatCard
+                  label="Funds held"
+                  value={groupedHoldings.length}
+                  sub={`${filteredHoldings.length} lot${filteredHoldings.length === 1 ? "" : "s"}`}
+                />
+                <StatCard
+                  label="Below category avg"
+                  value={
+                    belowCategory.compared > 0 ? (
+                      <>
+                        {belowCategory.below}
+                        <span className="text-sm font-normal text-slate-400"> of {belowCategory.compared}</span>
+                      </>
+                    ) : peersLoading ? (
+                      <span className="inline-block h-5 w-12 animate-pulse rounded bg-slate-200 align-middle" />
+                    ) : (
+                      "—"
+                    )
+                  }
+                  sub={
+                    belowCategory.compared > 0
+                      ? `funds · ${PERIODS.find((p) => p.id === belowCategory.periodUsed)?.label ?? "1Y"} return`
+                      : peersLoading
+                        ? "loading peer data"
+                        : "no peer data yet"
+                  }
+                />
+                <StatCard
+                  label="Next SIP"
+                  href="/sip"
+                  hrefLabel="Open SIP calendar"
+                  value={
+                    sips === null ? (
+                      <span className="inline-block h-5 w-16 animate-pulse rounded bg-slate-200 align-middle" />
+                    ) : nextSip ? (
+                      nextSip.date.toLocaleDateString("en-IN", { day: "numeric", month: "short" })
+                    ) : (
+                      "None"
+                    )
+                  }
+                  sub={
+                    nextSip
+                      ? `${formatInrShort(nextSip.amount, 2)}${nextSip.count > 1 ? ` · ${nextSip.count} SIPs` : ""}`
+                      : sips === null
+                        ? undefined
+                        : "Set up SIPs →"
+                  }
+                />
               </div>
-            </div>
+            </section>
 
-            {deleteGroupTarget && (
-              <div className="mt-3 rounded-lg border border-red-200 bg-red-50 px-4 py-3">
-                <p className="text-sm text-red-700">
-                  Delete all {deleteGroupTarget.lot_count} lots of{" "}
-                  <span className="font-semibold">{deleteGroupTarget.scheme_name}</span> totalling{" "}
-                  {formatInr(deleteGroupTarget.total_invested)}? This cannot be undone.
-                </p>
-                <div className="mt-2 flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleConfirmDeleteGroup(deleteGroupTarget)}
-                    disabled={deleteGroupDeleting}
-                    className="rounded-lg bg-red-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {deleteGroupDeleting && deleteGroupProgress
-                      ? `Deleting ${deleteGroupProgress.current} of ${deleteGroupProgress.total}...`
-                      : "Yes, delete all"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setDeleteGroupConfirmKey(null)}
-                    disabled={deleteGroupDeleting}
-                    className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
+            {owner === "family" && ownerSummaries.length > 1 && (
+              <OwnerCompareStrip rows={ownerSummaries} onSelect={(id) => setOwner(id)} />
             )}
 
-            <div className="mt-3 overflow-x-auto rounded-xl border border-slate-200 bg-white">
-              <div>
-                <div className={`${MAIN_GRID} items-center gap-2 border-b border-slate-200 px-4 py-2 text-xs text-slate-500`}>
-                  <span className="font-medium">Fund name</span>
-                  <span className="hidden font-medium md:block">Owner</span>
-                  <span className="hidden font-medium md:block">Category</span>
-                  <span className="hidden font-medium md:block">Invested ₹</span>
-                  <span className="hidden font-medium md:block">Current ₹</span>
-                  <span className="font-medium">P&L</span>
-                  <span className="hidden font-medium md:block">{periodLabel} Return</span>
-                  <span className="hidden font-medium md:block">Peer rank</span>
-                  <span className="text-right font-medium">Actions</span>
-                </div>
+            <section aria-label="Charts" className="grid gap-4 lg:grid-cols-2">
+              <AllocationCard slices={categoryAllocation} />
+              <ValueHistoryCard
+                points={history?.points ?? []}
+                loading={historyLoading}
+                error={historyError}
+                onRetry={() => loadHistory(owner)}
+              />
+            </section>
 
-                {groupedHoldings.map((group) => {
-                  const isExpanded = expandedGroups.has(group.key);
-                  const returnValue = group.peer ? group.peer[returnKey] : null;
-                  const rankValue = group.peer ? group.peer[rankKey] : null;
-                  const peerCount = group.peer?.peer_count ?? null;
-                  const signalDot = computeSignalDot(group.peer?.rank_1y ?? null, peerCount);
-                  const groupPnlPct = group.pnl_pct;
-                  const sortedLots = [...group.lots].sort((a, b) =>
-                    a.as_on_date < b.as_on_date ? -1 : a.as_on_date > b.as_on_date ? 1 : 0
-                  );
+            <MoversCard gainers={movers.gainers} losers={movers.losers} />
 
-                  return (
-                    <div key={group.key} className="border-b border-slate-100 last:border-0">
-                      <div
-                        className={`${MAIN_GRID} items-center gap-2 px-4 py-3 text-sm transition-colors hover:bg-slate-50`}
-                      >
-                        <div className="flex min-w-0 items-start gap-1.5" title={group.scheme_name}>
-                          <button
-                            type="button"
-                            onClick={() => toggleGroup(group.key)}
-                            aria-label={isExpanded ? "Collapse" : "Expand"}
-                            className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded text-slate-400 transition hover:bg-slate-200 hover:text-slate-600"
-                          >
-                            <span
-                              className={`inline-block transition-transform duration-200 ${
-                                isExpanded ? "rotate-90" : "rotate-0"
-                              }`}
-                            >
-                              <ChevronIcon />
-                            </span>
-                          </button>
-
-                          <div className="min-w-0">
-                            <button
-                              type="button"
-                              onClick={() => handleOpenAlternatives(group)}
-                              className="block max-w-[160px] cursor-pointer truncate text-left text-sm font-semibold text-slate-800 hover:text-blue-600 md:max-w-none md:line-clamp-2 md:whitespace-normal"
-                              title="View better alternatives"
-                            >
-                              {group.scheme_name}
-                            </button>
-                            <span className="mt-0.5 text-xs text-gray-500 md:hidden">
-                              {formatInr(group.total_invested)}
-                            </span>
-                            <div className="mt-0.5 flex items-center gap-1.5">
-                              {group.scheme_code && (
-                                <Link
-                                  href={`/fund/${group.scheme_code}`}
-                                  onClick={(e) => e.stopPropagation()}
-                                  aria-label="View fund details"
-                                  className="shrink-0 text-slate-300 hover:text-blue-600"
-                                >
-                                  <ExternalLinkIcon />
-                                </Link>
-                              )}
-                              {group.lot_count > 1 && (
-                                <span className="shrink-0 rounded-full bg-slate-100 px-1.5 py-0.5 text-[10px] font-medium text-slate-500">
-                                  {group.lot_count} lots
-                                </span>
-                              )}
-                              {group.nav_missing && <NavMissingBadge />}
-                            </div>
-                          </div>
-                        </div>
-
-                        <div className="hidden md:flex md:items-center">
-                          <OwnerBadge owner={group.owner} />
-                        </div>
-                        <span className="hidden truncate text-slate-600 md:block">{group.category}</span>
-                        <span className="hidden text-slate-800 md:block">{formatInr(group.total_invested)}</span>
-                        <span className="hidden text-slate-800 md:block">{formatInr(group.current_value)}</span>
-                        <span className={`font-medium ${group.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
-                          {group.pnl >= 0 ? "+" : "-"}
-                          {formatInr(Math.abs(group.pnl))} ({groupPnlPct >= 0 ? "+" : ""}
-                          {groupPnlPct.toFixed(2)}%)
-                        </span>
-                        <span
-                          className={`hidden font-medium md:block ${
-                            returnValue === null
-                              ? "text-slate-400"
-                              : returnValue >= 0
-                                ? "text-green-600"
-                                : "text-red-600"
+            <section id="holdings" aria-label="Holdings" className="scroll-mt-4 pt-2">
+              <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <h2 className="text-base font-semibold text-slate-800">Holdings</h2>
+                <div className="flex flex-wrap items-center gap-2">
+                  <label className="relative min-w-0 flex-1 md:w-56 md:flex-none">
+                    <span className="sr-only">Search funds</span>
+                    <span className="pointer-events-none absolute inset-y-0 left-2.5 flex items-center text-slate-400">
+                      <SearchIcon />
+                    </span>
+                    <input
+                      type="search"
+                      value={search}
+                      onChange={(e) => setSearch(e.target.value)}
+                      placeholder="Search funds"
+                      className="w-full rounded-lg border border-slate-200 bg-white py-1.5 pl-8 pr-2 text-sm placeholder:text-slate-400 focus:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-100"
+                    />
+                  </label>
+                  <div className="flex items-center gap-1.5">
+                    <span className="text-xs text-slate-500">Return period</span>
+                    <div className="inline-flex rounded-lg border border-slate-200 bg-slate-100 p-0.5" role="group" aria-label="Return period">
+                      {PERIODS.map((p) => (
+                        <button
+                          key={p.id}
+                          type="button"
+                          onClick={() => setPeriod(p.id)}
+                          aria-pressed={period === p.id}
+                          className={`rounded-md px-2.5 py-1 text-xs font-medium transition ${
+                            period === p.id ? "bg-white text-blue-600 shadow-sm" : "text-slate-500 hover:text-slate-700"
                           }`}
                         >
-                          {formatPct(returnValue)}
-                        </span>
-                        <div className="hidden md:flex md:items-center md:gap-1.5">
-                          {rankValue && peerCount ? (
-                            <span
-                              className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${rankBadgeTone(
-                                rankValue,
-                                peerCount
-                              )}`}
-                            >
-                              #{rankValue}/{peerCount}
-                            </span>
-                          ) : (
-                            <span
-                              className="text-slate-300"
-                              title="Click 'Sync peer data' to populate"
-                            >
-                              —
-                            </span>
-                          )}
-                          {signalDot && <SignalDot signal={signalDot} />}
-                        </div>
-                        <div className="flex items-center justify-end gap-1">
-                          <button
-                            type="button"
-                            onClick={() => handleEditGroup(group)}
-                            aria-label="Edit most recent lot"
-                            title="Edit most recent lot"
-                            className="flex h-7 items-center gap-1 rounded-md px-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-                          >
-                            <PencilIcon />
-                            <span className="hidden text-xs font-medium lg:inline">Edit</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleOpenAddLot(group)}
-                            aria-label="Add lot"
-                            title="Add lot"
-                            className="flex h-7 items-center gap-1 rounded-md px-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-blue-600"
-                          >
-                            <PlusIcon />
-                            <span className="hidden text-xs font-medium lg:inline">Add lot</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setDeleteGroupConfirmKey(group.key)}
-                            aria-label="Delete all lots"
-                            title="Delete all lots"
-                            className="flex h-7 items-center gap-1 rounded-md px-1.5 text-slate-400 transition hover:bg-red-50 hover:text-red-600"
-                          >
-                            <TrashIcon />
-                            <span className="hidden text-xs font-medium lg:inline">Delete</span>
-                          </button>
-                        </div>
-                      </div>
-
-                      <div
-                        className={`overflow-hidden transition-all duration-200 ${
-                          isExpanded ? "max-h-[500px]" : "max-h-0"
-                        }`}
-                      >
-                        <div className="ml-4 border-l-2 border-slate-200 py-1 pl-4">
-                            {sortedLots.map((lot) => {
-                              const isEditingLot = editingId === lot.id;
-                              const isSavedFlash = savedFlashId === lot.id;
-                              const isDeleteConfirming = deleteLotConfirmId === lot.id;
-                              const lotPnlPct =
-                                lot.invested_amount > 0 ? (lot.pnl / lot.invested_amount) * 100 : 0;
-
-                              if (isDeleteConfirming) {
-                                return (
-                                  <div
-                                    key={lot.id}
-                                    className="my-1 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-red-50 px-3 py-2"
-                                  >
-                                    <p className="text-xs text-red-700">
-                                      Delete lot of {formatInr(lot.invested_amount)} from{" "}
-                                      {formatDateDMY(lot.as_on_date)}?
-                                    </p>
-                                    <div className="flex items-center gap-2">
-                                      <button
-                                        type="button"
-                                        onClick={() => handleConfirmDeleteLot(lot)}
-                                        disabled={deleteLotDeleting}
-                                        className="rounded-md bg-red-600 px-2 py-1 text-xs font-semibold text-white transition hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-60"
-                                      >
-                                        Confirm delete
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={() => setDeleteLotConfirmId(null)}
-                                        disabled={deleteLotDeleting}
-                                        className="rounded-md border border-slate-300 bg-white px-2 py-1 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                                      >
-                                        Cancel
-                                      </button>
-                                    </div>
-                                  </div>
-                                );
-                              }
-
-                              return (
-                                <div key={lot.id}>
-                                <div
-                                  className={`${SUB_GRID} items-center gap-2 rounded py-2 pl-0 pr-2 text-xs transition-colors duration-700 ${
-                                    isSavedFlash ? "bg-green-50" : ""
-                                  }`}
-                                >
-                                  <span className="truncate text-slate-500">
-                                    {isEditingLot && editDraft ? (
-                                      <input
-                                        type="date"
-                                        value={editDraft.as_on_date}
-                                        max={todayIso()}
-                                        onChange={(e) =>
-                                          setEditDraft({ ...editDraft, as_on_date: e.target.value })
-                                        }
-                                        className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
-                                      />
-                                    ) : (
-                                      formatDateDMY(lot.as_on_date)
-                                    )}
-                                  </span>
-                                  <span>
-                                    {isEditingLot && editDraft ? (
-                                      <div className="inline-flex rounded-md border border-slate-200 p-0.5">
-                                        <button
-                                          type="button"
-                                          onClick={() => setEditDraft({ ...editDraft, owner: "praveen" })}
-                                          className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
-                                            editDraft.owner === "praveen"
-                                              ? "bg-blue-600 text-white"
-                                              : "text-slate-500 hover:bg-slate-100"
-                                          }`}
-                                        >
-                                          P
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={() => setEditDraft({ ...editDraft, owner: "geetha" })}
-                                          className={`rounded px-1.5 py-0.5 text-[10px] font-semibold transition ${
-                                            editDraft.owner === "geetha"
-                                              ? "bg-amber-500 text-white"
-                                              : "text-slate-500 hover:bg-slate-100"
-                                          }`}
-                                        >
-                                          G
-                                        </button>
-                                      </div>
-                                    ) : (
-                                      <OwnerBadge owner={lot.owner} />
-                                    )}
-                                  </span>
-                                  <span className="text-slate-700">
-                                    {isEditingLot && editDraft ? (
-                                      <input
-                                        type="number"
-                                        min="0"
-                                        step="0.01"
-                                        value={editDraft.invested_amount}
-                                        onChange={(e) =>
-                                          setEditDraft({ ...editDraft, invested_amount: e.target.value })
-                                        }
-                                        className="w-full rounded border border-slate-300 px-2 py-1 text-xs"
-                                      />
-                                    ) : (
-                                      formatInr(Number(lot.invested_amount))
-                                    )}
-                                  </span>
-                                  <span className="text-slate-700">{formatInr(Number(lot.current_value))}</span>
-                                  <span className={`font-medium ${lot.pnl >= 0 ? "text-green-600" : "text-red-600"}`}>
-                                    {lot.pnl >= 0 ? "+" : "-"}
-                                    {formatInr(Math.abs(lot.pnl))} ({lotPnlPct >= 0 ? "+" : ""}
-                                    {lotPnlPct.toFixed(2)}%)
-                                  </span>
-                                  <span className="text-slate-500">
-                                    {isEditingLot ? (
-                                      editNavLoading ? (
-                                        <span className="inline-block h-3 w-10 animate-pulse rounded bg-slate-200" />
-                                      ) : (
-                                        `₹${formatNav(Number(editDraft?.avg_nav ?? lot.avg_nav))}`
-                                      )
-                                    ) : (
-                                      `₹${formatNav(Number(lot.avg_nav))}`
-                                    )}
-                                  </span>
-                                  <span className="text-slate-500">
-                                    {isEditingLot ? (
-                                      editNavLoading ? (
-                                        <span className="inline-block h-3 w-10 animate-pulse rounded bg-slate-200" />
-                                      ) : (
-                                        formatUnits(Number(editDraft?.units ?? lot.units))
-                                      )
-                                    ) : (
-                                      formatUnits(Number(lot.units))
-                                    )}
-                                  </span>
-                                  <span className="flex items-center justify-end gap-1">
-                                    {isEditingLot ? (
-                                      <div className="flex flex-col items-end gap-1">
-                                        <div className="flex items-center gap-1">
-                                          <button
-                                            type="button"
-                                            onClick={() => handleSaveEdit(lot)}
-                                            disabled={editSaving || editNavLoading}
-                                            aria-label="Save"
-                                            className="flex h-6 w-6 items-center justify-center rounded-md bg-blue-600 text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
-                                          >
-                                            <CheckIcon />
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={handleCancelEdit}
-                                            disabled={editSaving}
-                                            aria-label="Cancel"
-                                            className="flex h-6 w-6 items-center justify-center rounded-md bg-slate-200 text-slate-600 transition hover:bg-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
-                                          >
-                                            <XIcon />
-                                          </button>
-                                        </div>
-                                        {editError && (
-                                          <span className="text-[10px] font-medium text-red-600">{editError}</span>
-                                        )}
-                                      </div>
-                                    ) : (
-                                      <>
-                                        <button
-                                          type="button"
-                                          onClick={() => handleStartEdit(lot)}
-                                          aria-label="Edit lot"
-                                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-slate-100 hover:text-slate-600"
-                                        >
-                                          <PencilIcon />
-                                        </button>
-                                        <button
-                                          type="button"
-                                          onClick={() => setDeleteLotConfirmId(lot.id)}
-                                          aria-label="Delete lot"
-                                          className="flex h-6 w-6 items-center justify-center rounded-md text-slate-400 transition hover:bg-red-50 hover:text-red-600"
-                                        >
-                                          <TrashIcon />
-                                        </button>
-                                      </>
-                                    )}
-                                  </span>
-                                </div>
-                                {isEditingLot && editDraft && (
-                                  <div className="mb-1 flex flex-col gap-1 pb-1 pl-1">
-                                    <div className="flex items-center gap-2">
-                                      <label className="text-[10px] font-medium text-slate-500">
-                                        Category
-                                      </label>
-                                      <select
-                                        value={editDraft.category}
-                                        onChange={(e) =>
-                                          setEditDraft({ ...editDraft, category: e.target.value })
-                                        }
-                                        className="rounded border border-slate-300 px-2 py-1 text-xs"
-                                      >
-                                        {CATEGORY_OPTIONS.map((c) => (
-                                          <option key={c} value={c}>
-                                            {c}
-                                          </option>
-                                        ))}
-                                      </select>
-                                    </div>
-                                    {editDraft.category !== lot.category && (
-                                      <p className="pl-1 text-[10px] text-blue-600">
-                                        Detected: {detectCategory(lot.scheme_name).category}
-                                      </p>
-                                    )}
-                                  </div>
-                                )}
-                                </div>
-                              );
-                            })}
-
-                            {addLotGroupKey === group.key && addLotDraft && (
-                              <div className="my-1 rounded-lg bg-blue-50 p-3">
-                                {(() => {
-                                  const detected = detectCategory(group.scheme_name);
-                                  const mismatch =
-                                    detected.confidence !== "low" && detected.category !== group.category;
-                                  if (!mismatch) return null;
-                                  return (
-                                    <div className="mb-3 flex flex-wrap items-start justify-between gap-2 rounded-md bg-amber-50 px-2 py-1.5">
-                                      <p className="text-xs text-amber-700">
-                                        ⚠️ Category mismatch detected. This fund appears to be {detected.category} based
-                                        on its name. Edit the fund to correct it.
-                                      </p>
-                                      <button
-                                        type="button"
-                                        onClick={() => handleEditGroup(group)}
-                                        className="shrink-0 text-xs font-semibold text-blue-600 hover:underline"
-                                      >
-                                        Fix category
-                                      </button>
-                                    </div>
-                                  );
-                                })()}
-                                <div className="flex flex-wrap items-end gap-3">
-                                  <div>
-                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
-                                      Category
-                                    </label>
-                                    <div className="flex h-[30px] items-center rounded border border-slate-200 bg-white px-2 text-xs text-slate-600">
-                                      {group.category}
-                                    </div>
-                                  </div>
-
-                                  <div>
-                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
-                                      Owner
-                                    </label>
-                                    <div className="inline-flex rounded-md border border-slate-200 bg-white p-0.5">
-                                      <button
-                                        type="button"
-                                        onClick={() => setAddLotDraft({ ...addLotDraft, owner: "praveen" })}
-                                        className={`rounded px-2 py-1 text-xs font-semibold transition ${
-                                          addLotDraft.owner === "praveen"
-                                            ? "bg-blue-600 text-white"
-                                            : "text-slate-500 hover:bg-slate-100"
-                                        }`}
-                                      >
-                                        P
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={() => setAddLotDraft({ ...addLotDraft, owner: "geetha" })}
-                                        className={`rounded px-2 py-1 text-xs font-semibold transition ${
-                                          addLotDraft.owner === "geetha"
-                                            ? "bg-amber-500 text-white"
-                                            : "text-slate-500 hover:bg-slate-100"
-                                        }`}
-                                      >
-                                        G
-                                      </button>
-                                    </div>
-                                  </div>
-
-                                  <div>
-                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
-                                      Invested ₹
-                                    </label>
-                                    <input
-                                      type="number"
-                                      min="0"
-                                      step="0.01"
-                                      value={addLotDraft.invested_amount}
-                                      onChange={(e) =>
-                                        setAddLotDraft({ ...addLotDraft, invested_amount: e.target.value })
-                                      }
-                                      className="w-28 rounded border border-slate-300 px-2 py-1 text-xs"
-                                    />
-                                  </div>
-
-                                  <div>
-                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
-                                      As on date
-                                    </label>
-                                    <input
-                                      type="date"
-                                      value={addLotDraft.as_on_date}
-                                      max={todayIso()}
-                                      onChange={(e) =>
-                                        setAddLotDraft({ ...addLotDraft, as_on_date: e.target.value })
-                                      }
-                                      className="rounded border border-slate-300 px-2 py-1 text-xs"
-                                    />
-                                  </div>
-
-                                  <div>
-                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
-                                      Avg NAV (₹)
-                                    </label>
-                                    {addLotDraft.navLoading ? (
-                                      <div className="flex h-[30px] w-24 items-center rounded border border-slate-200 bg-slate-100 px-2">
-                                        <div className="h-3 w-12 animate-pulse rounded bg-slate-300" />
-                                      </div>
-                                    ) : addLotDraft.manualMode ? (
-                                      <input
-                                        type="number"
-                                        min="0"
-                                        step="0.0001"
-                                        value={addLotDraft.avg_nav}
-                                        onChange={(e) =>
-                                          setAddLotDraft({ ...addLotDraft, avg_nav: e.target.value })
-                                        }
-                                        placeholder="Enter NAV"
-                                        className="w-24 rounded border border-slate-300 px-2 py-1 text-xs"
-                                      />
-                                    ) : (
-                                      <input
-                                        type="text"
-                                        readOnly
-                                        value={addLotDraft.avg_nav ? `₹${formatNav(Number(addLotDraft.avg_nav))}` : ""}
-                                        placeholder="Auto-filled"
-                                        className="w-24 cursor-not-allowed rounded border border-slate-200 bg-slate-100 px-2 py-1 text-xs text-slate-600"
-                                      />
-                                    )}
-                                  </div>
-
-                                  <div>
-                                    <label className="mb-1 block text-[10px] font-medium text-slate-600">
-                                      Units
-                                    </label>
-                                    {addLotDraft.navLoading ? (
-                                      <div className="flex h-[30px] w-24 items-center rounded border border-slate-200 bg-slate-100 px-2">
-                                        <div className="h-3 w-12 animate-pulse rounded bg-slate-300" />
-                                      </div>
-                                    ) : addLotDraft.manualMode ? (
-                                      <input
-                                        type="number"
-                                        min="0"
-                                        step="0.0001"
-                                        value={addLotDraft.units}
-                                        onChange={(e) => setAddLotDraft({ ...addLotDraft, units: e.target.value })}
-                                        placeholder="Enter units"
-                                        className="w-24 rounded border border-slate-300 px-2 py-1 text-xs"
-                                      />
-                                    ) : (
-                                      <input
-                                        type="text"
-                                        readOnly
-                                        value={addLotDraft.units ? formatUnits(Number(addLotDraft.units)) : ""}
-                                        placeholder="Auto-calculated"
-                                        className="w-24 cursor-not-allowed rounded border border-slate-200 bg-slate-100 px-2 py-1 text-xs text-slate-600"
-                                      />
-                                    )}
-                                  </div>
-
-                                  {group.scheme_code && (
-                                    <button
-                                      type="button"
-                                      onClick={addLotDraft.manualMode ? switchAddLotToAutoFetch : switchAddLotToManual}
-                                      className="text-xs font-medium text-blue-600 hover:underline"
-                                    >
-                                      {addLotDraft.manualMode ? "Auto-fetch" : "Enter manually"}
-                                    </button>
-                                  )}
-
-                                  <div className="flex items-center gap-2">
-                                    <button
-                                      type="button"
-                                      onClick={() => handleSaveAddLot(group)}
-                                      disabled={addLotSaving || addLotDraft.navLoading}
-                                      className="rounded-md bg-blue-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
-                                    >
-                                      {addLotSaving ? "Saving…" : "Save"}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={handleCancelAddLot}
-                                      disabled={addLotSaving}
-                                      className="rounded-md border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
-                                    >
-                                      Cancel
-                                    </button>
-                                  </div>
-                                </div>
-                                {(addLotError || addLotDraft.navError) && (
-                                  <p className="mt-2 text-xs text-red-600">
-                                    {addLotError ?? addLotDraft.navError}
-                                  </p>
-                                )}
-                              </div>
-                            )}
-                        </div>
-                      </div>
+                          {p.label}
+                        </button>
+                      ))}
                     </div>
-                  );
-                })}
+                  </div>
+                  <label className="inline-flex cursor-pointer items-center gap-1.5 text-xs text-slate-600">
+                    <input
+                      type="checkbox"
+                      checked={groupByCategory}
+                      onChange={(e) => setGroupByCategory(e.target.checked)}
+                      className="h-3.5 w-3.5 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                    />
+                    Group by category
+                  </label>
+                  {!isDesktop && (
+                    <label className="inline-flex items-center gap-1.5 text-xs text-slate-600">
+                      Sort
+                      <select
+                        value={`${sortKey}:${sortDir}`}
+                        onChange={(e) => {
+                          const [k, d] = e.target.value.split(":") as [SortKey, SortDir];
+                          setSortKey(k);
+                          setSortDir(d);
+                        }}
+                        className="rounded-md border border-slate-200 bg-white px-1.5 py-1 text-xs"
+                      >
+                        {SORT_OPTIONS.filter((o) => o.id !== "allocation").map((o) => (
+                          <Fragment key={o.id}>
+                            <option value={`${o.id}:${o.defaultDir}`}>
+                              {o.label} {o.defaultDir === "desc" ? "↓" : "↑"}
+                            </option>
+                            <option value={`${o.id}:${o.defaultDir === "desc" ? "asc" : "desc"}`}>
+                              {o.label} {o.defaultDir === "desc" ? "↑" : "↓"}
+                            </option>
+                          </Fragment>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                </div>
               </div>
-            </div>
+
+              {deleteGroupTarget && (
+                <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3" role="alert">
+                  <p className="text-sm text-rose-700">
+                    Delete all {deleteGroupTarget.lot_count} lots of{" "}
+                    <span className="font-semibold">{deleteGroupTarget.scheme_name}</span> totalling{" "}
+                    {formatInrFull(deleteGroupTarget.total_invested)}? This cannot be undone.
+                  </p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <button
+                      type="button"
+                      onClick={() => handleConfirmDeleteGroup(deleteGroupTarget)}
+                      disabled={deleteGroupDeleting}
+                      className="rounded-lg bg-rose-600 px-3 py-1.5 text-xs font-semibold text-white transition hover:bg-rose-700 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      {deleteGroupDeleting && deleteGroupProgress
+                        ? `Deleting ${deleteGroupProgress.current} of ${deleteGroupProgress.total}...`
+                        : "Yes, delete all"}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setDeleteGroupConfirmKey(null)}
+                      disabled={deleteGroupDeleting}
+                      className="rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs font-medium text-slate-700 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {tableRows.length === 0 ? (
+                <p className="mt-3 rounded-xl border border-dashed border-slate-300 bg-white px-4 py-8 text-center text-sm text-slate-500">
+                  No funds match “{search}”.
+                </p>
+              ) : isDesktop ? (
+                <div className="mt-3 rounded-2xl border border-slate-200 bg-white">
+                  <div
+                    className={`${MAIN_GRID} items-center gap-3 rounded-t-2xl border-b border-slate-200 bg-slate-50/60 px-4 py-2.5 text-xs text-slate-500`}
+                  >
+                    <span className="pl-6 font-medium">Fund</span>
+                    <span className="text-right">{renderSortButton("value", "Value")}</span>
+                    <span>{renderSortButton("pnl_pct", "P&L")}</span>
+                    <span className="text-right">{renderSortButton("allocation", "Alloc")}</span>
+                    <span className="flex items-center gap-2">
+                      {renderSortButton("return", `${periodLabel} return`)}
+                      {renderSortButton("rank", "Rank")}
+                    </span>
+                    <span className="sr-only">Actions</span>
+                  </div>
+                  {groupByCategory
+                    ? categorySections.map((s) => (
+                        <div key={s.category}>
+                          {renderSectionHeader(s)}
+                          {s.rows.map(renderRow)}
+                        </div>
+                      ))
+                    : tableRows.map(renderRow)}
+                </div>
+              ) : (
+                <div className="mt-3 space-y-2">
+                  {groupByCategory
+                    ? categorySections.map((s) => (
+                        <div key={s.category} className="space-y-2">
+                          {renderSectionHeader(s)}
+                          {s.rows.map(renderRow)}
+                        </div>
+                      ))
+                    : tableRows.map(renderRow)}
+                </div>
+              )}
+            </section>
           </>
         )}
-
       </main>
 
       <AlternativesPanel
