@@ -233,34 +233,19 @@ function groupKeyFor(h: EnrichedMFHolding): string {
     : `name:${h.scheme_name.trim().toLowerCase()}`;
 }
 
+// Below this many funds a rank says nothing (#1/1, #2/2) — shown neutral.
+const MIN_PEERS_TO_RANK = 3;
+
+// The single colour scale for peer rank (the pill is the only rank marker;
+// the separate signal dot used different thresholds and was removed):
+// top 25% emerald, top 50% blue, top 75% amber, bottom quartile rose.
 function rankBadgeTone(rank: number, peerCount: number) {
+  if (peerCount < MIN_PEERS_TO_RANK) return "bg-slate-100 text-slate-500";
   const pct = rank / peerCount;
   if (pct <= 0.25) return "bg-emerald-100 text-emerald-700";
   if (pct <= 0.5) return "bg-blue-100 text-blue-700";
   if (pct <= 0.75) return "bg-amber-100 text-amber-700";
   return "bg-rose-100 text-rose-700";
-}
-
-type SignalDot = "hold" | "watch" | "switch";
-
-// Cheap client-side approximation of the alternatives panel's rule-based
-// signal, using the fund's rank/peer_count for the selected return period
-// (already loaded) so the
-// dashboard doesn't need an extra API call per row just to show a dot.
-function computeSignalDot(rank: number | null, peerCount: number | null): SignalDot | null {
-  if (!rank || !peerCount) return null;
-  const pct = rank / peerCount;
-  if (pct <= 0.25) return "hold";
-  if (pct <= 0.5) return "watch";
-  return "switch";
-}
-
-function SignalDot({ signal }: { signal: SignalDot }) {
-  const color =
-    signal === "hold" ? "bg-emerald-500" : signal === "watch" ? "bg-amber-500" : "bg-rose-500";
-  const label =
-    signal === "hold" ? "Hold — strong performer" : signal === "watch" ? "Watch — moderate underperformance" : "Consider switching";
-  return <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${color}`} title={label} />;
 }
 
 function sortValue(
@@ -469,20 +454,22 @@ function ReturnRank({
   const returnValue = group.peer ? group.peer[returnKey] : null;
   const rankValue = group.peer ? group.peer[rankKey] : null;
   const peerCount = group.peer?.peer_count ?? null;
-  // Same period's rank as the pill, so the dot and the pill always agree.
-  const signalDot = computeSignalDot(rankValue, peerCount);
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       <span className={`text-sm font-medium tabular-nums ${toneText(returnValue)}`}>{formatPct(returnValue)}</span>
       {rankValue && peerCount ? (
         <span
-          className={`inline-flex items-center gap-1 rounded-full px-1.5 py-0.5 text-[11px] font-medium tabular-nums ${rankBadgeTone(
+          className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[11px] font-medium tabular-nums ${rankBadgeTone(
             rankValue,
             peerCount
           )}`}
-          title={`Rank ${rankValue} of ${peerCount} in its peer group`}
+          title={
+            peerCount < MIN_PEERS_TO_RANK
+              ? "Too few peers to rank"
+              : `Rank ${rankValue} of ${peerCount} in its peer group`
+          }
         >
-          {signalDot && <SignalDot signal={signalDot} />}#{rankValue}/{peerCount}
+          #{rankValue}/{peerCount}
         </span>
       ) : (
         <span className="text-xs text-slate-300" title="No peer rank yet — sync peer data in Settings">
