@@ -48,6 +48,17 @@ export interface HoldingGroup {
   nav_missing: boolean;
 }
 
+// XIRR annualises, so on a young portfolio a small gain extrapolates to a
+// misleadingly large "p.a." figure. Below a money-weighted average holding
+// period of one year the dashboard shows the plain absolute return instead.
+export interface ReturnMetric {
+  kind: "xirr" | "absolute";
+  pct: number | null;
+  avgHoldingDays: number | null;
+}
+
+export const MIN_XIRR_HOLDING_DAYS = 365;
+
 export interface HistoryPoint {
   date: string;
   invested: number;
@@ -87,4 +98,17 @@ const CATEGORY_SHORT_LABELS: Record<string, string> = {
 
 export function shortCategory(category: string): string {
   return CATEGORY_SHORT_LABELS[category] ?? category;
+}
+
+// Fund name without its plan/option suffix — "Kotak MNC Fund - Direct Plan -
+// Growth" → "Kotak MNC Fund", "Invesco India Midcap Fund Direct Growth" →
+// "Invesco India Midcap Fund". Every holding is a Direct Growth plan, so the
+// suffix is noise on the dashboard; callers keep the full name in a tooltip.
+export function displayFundName(name: string): string {
+  const stripped = name
+    .replace(/[\s\-–(]*\b(direct|regular)\b(\s*plan)?\b.*$/i, "")
+    .replace(/[\s\-–(]*\b(growth|idcw|dividend)\b(\s*(option|plan))?\s*\)?\s*$/i, "")
+    .replace(/[\s\-–]+$/, "")
+    .trim();
+  return stripped || name;
 }

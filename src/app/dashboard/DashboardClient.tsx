@@ -21,10 +21,13 @@ import {
   toneText,
 } from "@/lib/format";
 import {
+  MIN_XIRR_HOLDING_DAYS,
   PERIODS,
+  displayFundName,
   periodRankKey,
   periodReturnKey,
   shortCategory,
+  type ReturnMetric,
   type DayChange,
   type GroupOwner,
   type HistoryPoint,
@@ -70,6 +73,8 @@ const SUB_GRID = "grid grid-cols-[90px_56px_96px_96px_140px_84px_84px_96px]";
 // Concentration thresholds for the hero card warning chips.
 const FUND_CONCENTRATION_PCT = 15;
 const CATEGORY_CONCENTRATION_PCT = 35;
+// Exempt from the single-fund check (matched on scheme name or category).
+const CASH_LIKE_FUND = /arbitrage|liquid|overnight|money\s*market/i;
 
 type SortKey = "value" | "pnl_pct" | "allocation" | "return" | "rank";
 type SortDir = "asc" | "desc";
@@ -126,6 +131,37 @@ function portfolioXirrPct(lots: EnrichedMFHolding[]): number | null {
   flows.push({ date: new Date(`${todayIso()}T00:00:00Z`), amount: currentValue });
   const rate = xirr(flows);
   return rate === null ? null : rate * 100;
+}
+
+// Money-weighted average holding period: Σ invested × days held / Σ invested.
+function avgHoldingDays(lots: EnrichedMFHolding[]): number | null {
+  const today = new Date(`${todayIso()}T00:00:00Z`).getTime();
+  let weighted = 0;
+  let invested = 0;
+  for (const l of lots) {
+    const amount = Number(l.invested_amount);
+    if (!(amount > 0)) continue;
+    const days = Math.max(0, (today - new Date(`${l.as_on_date}T00:00:00Z`).getTime()) / 86400000);
+    weighted += amount * days;
+    invested += amount;
+  }
+  return invested > 0 ? weighted / invested : null;
+}
+
+// XIRR once the average lot has been held a year; absolute return before
+// that (see ReturnMetric).
+function portfolioReturnMetric(lots: EnrichedMFHolding[]): ReturnMetric {
+  const avgDays = avgHoldingDays(lots);
+  if (avgDays !== null && avgDays >= MIN_XIRR_HOLDING_DAYS) {
+    return { kind: "xirr", pct: portfolioXirrPct(lots), avgHoldingDays: avgDays };
+  }
+  const invested = lots.reduce((s, l) => s + Number(l.invested_amount), 0);
+  const value = lots.reduce((s, l) => s + Number(l.current_value), 0);
+  return {
+    kind: "absolute",
+    pct: invested > 0 ? ((value - invested) / invested) * 100 : null,
+    avgHoldingDays: avgDays,
+  };
 }
 
 // How many funds trail their category average for `period` — falls back to
@@ -797,9 +833,9 @@ export default function DashboardClient({
     );
     const pnl = currentValue - totalInvested;
     const pnlPct = totalInvested > 0 ? (pnl / totalInvested) * 100 : 0;
-    const xirrPct = portfolioXirrPct(filteredHoldings);
+    const returnMetric = portfolioReturnMetric(filteredHoldings);
 
-    return { totalInvested, currentValue, pnl, pnlPct, xirrPct };
+    return { totalInvested, currentValue, pnl, pnlPct, returnMetric };
   }, [filteredHoldings]);
 
   // Counted per fund (groupedHoldings), not per lot — a fund bought via 12
@@ -821,7 +857,7 @@ export default function DashboardClient({
           label: id === "praveen" ? "Praveen" : "Geetha",
           value,
           pnlPct: invested > 0 ? ((value - invested) / invested) * 100 : 0,
-          xirrPct: portfolioXirrPct(lots),
+          returnMetric: portfolioReturnMetric(lots),
           lotCount: lots.length,
         };
       })
@@ -859,11 +895,14 @@ export default function DashboardClient({
     if (total <= 0) return [];
     const warnings: ConcentrationWarning[] = [];
     for (const g of groupedHoldings) {
+      // Cash-like funds are often a deliberate large parking spot — not a
+      // single-fund risk. They still count toward the category check below.
+      if (CASH_LIKE_FUND.test(g.scheme_name) || CASH_LIKE_FUND.test(g.category)) continue;
       const pct = (g.current_value / total) * 100;
       if (pct > FUND_CONCENTRATION_PCT) {
         warnings.push({
           key: `fund:${g.key}`,
-          label: `${g.scheme_name.replace(/\s*-\s*Direct.*$/i, "")} is ${pct.toFixed(0)}% of portfolio`,
+          label: `${displayFundName(g.scheme_name)} is ${pct.toFixed(0)}% of portfolio`,
           detail: `${g.scheme_name} is ${pct.toFixed(1)}% of this portfolio (above the ${FUND_CONCENTRATION_PCT}% single-fund guideline).`,
         });
       }
@@ -891,7 +930,8 @@ export default function DashboardClient({
       .filter((g) => !g.nav_missing && g.total_invested > 0)
       .map((g) => ({
         key: g.key,
-        name: g.scheme_name,
+        name: displayFundName(g.scheme_name),
+        fullName: g.scheme_name,
         scheme_code: g.scheme_code,
         pnl: g.pnl,
         pnl_pct: g.pnl_pct,
@@ -1870,7 +1910,7 @@ export default function DashboardClient({
           className="min-w-0 text-left text-sm font-semibold leading-snug text-slate-800 hover:text-blue-600 md:line-clamp-2"
           title={`${group.scheme_name} — view better alternatives`}
         >
-          {group.scheme_name}
+          {displayFundName(group.scheme_name)}
         </button>
         {group.scheme_code && (
           <Link
@@ -2143,7 +2183,7 @@ export default function DashboardClient({
                 value={kpis.currentValue}
                 pnl={kpis.pnl}
                 pnlPct={kpis.pnlPct}
-                xirrPct={kpis.xirrPct}
+                returnMetric={kpis.returnMetric}
                 dayChange={history?.day_change ?? null}
                 warnings={concentrationWarnings}
               />
@@ -2292,7 +2332,10 @@ export default function DashboardClient({
                 <div className="mt-3 rounded-lg border border-rose-200 bg-rose-50 px-4 py-3" role="alert">
                   <p className="text-sm text-rose-700">
                     Delete all {deleteGroupTarget.lot_count} lots of{" "}
-                    <span className="font-semibold">{deleteGroupTarget.scheme_name}</span> totalling{" "}
+                    <span className="font-semibold" title={deleteGroupTarget.scheme_name}>
+                      {displayFundName(deleteGroupTarget.scheme_name)}
+                    </span>{" "}
+                    totalling{" "}
                     {formatInrFull(deleteGroupTarget.total_invested)}? This cannot be undone.
                   </p>
                   <div className="mt-2 flex items-center gap-2">

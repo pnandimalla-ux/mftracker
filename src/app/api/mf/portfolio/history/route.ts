@@ -58,7 +58,7 @@ export async function GET(request: Request) {
     }
 
     const codes = Array.from(new Set(lots.map((l) => l.scheme_code).filter((c): c is string => !!c)));
-    const histories = await getNavHistories(codes);
+    const { histories, dayChangeStale } = await getNavHistories(codes);
 
     const todayIso = new Date().toISOString().slice(0, 10);
     const firstIso = lots.reduce((min, l) => (l.as_on_date < min ? l.as_on_date : min), todayIso);
@@ -67,10 +67,12 @@ export async function GET(request: Request) {
     const points = buildPortfolioSeries(lots, histories, dates);
     // Day change only over lots that have a real NAV feed; manual-code lots
     // never move, so they'd only dilute it — but if any real fund is missing
-    // its history, computeDayChange returns null rather than a partial figure.
+    // its history, or its history is still stale after a refresh,
+    // computeDayChange returns null rather than a partial or multi-day figure.
     const day_change = computeDayChange(
       lots.filter((l) => l.scheme_code),
-      histories
+      histories,
+      dayChangeStale
     );
 
     return NextResponse.json({

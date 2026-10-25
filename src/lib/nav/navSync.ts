@@ -1,5 +1,5 @@
 import { createServiceRoleClient } from "@/lib/supabase/serviceRoleClient";
-import { fetchLatestNav, searchDirectGrowthScheme } from "@/lib/mfapi";
+import { fetchLatestNav, refreshNavAndHistory, searchDirectGrowthScheme } from "@/lib/mfapi";
 import { isRealSchemeCode } from "@/lib/peers/peerSync";
 
 // Schemes are fetched a few at a time rather than strictly one-by-one: a
@@ -20,11 +20,25 @@ export interface SyncSingleSchemeResult {
   nav_date: string;
 }
 
-// Fetches the latest NAV for one scheme from mfapi.in and upserts it into
-// mf_nav_cache. Throws on failure so callers can decide how to handle it.
+// Per-request mfapi.in timeout during a sync. Worst case is
+// ceil(schemes / SYNC_CONCURRENCY) × this, which must stay inside the sync
+// route's 60s maxDuration alongside the tier1 peer sync that follows it.
+const SYNC_FETCH_TIMEOUT_MS = 8000;
+
+// Fetches one scheme's full NAV history from mfapi.in and upserts both the
+// latest NAV and nav_history into mf_nav_cache, so the value chart / day
+// change are as fresh as the headline NAV. If the full-history request fails,
+// falls back to the lightweight latest-NAV endpoint so the NAV itself still
+// updates. Throws only when neither works.
 export async function syncSingleScheme(
   scheme_code: string
 ): Promise<SyncSingleSchemeResult> {
+  try {
+    return await refreshNavAndHistory(scheme_code, SYNC_FETCH_TIMEOUT_MS);
+  } catch (err) {
+    console.error(`Full NAV history refresh failed for ${scheme_code}, falling back to latest NAV:`, err);
+  }
+
   const latest = await fetchLatestNav(scheme_code);
   if (!latest) {
     throw new Error(`No NAV data for scheme ${scheme_code}`);
@@ -84,8 +98,9 @@ async function syncSchemeCodes(schemeCodes: string[]): Promise<SyncAllHoldingsRe
 // current value = invested) and never gets a peer rank. The import-time
 // search was a plain substring match that missed common spelling
 // differences ("Midcap" vs "Mid Cap", "and" vs "&"); searchDirectGrowthScheme
-// now tries those variants, so retry every placeholder here and, on a
-// confident match, re-point the lots (and their ledger rows) at the real code.
+// now tries those variants, so retry every placeholder here and, only on a
+// confident Direct+Growth match (strict mode), re-point the lots (and their
+// ledger rows) at the real code.
 async function resolveManualSchemeCodes(
   userId: string
 ): Promise<{ scheme_name: string; scheme_code: string }[]> {
@@ -111,7 +126,9 @@ async function resolveManualSchemeCodes(
 
   await Promise.all(
     names.map(async (name) => {
-      const match = await searchDirectGrowthScheme(name);
+      // Strict: a Direct+Growth match scoring >= 0.75 or nothing — these
+      // lots are re-pointed without anyone reviewing the match.
+      const match = await searchDirectGrowthScheme(name, { strict: true });
       if (!match || !isRealSchemeCode(match.scheme_code)) return;
       const oldCodes = Array.from(placeholdersByName.get(name) ?? []);
       try {

@@ -136,7 +136,17 @@ async function runMfapiSearch(q: string): Promise<MfapiSearchResult[]> {
 // When the literal name finds nothing at all, alternative spellings are
 // tried (see searchQueryVariants), accepting only a confident Direct+Growth
 // name match — a wrong scheme_code is worse than a manual placeholder.
-export async function searchDirectGrowthScheme(query: string): Promise<MfapiSchemeMatch | null> {
+//
+// `strict` applies that confidence bar to the literal search too and never
+// falls back to an arbitrary first result — used when silently re-pointing
+// existing lots (navSync), where nobody reviews the match. Imports keep the
+// lenient behaviour because the user confirms the preview before saving.
+const CONFIDENT_MATCH_SCORE = 0.75;
+
+export async function searchDirectGrowthScheme(
+  query: string,
+  options: { strict?: boolean } = {}
+): Promise<MfapiSchemeMatch | null> {
   try {
     const variants = searchQueryVariants(query);
     for (let i = 0; i < variants.length; i++) {
@@ -150,12 +160,12 @@ export async function searchDirectGrowthScheme(query: string): Promise<MfapiSche
         .sort((a, b) => b.score - a.score);
 
       const best = candidates[0];
-      if (i === 0) {
+      if (i === 0 && !options.strict) {
         const match = best?.r ?? results[0];
         if (!match || typeof match.schemeCode === "undefined") return null;
         return { scheme_code: String(match.schemeCode), scheme_name: String(match.schemeName) };
       }
-      if (best && best.score >= 0.75) {
+      if (best && best.score >= CONFIDENT_MATCH_SCORE) {
         return { scheme_code: String(best.r.schemeCode), scheme_name: String(best.r.schemeName) };
       }
     }
@@ -314,9 +324,10 @@ async function getCachedNavHistory(
 }
 
 async function fetchAndCacheNavHistory(
-  schemeCode: string
+  schemeCode: string,
+  timeoutMs = MFAPI_TIMEOUT_MS
 ): Promise<{ history: MfapiHistoryEntry[]; schemeName: string } | null> {
-  const res = await fetchWithTimeout(`https://api.mfapi.in/mf/${schemeCode}`);
+  const res = await fetchWithTimeout(`https://api.mfapi.in/mf/${schemeCode}`, timeoutMs);
   if (!res.ok) return null;
 
   const json = await res.json();
@@ -341,19 +352,100 @@ async function fetchAndCacheNavHistory(
   return { history, schemeName };
 }
 
+// One full-history fetch that refreshes both the latest NAV and the cached
+// nav_history — used by Sync NAV / the daily cron so the value chart and
+// day change never lag behind the headline NAV. Throws on failure.
+export async function refreshNavAndHistory(
+  schemeCode: string,
+  timeoutMs = 10000
+): Promise<{ nav: number; nav_date: string }> {
+  const res = await fetchWithTimeout(`https://api.mfapi.in/mf/${schemeCode}`, timeoutMs);
+  if (!res.ok) throw new Error(`mfapi.in returned ${res.status} for scheme ${schemeCode}`);
+
+  const json = await res.json();
+  const history: MfapiHistoryEntry[] = Array.isArray(json?.data) ? json.data : [];
+  const latest = history[0];
+  const nav = Number(latest?.nav);
+  if (!latest || !Number.isFinite(nav) || nav <= 0) {
+    throw new Error(`No NAV data for scheme ${schemeCode}`);
+  }
+  const nav_date = toIsoDate(String(latest.date));
+  const schemeName = typeof json?.meta?.scheme_name === "string" ? json.meta.scheme_name : null;
+  const now = new Date().toISOString();
+
+  await ensureNavHistoryColumns();
+  const supabase = createServiceRoleClient();
+  const { error } = await supabase.from("mf_nav_cache").upsert({
+    scheme_code: schemeCode,
+    scheme_name: schemeName,
+    nav,
+    nav_date,
+    fetched_at: now,
+    nav_history: history,
+    nav_history_fetched_at: now,
+  });
+  if (error) throw new Error(`Failed to upsert nav cache for ${schemeCode}: ${error.message}`);
+
+  return { nav, nav_date };
+}
+
 export interface NavPoint {
   date: string; // ISO yyyy-mm-dd
   nav: number;
 }
 
+// A day change is only meaningful between consecutive trading days.
+const MAX_DAY_CHANGE_GAP_DAYS = 4;
+const DAY_MS_UTC = 24 * 60 * 60 * 1000;
+
+function isoDayDiff(a: string, b: string): number {
+  return Math.round((new Date(`${b}T00:00:00Z`).getTime() - new Date(`${a}T00:00:00Z`).getTime()) / DAY_MS_UTC);
+}
+
+// Weekday before `iso` (exchange holidays aren't known here — the gap check
+// below tolerates those).
+function previousTradingDay(iso: string): string {
+  let d = new Date(new Date(`${iso}T00:00:00Z`).getTime() - DAY_MS_UTC);
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d = new Date(d.getTime() - DAY_MS_UTC);
+  return d.toISOString().slice(0, 10);
+}
+
+function withLatest(points: NavPoint[], latest: NavPoint | undefined): NavPoint[] {
+  if (latest && (points.length === 0 || latest.date > points[points.length - 1].date)) {
+    return [...points, latest];
+  }
+  return points;
+}
+
+// True when the last two points can't give a latest-vs-previous-trading-day
+// change: they're more than MAX_DAY_CHANGE_GAP_DAYS apart, or the stored
+// history ends before the trading day preceding the cached latest NAV (so
+// appending that latest NAV would produce a multi-day change).
+function isDayChangeStale(history: NavPoint[], latest: NavPoint | undefined): boolean {
+  const merged = withLatest(history, latest);
+  if (merged.length < 2) return true;
+  const prev = merged[merged.length - 2];
+  const last = merged[merged.length - 1];
+  if (isoDayDiff(prev.date, last.date) > MAX_DAY_CHANGE_GAP_DAYS) return true;
+  if (latest) {
+    const historyLast = history[history.length - 1]?.date;
+    if (!historyLast || historyLast < previousTradingDay(latest.date)) return true;
+  }
+  return false;
+}
+
 // NAV histories (ascending by date) for many schemes at once — for charting,
 // so a cached history is used even past its 24h TTL (the latest cached NAV
 // from the daily sync is appended if it's newer). Schemes with no cached
-// history are fetched from mfapi.in in parallel and cached; one that doesn't
-// answer within the mfapi timeout is simply left out of the result.
-export async function getNavHistories(schemeCodes: string[]): Promise<Map<string, NavPoint[]>> {
+// history, or whose history is too old to give a one-trading-day change, are
+// fetched from mfapi.in in parallel and cached; one that doesn't answer within
+// the mfapi timeout is left out (no history) or reported in `dayChangeStale`.
+export async function getNavHistories(
+  schemeCodes: string[]
+): Promise<{ histories: Map<string, NavPoint[]>; dayChangeStale: Set<string> }> {
   const result = new Map<string, NavPoint[]>();
-  if (schemeCodes.length === 0) return result;
+  const dayChangeStale = new Set<string>();
+  if (schemeCodes.length === 0) return { histories: result, dayChangeStale };
 
   const toPoints = (rows: MfapiHistoryEntry[]): NavPoint[] =>
     rows
@@ -383,9 +475,11 @@ export async function getNavHistories(schemeCodes: string[]): Promise<Map<string
     }
   }
 
-  const missing = schemeCodes.filter((c) => !result.has(c));
+  const toFetch = schemeCodes.filter(
+    (c) => !result.has(c) || isDayChangeStale(result.get(c)!, latestByCode.get(c))
+  );
   await Promise.all(
-    missing.map(async (code) => {
+    toFetch.map(async (code) => {
       try {
         const fetched = await fetchAndCacheNavHistory(code);
         if (fetched) result.set(code, toPoints(fetched.history));
@@ -397,12 +491,11 @@ export async function getNavHistories(schemeCodes: string[]): Promise<Map<string
 
   for (const [code, points] of Array.from(result.entries())) {
     const latest = latestByCode.get(code);
-    if (latest && (points.length === 0 || latest.date > points[points.length - 1].date)) {
-      points.push(latest);
-    }
+    if (isDayChangeStale(points, latest)) dayChangeStale.add(code);
+    result.set(code, withLatest(points, latest));
   }
 
-  return result;
+  return { histories: result, dayChangeStale };
 }
 
 async function fetchNavForDateFromHistory(

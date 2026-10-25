@@ -30,7 +30,26 @@ import {
   formatSignedInrShort,
   toneText,
 } from "@/lib/format";
-import type { DayChange, HistoryPoint } from "./types";
+import { MIN_XIRR_HOLDING_DAYS, type DayChange, type HistoryPoint, type ReturnMetric } from "./types";
+
+const ABSOLUTE_RETURN_TOOLTIP = "XIRR shown once avg holding ≥ 1 year";
+
+function returnMetricLabel(m: ReturnMetric): string {
+  return m.kind === "xirr" ? "XIRR" : "Return";
+}
+
+function returnMetricTooltip(m: ReturnMetric): string {
+  if (m.kind === "xirr") return "Annualised return, accounting for when each lot was bought";
+  const days = m.avgHoldingDays === null ? null : Math.round(m.avgHoldingDays);
+  return days === null || days >= MIN_XIRR_HOLDING_DAYS
+    ? ABSOLUTE_RETURN_TOOLTIP
+    : `${ABSOLUTE_RETURN_TOOLTIP} (currently ${days} days)`;
+}
+
+function formatReturnMetric(m: ReturnMetric, digits = 2): string {
+  if (m.pct === null) return "—";
+  return m.kind === "xirr" ? `${formatPct(m.pct, digits)} p.a.` : formatPct(m.pct, digits);
+}
 
 // --- Hero card ---
 
@@ -44,14 +63,14 @@ export function HeroCard({
   value,
   pnl,
   pnlPct,
-  xirrPct,
+  returnMetric,
   dayChange,
   warnings,
 }: {
   value: number;
   pnl: number;
   pnlPct: number;
-  xirrPct: number | null;
+  returnMetric: ReturnMetric;
   dayChange: DayChange | null;
   warnings: ConcentrationWarning[];
 }) {
@@ -70,11 +89,14 @@ export function HeroCard({
           </dd>
         </div>
         <div>
-          <dt className="text-xs text-slate-500" title="Annualised return, accounting for when each lot was bought">
-            XIRR
+          <dt className="text-xs text-slate-500" title={returnMetricTooltip(returnMetric)}>
+            {returnMetricLabel(returnMetric)}
           </dt>
-          <dd className={`font-semibold tabular-nums ${toneText(xirrPct, "text-slate-500")}`}>
-            {xirrPct === null ? "—" : `${formatPct(xirrPct)} p.a.`}
+          <dd
+            className={`font-semibold tabular-nums ${toneText(returnMetric.pct, "text-slate-500")}`}
+            title={returnMetricTooltip(returnMetric)}
+          >
+            {formatReturnMetric(returnMetric)}
           </dd>
         </div>
         {dayChange && (
@@ -239,6 +261,24 @@ const HISTORY_RANGES: { id: HistoryRange; label: string; days: number | null }[]
 const VALUE_COLOR = "#6366f1";
 const INVESTED_COLOR = "#94a3b8";
 
+// Round y-axis ticks (₹5L / ₹10L / ₹15L …): picks a 1/2/2.5/5 × 10^k step
+// giving roughly four intervals, and snaps the domain outward to it.
+function niceTicks(min: number, max: number, targetIntervals = 4): { min: number; max: number; ticks: number[] } {
+  if (!(max > min)) {
+    const pad = Math.max(1000, Math.abs(max) * 0.1);
+    min -= pad;
+    max += pad;
+  }
+  const rough = (max - min) / targetIntervals;
+  const magnitude = Math.pow(10, Math.floor(Math.log10(rough)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * magnitude).find((s) => s >= rough) ?? 10 * magnitude;
+  const lo = Math.max(0, Math.floor(min / step) * step);
+  const hi = Math.ceil(max / step) * step;
+  const ticks: number[] = [];
+  for (let t = lo; t <= hi + step / 2; t += step) ticks.push(Math.round(t));
+  return { min: lo, max: hi, ticks };
+}
+
 function formatMonthTick(iso: string): string {
   const [y, m] = iso.split("-").map(Number);
   return new Date(y, m - 1, 1).toLocaleString("en-IN", { month: "short", year: "2-digit" });
@@ -272,6 +312,11 @@ export function ValueHistoryCard({
     return inRange.length >= 2 ? inRange : points.slice(-2);
   }, [points, range]);
 
+  const yAxis = useMemo(() => {
+    const values = visible.flatMap((p) => [p.value, p.invested]);
+    return values.length > 0 ? niceTicks(Math.min(...values), Math.max(...values)) : null;
+  }, [visible]);
+
   const first = visible[0];
   const last = visible[visible.length - 1];
   // Change in value over the range net of new money put in during it.
@@ -284,7 +329,7 @@ export function ValueHistoryCard({
           <h3 className="text-sm font-semibold text-slate-700">Portfolio value over time</h3>
           {rangeGain !== null && !loading && !error && (
             <p className={`text-xs tabular-nums ${toneText(rangeGain)}`}>
-              {formatSignedInrShort(rangeGain, 2)} market gain in this range
+              {formatInrShort(Math.abs(rangeGain), 2)} market {rangeGain >= 0 ? "gain" : "loss"} in this range
             </p>
           )}
         </div>
@@ -336,12 +381,14 @@ export function ValueHistoryCard({
                 minTickGap={28}
               />
               <YAxis
-                tickFormatter={(v: number) => formatInrShort(v, 0)}
+                tickFormatter={(v: number) => formatInrShort(v, 2)}
                 tick={{ fontSize: 11, fill: "#64748b" }}
                 tickLine={false}
                 axisLine={false}
                 width={52}
-                domain={["auto", "auto"]}
+                domain={yAxis ? [yAxis.min, yAxis.max] : ["auto", "auto"]}
+                ticks={yAxis?.ticks}
+                interval={0}
               />
               <Tooltip
                 content={({ active, payload }) => {
@@ -402,7 +449,9 @@ export function ValueHistoryCard({
 
 export interface MoverRow {
   key: string;
+  // Display name (plan/option suffix stripped); fullName goes in the tooltip.
   name: string;
+  fullName: string;
   scheme_code: string | null;
   pnl: number;
   pnl_pct: number;
@@ -422,12 +471,12 @@ function MoverList({ title, rows }: { title: string; rows: MoverRow[] }) {
                 <Link
                   href={`/fund/${r.scheme_code}`}
                   className="min-w-0 flex-1 truncate text-slate-700 hover:text-blue-600"
-                  title={r.name}
+                  title={r.fullName}
                 >
                   {r.name}
                 </Link>
               ) : (
-                <span className="min-w-0 flex-1 truncate text-slate-700" title={r.name}>
+                <span className="min-w-0 flex-1 truncate text-slate-700" title={r.fullName}>
                   {r.name}
                 </span>
               )}
@@ -463,7 +512,7 @@ export interface OwnerSummary {
   label: string;
   value: number;
   pnlPct: number;
-  xirrPct: number | null;
+  returnMetric: ReturnMetric;
 }
 
 export function OwnerCompareStrip({
@@ -503,9 +552,12 @@ export function OwnerCompareStrip({
             <p className="text-sm font-semibold tabular-nums text-slate-900">{formatInrShort(r.value, 2)}</p>
             <p className="text-xs tabular-nums">
               <span className={toneText(r.pnlPct)}>{formatPct(r.pnlPct, 1)}</span>
-              <span className="text-slate-400"> · XIRR </span>
-              <span className={toneText(r.xirrPct, "text-slate-400")}>
-                {r.xirrPct === null ? "—" : formatPct(r.xirrPct, 1)}
+              <span className="text-slate-400" title={returnMetricTooltip(r.returnMetric)}>
+                {" "}
+                · {returnMetricLabel(r.returnMetric)}{" "}
+              </span>
+              <span className={toneText(r.returnMetric.pct, "text-slate-400")} title={returnMetricTooltip(r.returnMetric)}>
+                {formatReturnMetric(r.returnMetric, 1)}
               </span>
             </p>
           </div>

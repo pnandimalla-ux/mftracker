@@ -107,22 +107,33 @@ export function buildPortfolioSeries(
   });
 }
 
-// Latest vs previous published NAV, summed over lots. Only returned when every
-// lot has a history with at least two points — a partial figure would be
-// misleading next to the full-portfolio value.
+// Same bound as getNavHistories: beyond this the "previous" point isn't the
+// previous trading day.
+const MAX_DAY_CHANGE_GAP_DAYS = 4;
+
+// Latest NAV vs the previous trading day's NAV, summed over lots. Only
+// returned when every lot has a fresh history (none in `dayChangeStale`, last
+// two points at most MAX_DAY_CHANGE_GAP_DAYS apart) — a partial or multi-day
+// figure would be misleading next to the full-portfolio value.
 export function computeDayChange(
   lots: HistoryLot[],
-  histories: Map<string, NavPoint[]>
+  histories: Map<string, NavPoint[]>,
+  dayChangeStale: Set<string> = new Set()
 ): DayChange | null {
   if (lots.length === 0) return null;
   let amount = 0;
   let previousValue = 0;
   let asOf = "";
   for (const lot of lots) {
-    const history = lot.scheme_code ? histories.get(lot.scheme_code) : undefined;
+    if (!lot.scheme_code || dayChangeStale.has(lot.scheme_code)) return null;
+    const history = histories.get(lot.scheme_code);
     if (!history || history.length < 2) return null;
     const latest = history[history.length - 1];
     const prev = history[history.length - 2];
+    const gapDays = Math.round(
+      (new Date(`${latest.date}T00:00:00Z`).getTime() - new Date(`${prev.date}T00:00:00Z`).getTime()) / DAY_MS
+    );
+    if (gapDays > MAX_DAY_CHANGE_GAP_DAYS) return null;
     // Bought at the latest NAV — it had no previous-day value to change from.
     if (lot.as_on_date >= latest.date) continue;
     amount += lot.units * (latest.nav - prev.nav);
