@@ -341,6 +341,70 @@ async function fetchAndCacheNavHistory(
   return { history, schemeName };
 }
 
+export interface NavPoint {
+  date: string; // ISO yyyy-mm-dd
+  nav: number;
+}
+
+// NAV histories (ascending by date) for many schemes at once — for charting,
+// so a cached history is used even past its 24h TTL (the latest cached NAV
+// from the daily sync is appended if it's newer). Schemes with no cached
+// history are fetched from mfapi.in in parallel and cached; one that doesn't
+// answer within the mfapi timeout is simply left out of the result.
+export async function getNavHistories(schemeCodes: string[]): Promise<Map<string, NavPoint[]>> {
+  const result = new Map<string, NavPoint[]>();
+  if (schemeCodes.length === 0) return result;
+
+  const toPoints = (rows: MfapiHistoryEntry[]): NavPoint[] =>
+    rows
+      .map((r) => ({ date: toIsoDate(r.date), nav: Number(r.nav) }))
+      .filter((p) => Number.isFinite(p.nav) && p.nav > 0)
+      .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+
+  let cachedRows: { scheme_code: string; nav: number | null; nav_date: string | null; nav_history: unknown }[] = [];
+  try {
+    const supabase = createServiceRoleClient();
+    const { data } = await supabase
+      .from("mf_nav_cache")
+      .select("scheme_code, nav, nav_date, nav_history")
+      .in("scheme_code", schemeCodes);
+    cachedRows = (data ?? []) as typeof cachedRows;
+  } catch (err) {
+    console.error("getNavHistories: failed to read mf_nav_cache:", err);
+  }
+
+  const latestByCode = new Map<string, NavPoint>();
+  for (const row of cachedRows) {
+    if (row.nav_date && Number(row.nav) > 0) {
+      latestByCode.set(row.scheme_code, { date: row.nav_date, nav: Number(row.nav) });
+    }
+    if (Array.isArray(row.nav_history) && row.nav_history.length > 0) {
+      result.set(row.scheme_code, toPoints(row.nav_history as MfapiHistoryEntry[]));
+    }
+  }
+
+  const missing = schemeCodes.filter((c) => !result.has(c));
+  await Promise.all(
+    missing.map(async (code) => {
+      try {
+        const fetched = await fetchAndCacheNavHistory(code);
+        if (fetched) result.set(code, toPoints(fetched.history));
+      } catch (err) {
+        console.error(`getNavHistories: fetch failed for ${code}:`, err);
+      }
+    })
+  );
+
+  for (const [code, points] of Array.from(result.entries())) {
+    const latest = latestByCode.get(code);
+    if (latest && (points.length === 0 || latest.date > points[points.length - 1].date)) {
+      points.push(latest);
+    }
+  }
+
+  return result;
+}
+
 async function fetchNavForDateFromHistory(
   schemeCode: string,
   isoDate: string
