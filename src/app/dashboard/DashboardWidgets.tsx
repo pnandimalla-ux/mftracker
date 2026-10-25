@@ -32,23 +32,30 @@ import {
 } from "@/lib/format";
 import { MIN_XIRR_HOLDING_DAYS, type DayChange, type HistoryPoint, type ReturnMetric } from "./types";
 
-const ABSOLUTE_RETURN_TOOLTIP = "XIRR shown once avg holding ≥ 1 year";
+const XIRR_TOOLTIP = "Annualised return, accounting for when each lot was bought";
 
-function returnMetricLabel(m: ReturnMetric): string {
-  return m.kind === "xirr" ? "XIRR" : "Return";
+function formatXirr(m: ReturnMetric, digits = 2): string {
+  return m.pct === null ? "—" : `${formatPct(m.pct, digits)} p.a.`;
 }
 
-function returnMetricTooltip(m: ReturnMetric): string {
-  if (m.kind === "xirr") return "Annualised return, accounting for when each lot was bought";
+// When the money-weighted average holding period reaches a year, assuming
+// no new money goes in (each day held adds a day to the average).
+function xirrAvailableFrom(m: ReturnMetric): Date | null {
+  if (m.avgHoldingDays === null) return null;
+  const daysLeft = Math.max(0, Math.ceil(MIN_XIRR_HOLDING_DAYS - m.avgHoldingDays));
+  const d = new Date();
+  d.setDate(d.getDate() + daysLeft);
+  return d;
+}
+
+function xirrPendingTooltip(m: ReturnMetric): string {
   const days = m.avgHoldingDays === null ? null : Math.round(m.avgHoldingDays);
-  return days === null || days >= MIN_XIRR_HOLDING_DAYS
-    ? ABSOLUTE_RETURN_TOOLTIP
-    : `${ABSOLUTE_RETURN_TOOLTIP} (currently ${days} days)`;
-}
-
-function formatReturnMetric(m: ReturnMetric, digits = 2): string {
-  if (m.pct === null) return "—";
-  return m.kind === "xirr" ? `${formatPct(m.pct, digits)} p.a.` : formatPct(m.pct, digits);
+  return (
+    "XIRR annualises returns, so on money held for less than a year it exaggerates small moves. " +
+    "It's shown once the average holding period (weighted by amount invested) reaches 1 year" +
+    (days !== null ? ` — currently ${days} days` : "") +
+    ". New investments push that date out. Until then, Total P&L % is your return so far."
+  );
 }
 
 // --- Hero card ---
@@ -88,17 +95,29 @@ export function HeroCard({
             {formatSignedInrShort(pnl, 2)} <span className="font-medium">({formatPct(pnlPct)})</span>
           </dd>
         </div>
-        <div>
-          <dt className="text-xs text-slate-500" title={returnMetricTooltip(returnMetric)}>
-            {returnMetricLabel(returnMetric)}
-          </dt>
-          <dd
-            className={`font-semibold tabular-nums ${toneText(returnMetric.pct, "text-slate-500")}`}
-            title={returnMetricTooltip(returnMetric)}
-          >
-            {formatReturnMetric(returnMetric)}
-          </dd>
-        </div>
+        {returnMetric.kind === "xirr" ? (
+          <div>
+            <dt className="text-xs text-slate-500" title={XIRR_TOOLTIP}>
+              XIRR
+            </dt>
+            <dd className={`font-semibold tabular-nums ${toneText(returnMetric.pct, "text-slate-500")}`}>
+              {formatXirr(returnMetric)}
+            </dd>
+          </div>
+        ) : (
+          // Absolute return would just repeat Total P&L % — say when XIRR arrives instead.
+          <div title={xirrPendingTooltip(returnMetric)}>
+            <dt className="text-xs text-slate-500">XIRR</dt>
+            <dd className="font-medium text-slate-500">
+              {(() => {
+                const from = xirrAvailableFrom(returnMetric);
+                return from
+                  ? `from ${from.toLocaleDateString("en-IN", { month: "short", year: "numeric" })}`
+                  : "—";
+              })()}
+            </dd>
+          </div>
+        )}
         {dayChange && (
           <div>
             <dt className="text-xs text-slate-500" title={`Latest NAV (${dayChange.as_of}) vs previous NAV`}>
@@ -188,9 +207,11 @@ export interface AllocationSlice {
 export function AllocationCard({ slices }: { slices: AllocationSlice[] }) {
   const total = slices.reduce((s, c) => s + c.value, 0);
   return (
-    <div className="rounded-2xl border border-slate-200 bg-white p-4">
+    // flex-col + flex-1 body: when the value chart beside it makes the row
+    // taller, the donut and legend centre vertically instead of leaving a gap.
+    <div className="flex flex-col rounded-2xl border border-slate-200 bg-white p-4">
       <h3 className="text-sm font-semibold text-slate-700">Allocation by category</h3>
-      <div className="mt-3 flex flex-col items-center gap-4 sm:flex-row sm:items-center">
+      <div className="mt-3 flex flex-1 flex-col items-center justify-center gap-4 sm:flex-row sm:items-center">
         <div className="h-44 w-44 shrink-0">
           <ResponsiveContainer width="100%" height="100%">
             <PieChart>
@@ -312,6 +333,23 @@ export function ValueHistoryCard({
     return inRange.length >= 2 ? inRange : points.slice(-2);
   }, [points, range]);
 
+  // The last year has weekly points, so default ticks repeated month labels.
+  // Explicit ticks: the first point of each month (≤ 1Y) or quarter (3Y/All),
+  // so every "Mon YY" label is unique.
+  const xTicks = useMemo(() => {
+    const quarterly = range === "3y" || range === "all";
+    const seen = new Set<string>();
+    const ticks: string[] = [];
+    for (const p of visible) {
+      const [y, m] = p.date.split("-").map(Number);
+      const bucket = quarterly ? `${y}-Q${Math.floor((m - 1) / 3)}` : `${y}-${m}`;
+      if (seen.has(bucket)) continue;
+      seen.add(bucket);
+      ticks.push(p.date);
+    }
+    return ticks;
+  }, [visible, range]);
+
   const yAxis = useMemo(() => {
     const values = visible.flatMap((p) => [p.value, p.invested]);
     return values.length > 0 ? niceTicks(Math.min(...values), Math.max(...values)) : null;
@@ -374,6 +412,7 @@ export function ValueHistoryCard({
               <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
               <XAxis
                 dataKey="date"
+                ticks={xTicks}
                 tickFormatter={formatMonthTick}
                 tick={{ fontSize: 11, fill: "#64748b" }}
                 tickLine={false}
@@ -552,13 +591,18 @@ export function OwnerCompareStrip({
             <p className="text-sm font-semibold tabular-nums text-slate-900">{formatInrShort(r.value, 2)}</p>
             <p className="text-xs tabular-nums">
               <span className={toneText(r.pnlPct)}>{formatPct(r.pnlPct, 1)}</span>
-              <span className="text-slate-400" title={returnMetricTooltip(r.returnMetric)}>
-                {" "}
-                · {returnMetricLabel(r.returnMetric)}{" "}
-              </span>
-              <span className={toneText(r.returnMetric.pct, "text-slate-400")} title={returnMetricTooltip(r.returnMetric)}>
-                {formatReturnMetric(r.returnMetric, 1)}
-              </span>
+              {/* Absolute return equals the P&L % above, so only XIRR adds anything here. */}
+              {r.returnMetric.kind === "xirr" && (
+                <>
+                  <span className="text-slate-400" title={XIRR_TOOLTIP}>
+                    {" "}
+                    · XIRR{" "}
+                  </span>
+                  <span className={toneText(r.returnMetric.pct, "text-slate-400")}>
+                    {formatXirr(r.returnMetric, 1)}
+                  </span>
+                </>
+              )}
             </p>
           </div>
         </button>

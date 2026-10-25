@@ -244,7 +244,8 @@ function rankBadgeTone(rank: number, peerCount: number) {
 type SignalDot = "hold" | "watch" | "switch";
 
 // Cheap client-side approximation of the alternatives panel's rule-based
-// signal, using the fund's own 1Y rank/peer_count (already loaded) so the
+// signal, using the fund's rank/peer_count for the selected return period
+// (already loaded) so the
 // dashboard doesn't need an extra API call per row just to show a dot.
 function computeSignalDot(rank: number | null, peerCount: number | null): SignalDot | null {
   if (!rank || !peerCount) return null;
@@ -468,7 +469,8 @@ function ReturnRank({
   const returnValue = group.peer ? group.peer[returnKey] : null;
   const rankValue = group.peer ? group.peer[rankKey] : null;
   const peerCount = group.peer?.peer_count ?? null;
-  const signalDot = computeSignalDot(group.peer?.rank_1y ?? null, peerCount);
+  // Same period's rank as the pill, so the dot and the pill always agree.
+  const signalDot = computeSignalDot(rankValue, peerCount);
   return (
     <div className="flex flex-wrap items-center gap-1.5">
       <span className={`text-sm font-medium tabular-nums ${toneText(returnValue)}`}>{formatPct(returnValue)}</span>
