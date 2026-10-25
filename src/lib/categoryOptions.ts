@@ -8,6 +8,7 @@ export const CATEGORY_OPTIONS = [
   "Small Cap",
   "Large & Mid Cap",
   "Flexi Cap",
+  "Focused",
   "ELSS",
   "Value",
   "Sectoral/Thematic",

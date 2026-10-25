@@ -12,6 +12,10 @@ interface Rule {
   category: string;
   confidence: "high" | "medium";
   test: (name: string) => string | null;
+  // Rule-set version that introduced this rule. detectCategoryLegacy skips
+  // anything newer than v1 so scripts/recategorise-holdings.ts can tell an
+  // auto-assigned category (matches the old rules) from a user-edited one.
+  since?: 2;
 }
 
 function includesAny(name: string, keywords: string[]): string | null {
@@ -24,6 +28,9 @@ function includesAny(name: string, keywords: string[]): string | null {
 // Checked in this exact order — first match wins.
 const RULES: Rule[] = [
   // Priority 1 — exact SEBI category keywords.
+  // Focused first: e.g. "Sundaram Focused Fund (Formerly ... Focused Multicap
+  // Fund)" would otherwise hit the multi cap rule.
+  { category: "Focused", confidence: "high", since: 2, test: (n) => includesAny(n, ["focused"]) },
   { category: "Large & Mid Cap", confidence: "high", test: (n) => includesAny(n, ["large & mid cap", "large and mid cap"]) },
   { category: "Flexi Cap", confidence: "high", test: (n) => includesAny(n, ["multi cap", "multicap"]) },
   { category: "Flexi Cap", confidence: "high", test: (n) => includesAny(n, ["flexi cap", "flexicap"]) },
@@ -77,6 +84,16 @@ const RULES: Rule[] = [
     test: (n) => includesAny(n, ["nasdaq", "s&p 500", "global", "international", "overseas", "world", "us equity"]),
   },
   { category: "Commodity", confidence: "high", test: (n) => includesAny(n, ["gold", "silver"]) },
+  // Multi-asset → Hybrid, checked before Fund of Funds — but a multi-asset
+  // FoF wrapper ("... Multi Asset Omni FoF", "Passive Multi-Asset Fund of
+  // Funds") stays Fund of Funds.
+  {
+    category: "Hybrid",
+    confidence: "high",
+    since: 2,
+    test: (n) =>
+      n.includes("fund of fund") || /\bfof\b/.test(n) ? null : includesAny(n, ["multi asset", "multi-asset"]),
+  },
   { category: "Fund of Funds", confidence: "high", test: (n) => includesAny(n, ["fund of fund", "fof"]) },
   {
     category: "Value",
@@ -87,6 +104,13 @@ const RULES: Rule[] = [
   { category: "Value", confidence: "high", test: (n) => includesAny(n, ["dividend yield"]) },
 
   // Priority 2 — AMC + thematic keywords.
+  {
+    category: "Sectoral/Thematic",
+    confidence: "high",
+    since: 2,
+    test: (n) =>
+      includesAny(n, ["defence", "defense", "manufacturing", "manufacture in india", "innovation", "special opportunities"]),
+  },
   { category: "Sectoral/Thematic", confidence: "high", test: (n) => includesAny(n, ["pharma", "healthcare", "hospital"]) },
   { category: "Sectoral/Thematic", confidence: "high", test: (n) => includesAny(n, ["technology", "tech", "digital", "it fund"]) },
   {
@@ -109,9 +133,23 @@ const RULES: Rule[] = [
 ];
 
 export function detectCategory(fundName: string): DetectCategoryResult {
+  return detectWithRules(fundName, RULES);
+}
+
+// The v1 rule set (before the Focused / defence-manufacturing-innovation /
+// multi-asset rules). Only for the one-off recategorisation script — never
+// use it to categorise new holdings.
+export function detectCategoryLegacy(fundName: string): DetectCategoryResult {
+  return detectWithRules(
+    fundName,
+    RULES.filter((r) => r.since === undefined)
+  );
+}
+
+function detectWithRules(fundName: string, rules: Rule[]): DetectCategoryResult {
   const name = fundName.toLowerCase();
 
-  for (const rule of RULES) {
+  for (const rule of rules) {
     const match = rule.test(name);
     if (match) {
       return {

@@ -83,9 +83,11 @@ export const CATEGORY_UNIVERSE: Record<string, CategoryFund[]> = {
   // Re-audited live against mfapi.in — three of the original codes here were
   // wrong (120828 is actually Quant SMALL CAP, not Flexi Cap; 100163 and
   // 101835 are dead/nonexistent scheme codes), which is what caused a held
-  // Flexi Cap fund to get compared against Small Cap peers. All 9 codes
-  // below were confirmed against mfapi.in's meta.scheme_category before
-  // being added.
+  // Flexi Cap fund to get compared against Small Cap peers. All codes below
+  // were confirmed against mfapi.in's meta.scheme_category before being
+  // added. (Invesco India Focused, 148481, used to be listed here too, but
+  // its scheme_category is "Equity Scheme - Focused Fund" — it now lives
+  // under "Focused".)
   "Flexi Cap": [
     { code: "122639", name: "Parag Parikh Flexi Cap Fund - Direct Plan - Growth", amc: "PPFAS" },
     { code: "120843", name: "Quant Flexi Cap Fund - Direct Plan - Growth", amc: "Quant" },
@@ -95,7 +97,24 @@ export const CATEGORY_UNIVERSE: Record<string, CategoryFund[]> = {
     { code: "119718", name: "SBI Flexicap Fund - Direct Plan - Growth", amc: "SBI" },
     { code: "141925", name: "Axis Flexi Cap Fund - Direct Plan - Growth", amc: "Axis" },
     { code: "129046", name: "Motilal Oswal Flexi Cap Fund - Direct Plan - Growth", amc: "Motilal Oswal" },
+  ],
+
+  // Focused funds hold at most 30 stocks (SEBI). Every code below was
+  // verified live (2026-10-25) to have meta.scheme_category "Equity Scheme -
+  // Focused Fund" and a current NAV.
+  Focused: [
     { code: "148481", name: "Invesco India Focused Fund - Direct Plan - Growth", amc: "Invesco" },
+    { code: "119727", name: "SBI Focused Fund - Direct Plan - Growth", amc: "SBI" },
+    { code: "120722", name: "ICICI Prudential Focused Fund - Direct Plan - Growth", amc: "ICICI Pru" },
+    { code: "120468", name: "Axis Focused Fund - Direct Plan - Growth Option", amc: "Axis" },
+    { code: "118564", name: "Franklin India Focused Equity Fund - Direct Plan - Growth", amc: "Franklin" },
+    { code: "118692", name: "Nippon India Focused Fund - Direct Plan - Growth Option", amc: "Nippon" },
+    { code: "122389", name: "Motilal Oswal Focused Fund - Direct Plan - Growth", amc: "Motilal Oswal" },
+    { code: "119096", name: "DSP Focused Fund - Direct Plan - Growth", amc: "DSP" },
+    { code: "147473", name: "Kotak Focused Fund - Direct Plan - Growth Option", amc: "Kotak" },
+    { code: "147206", name: "Mirae Asset Focused Fund - Direct Plan - Growth", amc: "Mirae Asset" },
+    { code: "120834", name: "Quant Focused Fund - Direct Plan - Growth Option", amc: "Quant" },
+    { code: "131580", name: "360 ONE Focused Fund - Direct Plan - Growth Option", amc: "360 ONE" },
   ],
 
   // Re-verified — Kotak's ELSS fund and Motilal Oswal's were already

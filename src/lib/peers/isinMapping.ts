@@ -27,7 +27,7 @@ export const KNOWN_ISIN_MAP: Record<string, KnownIsinFund> = {
   INF205KA1213: {
     scheme_code: "148481",
     scheme_name: "Invesco India Focused Fund - Direct Plan - Growth",
-    category: "Flexi Cap",
+    category: "Focused",
     amc: "Invesco",
   },
   INF769K01GX9: {

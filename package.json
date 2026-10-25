@@ -9,7 +9,8 @@
     "start": "next start",
     "lint": "next lint",
     "migrate": "npx ts-node src/lib/db/runMigration.ts",
-    "test:xirr": "npx ts-node scripts/check-xirr.ts"
+    "test:xirr": "npx ts-node scripts/check-xirr.ts",
+    "recategorise": "npx ts-node -r tsconfig-paths/register scripts/recategorise-holdings.ts"
   },
   "dependencies": {
     "@google/genai": "^2.21.0",
@@ -33,6 +34,7 @@
     "postcss": "^8",
     "tailwindcss": "^3.4.1",
     "ts-node": "^10.9.2",
+    "tsconfig-paths": "^4.2.0",
     "typescript": "^5"
   }
 }
