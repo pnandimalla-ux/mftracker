@@ -46,6 +46,10 @@ export interface HoldingGroup {
   peer: PeerInfo | null;
   // At least one lot has no cached NAV, so current_value is just cost.
   nav_missing: boolean;
+  // Latest NAV of the scheme (every lot shares it) and its date; both null
+  // when nav_missing.
+  current_nav: number | null;
+  nav_date: string | null;
 }
 
 // XIRR annualises, so on a young portfolio a small gain extrapolates to a

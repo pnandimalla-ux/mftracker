@@ -63,9 +63,9 @@ const OWNERS: { id: OwnerFilter; label: string }[] = [
   { id: "geetha", label: "Geetha" },
 ];
 
-// Desktop holdings row: Fund | Value | P&L | Alloc | Return & rank | ⋯
+// Desktop holdings row: Fund | Value | NAV | P&L | Alloc | Return & rank | ⋯
 const MAIN_GRID =
-  "grid grid-cols-[minmax(0,1fr)_128px_168px_64px_150px_40px] lg:grid-cols-[minmax(0,1fr)_136px_184px_72px_164px_40px]";
+  "grid gap-2 grid-cols-[minmax(0,1fr)_116px_104px_148px_56px_136px_36px] lg:gap-3 lg:grid-cols-[minmax(0,1fr)_132px_112px_172px_64px_156px_40px]";
 
 // Individual lot sub-row: Date | Owner | Invested ₹ | Current ₹ | P&L | Avg NAV | Units | Actions
 const SUB_GRID = "grid grid-cols-[90px_56px_96px_96px_140px_84px_84px_96px]";
@@ -214,6 +214,30 @@ function formatAgo(iso: string | null): string {
 function formatNav(n: number): string {
   return n.toFixed(2);
 }
+
+// Scheme NAV for the holdings table: Indian grouping, 4 decimals below ₹10
+// where the extra precision still moves the value.
+function formatSchemeNav(n: number): string {
+  const digits = n < 10 ? 4 : 2;
+  return `₹${n.toLocaleString("en-IN", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+}
+
+function parseIsoDate(iso: string): Date {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, (m || 1) - 1, d || 1);
+}
+
+function formatNavDate(iso: string, withYear = true): string {
+  return parseIsoDate(iso).toLocaleDateString("en-IN", {
+    day: "numeric",
+    month: "short",
+    ...(withYear ? { year: "numeric" } : {}),
+  });
+}
+
+// A NAV this many days older than the newest one on the page is flagged
+// (usually a fund whose sync failed).
+const STALE_NAV_DAYS = 3;
 
 function formatUnits(n: number): string {
   return parseFloat(n.toFixed(3)).toString();
@@ -781,6 +805,8 @@ export default function DashboardClient({
           latest_date: h.as_on_date,
           peer: h.peer,
           nav_missing: false,
+          current_nav: null,
+          nav_date: null,
         };
         map.set(key, g);
       }
@@ -797,8 +823,14 @@ export default function DashboardClient({
         const total_units = g.lots.reduce((s, l) => s + Number(l.units), 0);
         const current_value = g.lots.reduce((s, l) => s + Number(l.current_value), 0);
         const pnl = current_value - total_invested;
+        // Every lot of a scheme shares one NAV; take the freshest lot's.
+        const navLot = g.nav_missing
+          ? null
+          : g.lots.reduce((best, l) => ((l.nav_date ?? "") > (best.nav_date ?? "") ? l : best), g.lots[0]);
         return {
           ...g,
+          current_nav: navLot ? Number(navLot.current_nav) : null,
+          nav_date: navLot ? navLot.nav_date : null,
           total_invested,
           total_units,
           avg_nav: total_units > 0 ? total_invested / total_units : 0,
@@ -945,6 +977,15 @@ export default function DashboardClient({
   const maxAbsPnlPct = useMemo(
     () =>
       groupedHoldings.reduce((m, g) => (g.nav_missing ? m : Math.max(m, Math.abs(g.pnl_pct))), 0),
+    [groupedHoldings]
+  );
+
+  const newestNavDate = useMemo(
+    () =>
+      groupedHoldings.reduce<string | null>(
+        (max, g) => (g.nav_date && (max === null || g.nav_date > max) ? g.nav_date : max),
+        null
+      ),
     [groupedHoldings]
   );
 
@@ -1938,11 +1979,24 @@ export default function DashboardClient({
 
   const allocationPct = (g: HoldingGroup) => (portfolioValue > 0 ? (g.current_value / portfolioValue) * 100 : 0);
 
+  const isNavStale = (g: HoldingGroup) =>
+    g.nav_date !== null &&
+    newestNavDate !== null &&
+    (parseIsoDate(newestNavDate).getTime() - parseIsoDate(g.nav_date).getTime()) / 86400000 > STALE_NAV_DAYS;
+
+  const navTooltip = (g: HoldingGroup) =>
+    `${g.nav_date ? `NAV as of ${formatNavDate(g.nav_date)}` : "NAV date unknown"} · ${formatUnits(g.total_units)} units`;
+
+  const renderStaleNavDate = (g: HoldingGroup) =>
+    isNavStale(g) && g.nav_date ? (
+      <span className="ml-1 text-[10px] font-medium text-amber-600">{formatNavDate(g.nav_date, false)}</span>
+    ) : null;
+
   const renderDesktopRow = (group: HoldingGroup) => {
     const isExpanded = expandedGroups.has(group.key);
     return (
       <div key={group.key} className="border-b border-slate-100 last:border-0">
-        <div className={`${MAIN_GRID} items-center gap-3 px-4 py-3 transition-colors hover:bg-slate-50/70`}>
+        <div className={`${MAIN_GRID} items-center px-4 py-3 transition-colors hover:bg-slate-50/70`}>
           <div className="flex min-w-0 items-start gap-1.5">
             {renderExpandButton(group, isExpanded)}
             {renderFundIdentity(group)}
@@ -1951,6 +2005,19 @@ export default function DashboardClient({
             <p className="text-sm font-medium tabular-nums text-slate-900">{formatInrFull(group.current_value)}</p>
             <p className="text-xs tabular-nums text-slate-400">Inv {formatInrFull(group.total_invested)}</p>
           </div>
+          {group.current_nav === null ? (
+            <p className="text-right text-sm text-slate-400" title="No NAV — valued at cost">
+              —
+            </p>
+          ) : (
+            <div className="text-right" title={navTooltip(group)}>
+              <p className="whitespace-nowrap text-sm tabular-nums text-slate-900">
+                {formatSchemeNav(group.current_nav)}
+                {renderStaleNavDate(group)}
+              </p>
+              <p className="text-xs tabular-nums text-slate-400">Avg {formatSchemeNav(group.avg_nav)}</p>
+            </div>
+          )}
           <div>
             {group.nav_missing ? (
               <p className="text-sm text-slate-400" title="No NAV — valued at cost">
@@ -2016,6 +2083,12 @@ export default function DashboardClient({
             </dd>
           </div>
         </dl>
+        {group.current_nav !== null && (
+          <p className="mt-1.5 text-xs tabular-nums text-slate-500" title={navTooltip(group)}>
+            NAV {formatSchemeNav(group.current_nav)}
+            {renderStaleNavDate(group)} · Avg {formatSchemeNav(group.avg_nav)}
+          </p>
+        )}
         <button
           type="button"
           onClick={() => toggleGroup(group.key)}
@@ -2357,10 +2430,11 @@ export default function DashboardClient({
               ) : isDesktop ? (
                 <div className="mt-3 rounded-2xl border border-slate-200 bg-white">
                   <div
-                    className={`${MAIN_GRID} items-center gap-3 rounded-t-2xl border-b border-slate-200 bg-slate-50/60 px-4 py-2.5 text-xs text-slate-500`}
+                    className={`${MAIN_GRID} items-center rounded-t-2xl border-b border-slate-200 bg-slate-50/60 px-4 py-2.5 text-xs text-slate-500`}
                   >
                     <span className="pl-6 font-medium">Fund</span>
                     <span className="text-right">{renderSortButton("value", "Value")}</span>
+                    <span className="text-right font-medium">NAV</span>
                     <span>{renderSortButton("pnl_pct", "P&L")}</span>
                     <span className="text-right">{renderSortButton("allocation", "Alloc")}</span>
                     <span className="flex items-center gap-2">
