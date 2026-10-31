@@ -326,6 +326,50 @@ async function findDuplicates(
   return counts;
 }
 
+// A fund the parser couldn't resolve (mfapi.in name search missed or timed
+// out) arrives with scheme_code null. Minting a fresh manual-* code for it on
+// every import defeated the duplicate check above, so each re-upload of the
+// same CSV re-inserted its lots. Reuse the code already stored for the same
+// fund name instead: a real code held by either owner first, else this
+// owner's existing manual-* code. Mutates `funds` in place.
+async function resolveMissingSchemeCodes(
+  supabase: ReturnType<typeof createClient>,
+  userId: string,
+  funds: ConfirmFund[]
+) {
+  const unresolved = funds.filter((f) => !f.scheme_code);
+  if (unresolved.length === 0) return;
+
+  const { data, error } = await supabase
+    .from("mf_holdings")
+    .select("owner, scheme_code, scheme_name")
+    .eq("user_id", userId);
+  if (error) {
+    console.error("Failed to load holdings for scheme_code reuse:", error.message);
+    return;
+  }
+
+  const normalize = (name: unknown) => String(name ?? "").trim().toLowerCase();
+  const realByName = new Map<string, string>();
+  const manualByOwnerName = new Map<string, string>();
+  for (const row of data ?? []) {
+    const code = typeof row.scheme_code === "string" ? row.scheme_code : "";
+    const name = normalize(row.scheme_name);
+    if (!code || !name) continue;
+    if (isRealSchemeCode(code)) {
+      if (!realByName.has(name)) realByName.set(name, code);
+    } else {
+      const key = `${row.owner}:${name}`;
+      if (!manualByOwnerName.has(key)) manualByOwnerName.set(key, code);
+    }
+  }
+
+  for (const fund of unresolved) {
+    const name = normalize(fund.scheme_name);
+    fund.scheme_code = realByName.get(name) ?? manualByOwnerName.get(`${fund.owner}:${name}`) ?? null;
+  }
+}
+
 // Applies SELL rows that had no corresponding BUY row in this CSV against
 // existing mf_holdings — oldest lot first (FIFO). Uses the service client
 // since this bypasses the normal per-owner RLS write path (same convention
@@ -481,6 +525,7 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "No valid funds to import" }, { status: 400 });
     }
 
+    await resolveMissingSchemeCodes(supabase, user.id, validFunds);
     const duplicateCounts = await findDuplicates(supabase, user.id, validFunds);
 
     if (check_only) {

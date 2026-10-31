@@ -20,6 +20,36 @@ export const maxDuration = 60;
 
 const VALID_FREQUENCIES: SIPFrequency[] = ["weekly", "bi-weekly", "monthly", "quarterly"];
 
+interface ExistingSchedule {
+  owner: string;
+  scheme_code: string | null;
+  scheme_name: string;
+  sip_date: number;
+  frequency: SIPFrequency;
+}
+
+const realCode = (code: string | null) => (code && !code.startsWith("manual-") ? code : null);
+const isPeriodic = (f: SIPFrequency) => f === "weekly" || f === "bi-weekly";
+
+// Same owner and same fund — matching real scheme codes, or the same name
+// (case-insensitive). Comparing on name too means a schedule saved without a
+// code (fund unresolved at import) still collides with one saved with it.
+function isSameFund(a: ExistingSchedule, b: ExistingSchedule): boolean {
+  if (a.owner !== b.owner) return false;
+  const ac = realCode(a.scheme_code);
+  const bc = realCode(b.scheme_code);
+  if (ac && bc && ac === bc) return true;
+  return a.scheme_name.trim().toLowerCase() === b.scheme_name.trim().toLowerCase();
+}
+
+function isDuplicateSchedule(existing: ExistingSchedule, item: ExistingSchedule): boolean {
+  if (!isSameFund(existing, item)) return false;
+  if (isPeriodic(existing.frequency) || isPeriodic(item.frequency)) {
+    return isPeriodic(existing.frequency) && isPeriodic(item.frequency);
+  }
+  return dayDistance(existing.sip_date, item.sip_date) <= SIP_DAY_TOLERANCE;
+}
+
 export async function POST(request: Request) {
   try {
     const supabase = createClient();
@@ -74,10 +104,11 @@ export async function POST(request: Request) {
     }
 
     // De-dupe against existing schedules. A fund can legitimately have
-    // several SIPs on different dates (e.g. the 1st and the 16th), so an item
-    // is only a duplicate when the same owner + fund already has a schedule
-    // within SIP_DAY_TOLERANCE days of its sip_date. Funds without a
-    // scheme_code (manual / unmatched) match on scheme_name instead.
+    // several monthly SIPs on different dates (e.g. the 1st and the 16th), so
+    // a monthly/quarterly item is only a duplicate when the same owner + fund
+    // already has one within SIP_DAY_TOLERANCE days of its sip_date. A
+    // weekly/bi-weekly schedule's sip_date is just its first lot's day, so
+    // any existing weekly/bi-weekly schedule of the fund counts as the same.
     const { data: existingRows, error: existingError } = await supabase
       .from("mf_sip_schedules")
       .select("owner, scheme_code, scheme_name, sip_date, frequency")
@@ -86,30 +117,21 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: existingError.message }, { status: 500 });
     }
 
-    const fundKey = (owner: string, scheme_code: string | null, scheme_name: string) =>
-      scheme_code ? `${owner}:code:${scheme_code}` : `${owner}:name:${scheme_name.trim().toLowerCase()}`;
-
-    const existingDays = new Map<string, number[]>();
-    const addExisting = (key: string, day: number) => {
-      const list = existingDays.get(key) ?? [];
-      list.push(day);
-      existingDays.set(key, list);
-    };
-    for (const row of existingRows ?? []) {
-      const day = Number(row.sip_date);
-      if (!Number.isFinite(day)) continue;
-      addExisting(fundKey(row.owner, row.scheme_code, row.scheme_name ?? ""), day);
-      // Let a manual item also collide with a coded schedule of the same name.
-      if (row.scheme_code && row.scheme_name) addExisting(fundKey(row.owner, null, row.scheme_name), day);
-    }
+    const existing: ExistingSchedule[] = (existingRows ?? [])
+      .filter((row) => Number.isFinite(Number(row.sip_date)))
+      .map((row) => ({
+        owner: row.owner,
+        scheme_code: row.scheme_code ?? null,
+        scheme_name: row.scheme_name ?? "",
+        sip_date: Number(row.sip_date),
+        frequency: row.frequency as SIPFrequency,
+      }));
 
     const rowsToInsert: Record<string, unknown>[] = [];
     const skippedItems: { scheme_name: string; owner: Owner; sip_date: number }[] = [];
 
     for (const item of validItems) {
-      const key = fundKey(item.owner, item.scheme_code, item.scheme_name);
-      const days = existingDays.get(key) ?? [];
-      if (days.some((d) => dayDistance(d, item.sip_date) <= SIP_DAY_TOLERANCE)) {
+      if (existing.some((row) => isDuplicateSchedule(row, item))) {
         skippedItems.push({ scheme_name: item.scheme_name, owner: item.owner, sip_date: item.sip_date });
         continue;
       }
@@ -130,8 +152,7 @@ export async function POST(request: Request) {
       });
 
       // Avoid inserting near-duplicates within one batch.
-      addExisting(key, item.sip_date);
-      if (item.scheme_code) addExisting(fundKey(item.owner, null, item.scheme_name), item.sip_date);
+      existing.push(item);
     }
 
     const skipped = skippedItems.length;
