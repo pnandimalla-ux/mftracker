@@ -814,7 +814,7 @@ export default function SIPCalendarClient({
 
       <main className="mx-auto max-w-6xl px-4 py-8">
         {/* Summary bar */}
-        <div className="mb-6 grid grid-cols-1 gap-4 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-6">
+        <div className="mb-6 grid grid-cols-2 gap-4 rounded-xl border border-slate-200 bg-white p-4 md:grid-cols-3 xl:grid-cols-6 [&>*]:min-w-0">
           <div>
             <p className="text-xs font-medium text-slate-500">
               Total SIP this month
@@ -839,19 +839,33 @@ export default function SIPCalendarClient({
           </div>
           <div>
             <p className="text-xs font-medium text-slate-500">By owner</p>
-            <p className="mt-1 text-sm text-slate-700">
-              <span className="text-blue-600">
-                Praveen: ₹{totalsByOwner.praveen.toLocaleString("en-IN")}
-              </span>
-              <span className="mx-2 text-slate-300">|</span>
-              <span className="text-amber-600">
-                Geetha: ₹{totalsByOwner.geetha.toLocaleString("en-IN")}
-              </span>
-            </p>
+            <div className="mt-1 space-y-0.5">
+              {(
+                [
+                  { owner: "praveen", name: "Praveen", dot: "bg-blue-600", text: "text-blue-600" },
+                  { owner: "geetha", name: "Geetha", dot: "bg-amber-500", text: "text-amber-600" },
+                ] as const
+              ).map((row) => (
+                <div
+                  key={row.owner}
+                  className={`flex items-baseline justify-between gap-3 whitespace-nowrap transition-opacity ${
+                    ownerFilter !== "all" && ownerFilter !== row.owner ? "opacity-40" : ""
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5 text-sm text-slate-600">
+                    <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${row.dot}`} aria-hidden="true" />
+                    {row.name}
+                  </span>
+                  <span className={`text-sm font-semibold tabular-nums ${row.text}`}>
+                    ₹{totalsByOwner[row.owner].toLocaleString("en-IN")}
+                  </span>
+                </div>
+              ))}
+            </div>
           </div>
           <div>
             <p className="text-xs font-medium text-slate-500">Next SIP</p>
-            <p className="mt-1 text-sm font-semibold text-slate-900">
+            <p className="mt-1 break-words text-sm font-semibold leading-snug text-slate-900">
               {nextSipCountdown === null
                 ? "No more SIPs this month"
                 : nextSipCountdown === 0
