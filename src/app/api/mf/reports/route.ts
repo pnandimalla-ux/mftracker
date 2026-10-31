@@ -57,22 +57,32 @@ export async function GET(request: Request) {
     const ownerFilter: OwnerFilter =
       ownerParam === "praveen" || ownerParam === "geetha" ? ownerParam : "all";
 
-    let query = supabase
-      .from("mf_transactions")
-      .select("owner, scheme_code, scheme_name, transaction_type, lot_type, amount, trade_date")
-      .eq("user_id", user.id);
+    // Read in pages: PostgREST caps a single response (1000 rows by default),
+    // and a truncated ledger would silently understate every total.
+    const PAGE_SIZE = 1000;
+    const transactions: TransactionRow[] = [];
+    for (let from = 0; ; from += PAGE_SIZE) {
+      let query = supabase
+        .from("mf_transactions")
+        .select("owner, scheme_code, scheme_name, transaction_type, lot_type, amount, trade_date")
+        .eq("user_id", user.id)
+        .order("id", { ascending: true })
+        .range(from, from + PAGE_SIZE - 1);
 
-    if (ownerFilter !== "all") {
-      query = query.eq("owner", ownerFilter);
+      if (ownerFilter !== "all") {
+        query = query.eq("owner", ownerFilter);
+      }
+
+      const { data, error } = await query;
+
+      if (error) {
+        return NextResponse.json({ error: error.message }, { status: 500 });
+      }
+
+      const page = (data ?? []) as TransactionRow[];
+      transactions.push(...page);
+      if (page.length < PAGE_SIZE) break;
     }
-
-    const { data, error } = await query;
-
-    if (error) {
-      return NextResponse.json({ error: error.message }, { status: 500 });
-    }
-
-    const transactions = (data ?? []) as TransactionRow[];
 
     let total_invested = 0;
     let sip_invested = 0;

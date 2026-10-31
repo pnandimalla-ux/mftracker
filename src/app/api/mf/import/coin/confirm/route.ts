@@ -903,7 +903,47 @@ export async function POST(request: Request) {
       // Ledger copy of every BUY lot just inserted, for the Reports page.
       // Uses the service client — like mf_cas_imports, this is a
       // write-only-by-import audit table, not a user-editable one.
-      const buyTransactionRows = rows.map((r) => ({
+      //
+      // The ledger records each purchase once. A lot can be inserted into
+      // mf_holdings again after its first copy was removed without deleting
+      // the import (a "replace" re-import, an over-sell that deleted the lot
+      // and a later rebuild, a manual cleanup), so skip BUY events the ledger
+      // already has — otherwise Reports counts that purchase twice.
+      const ledgerBuyKey = (r: {
+        owner: unknown;
+        scheme_code: unknown;
+        settlement_id: unknown;
+        trade_date: unknown;
+        units: unknown;
+      }) =>
+        `${r.owner}:${r.scheme_code ?? ""}:${r.settlement_id ?? ""}:${String(r.trade_date).slice(0, 10)}:${Number(r.units).toFixed(4)}`;
+      const existingLedgerBuys = new Set<string>();
+      const ledgerCodes = Array.from(new Set(rows.map((r) => r.scheme_code as string)));
+      const { data: ledgerRows, error: ledgerReadError } = await serviceClient
+        .from("mf_transactions")
+        .select("owner, scheme_code, settlement_id, trade_date, units")
+        .eq("user_id", user.id)
+        .eq("transaction_type", "BUY")
+        .in("scheme_code", ledgerCodes);
+      if (ledgerReadError) {
+        console.error("Failed to load ledger for BUY dedupe:", ledgerReadError.message);
+      }
+      for (const t of ledgerRows ?? []) existingLedgerBuys.add(ledgerBuyKey(t));
+
+      const buyTransactionRows = rows
+        .filter(
+          (r) =>
+            !existingLedgerBuys.has(
+              ledgerBuyKey({
+                owner: r.owner,
+                scheme_code: r.scheme_code,
+                settlement_id: r.settlement_id,
+                trade_date: r.as_on_date,
+                units: r.units,
+              })
+            )
+        )
+        .map((r) => ({
         user_id: r.user_id,
         import_id: r.import_id,
         owner: r.owner,
@@ -918,7 +958,10 @@ export async function POST(request: Request) {
         trade_date: r.as_on_date,
         settlement_id: r.settlement_id,
       }));
-      const { error: buyTxnError } = await serviceClient.from("mf_transactions").insert(buyTransactionRows);
+      const { error: buyTxnError } =
+        buyTransactionRows.length > 0
+          ? await serviceClient.from("mf_transactions").insert(buyTransactionRows)
+          : { error: null };
       if (buyTxnError) {
         console.error("Failed to record BUY transactions in ledger:", buyTxnError.message);
       }
