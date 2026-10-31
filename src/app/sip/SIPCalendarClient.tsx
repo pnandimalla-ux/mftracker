@@ -238,6 +238,10 @@ function formatShortDate(d: Date): string {
   return `${d.getDate()} ${MONTH_NAMES[d.getMonth()].slice(0, 3)} ${d.getFullYear()}`;
 }
 
+function formatDayMonth(d: Date): string {
+  return `${d.getDate()} ${MONTH_NAMES[d.getMonth()].slice(0, 3)}`;
+}
+
 function formatUnits(n: number): string {
   return n.toLocaleString("en-IN", { maximumFractionDigits: 3 });
 }
@@ -265,6 +269,12 @@ interface SipChip {
   scheduled: Date;
   isWeekend: boolean;
   lot: SipLotEntry | null;
+  // Set when the matched lot executed in a different month from the
+  // scheduled occurrence (e.g. 31 Oct for a 1 Nov SIP).
+  shift: "early" | "late" | null;
+  // Which side of a cross-month match this chip represents: the scheduled
+  // day in the occurrence's month, or the execution day in the lot's month.
+  shownOn: "scheduled" | "lot";
 }
 
 interface SipCalendarView {
@@ -338,16 +348,26 @@ function computeSipCalendarView(
     const lotIdx = occToLot.get(occIdx);
     if (lotIdx !== undefined) {
       const { lot, date } = lots[lotIdx];
-      if (inViewedMonth(date)) {
-        pushChip(date.getDate(), {
-          key: occ.key,
-          status: "executed",
-          sip: occ.sip,
-          scheduled: occ.date,
-          isWeekend: occ.isWeekend,
-          lot,
-        });
+      const sameMonth =
+        date.getFullYear() === occ.date.getFullYear() && date.getMonth() === occ.date.getMonth();
+      const base = {
+        key: occ.key,
+        status: "executed" as const,
+        sip: occ.sip,
+        scheduled: occ.date,
+        isWeekend: occ.isWeekend,
+        lot,
+        shift: sameMonth ? null : date < occ.date ? ("early" as const) : ("late" as const),
+      };
+      if (sameMonth) {
+        if (inViewedMonth(date)) pushChip(date.getDate(), { ...base, shownOn: "lot" });
+        return;
       }
+      // Cross-month: the occurrence's month shows it on the scheduled day;
+      // the lot's month shows it on the execution day, labelled as the other
+      // month's instalment.
+      if (inViewedMonth(occ.date)) pushChip(occ.date.getDate(), { ...base, key: `${occ.key}-sched`, shownOn: "scheduled" });
+      if (inViewedMonth(date)) pushChip(date.getDate(), { ...base, key: `${occ.key}-lot`, shownOn: "lot" });
       return;
     }
     if (!inViewedMonth(occ.date)) return;
@@ -358,6 +378,8 @@ function computeSipCalendarView(
       scheduled: occ.date,
       isWeekend: occ.isWeekend,
       lot: null,
+      shift: null,
+      shownOn: "scheduled",
     });
   });
 
@@ -669,6 +691,15 @@ export default function SIPCalendarClient({
     }
   };
 
+  // Deleting removes the whole recurring schedule, not one instalment.
+  const confirmDeleteSip = (sip: MFSIPSchedule) => {
+    const owner = sip.owner === "praveen" ? "Praveen" : "Geetha";
+    const message =
+      `Delete the entire recurring SIP schedule for ${sip.scheme_name} ` +
+      `(${owner}, ${ordinal(sip.sip_date)}, ${sip.frequency})? Past purchases are not affected.`;
+    if (window.confirm(message)) deleteSip(sip.id);
+  };
+
   const toggleNotify = async (sip: MFSIPSchedule, field: "notify_email" | "notify_sms") => {
     const nextValue = !sip[field];
     try {
@@ -822,12 +853,26 @@ export default function SIPCalendarClient({
                         {day}
                       </span>
                       <div className="mt-1 flex flex-col gap-1">
-                        {occ.map(({ key, status, sip, scheduled, isWeekend, lot }) => {
+                        {occ.map(({ key, status, sip, scheduled, isWeekend, lot, shift, shownOn }) => {
                           const isPraveen = sip.owner === "praveen";
                           const amount = lot?.amount ?? sip.amount;
                           let title = `${sip.scheme_name} — ₹${sip.amount.toLocaleString("en-IN")}`;
                           let chipClass = isPraveen ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700";
-                          if (status === "executed" && lot) {
+                          let label = `${sip.scheme_name} · ₹${amount.toLocaleString("en-IN")}`;
+                          if (status === "executed" && lot && shift) {
+                            const lotDate = localDateFromIso(lot.trade_date);
+                            const detail = `₹${lot.amount.toLocaleString("en-IN")} · ${formatUnits(lot.units)} units`;
+                            if (shownOn === "scheduled") {
+                              title = `✓ ${sip.scheme_name}\nExecuted ${shift} on ${formatDayMonth(lotDate)} · ${detail}`;
+                              chipClass = isPraveen ? "bg-blue-600 text-white" : "bg-amber-500 text-white";
+                            } else {
+                              title =
+                                `✓ ${sip.scheme_name}\nExecuted ${shift} on ${formatDayMonth(lotDate)} · ${detail}\n` +
+                                `Counts as the ${formatShortDate(scheduled)} instalment`;
+                              chipClass = `border bg-white ${isPraveen ? "border-blue-400 text-blue-700" : "border-amber-400 text-amber-700"}`;
+                              label = `${sip.scheme_name} · ${MONTH_NAMES[scheduled.getMonth()].slice(0, 3)} ${ordinal(scheduled.getDate())} SIP (${shift})`;
+                            }
+                          } else if (status === "executed" && lot) {
                             title =
                               `✓ Executed — ${sip.scheme_name}\n` +
                               `${formatShortDate(localDateFromIso(lot.trade_date))} · ₹${lot.amount.toLocaleString("en-IN")} · ${formatUnits(lot.units)} units\n` +
@@ -847,15 +892,11 @@ export default function SIPCalendarClient({
                               >
                                 {status === "executed" && "✓ "}
                                 {status === "missed" && <span className="font-bold text-red-400">! </span>}
-                                {sip.scheme_name} · ₹{amount.toLocaleString("en-IN")}
+                                {label}
                               </span>
                               <button
                                 type="button"
-                                onClick={() => {
-                                  if (window.confirm("Delete this SIP?")) {
-                                    deleteSip(sip.id);
-                                  }
-                                }}
+                                onClick={() => confirmDeleteSip(sip)}
                                 aria-label="Delete SIP"
                                 title="Delete SIP"
                                 className="absolute -right-1 -top-1 hidden h-3.5 w-3.5 items-center justify-center rounded-full bg-red-600 text-[9px] font-bold leading-none text-white group-hover:flex"
@@ -934,7 +975,11 @@ export default function SIPCalendarClient({
             <span className="flex items-center gap-1.5">
               <span className="rounded-full bg-blue-600 px-2 py-0.5 text-[10px] font-medium text-white">✓ Praveen</span>
               <span className="rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-medium text-white">✓ Geetha</span>
-              SIP executed (on actual date)
+              SIP executed
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="rounded-full border border-blue-400 bg-white px-2 py-0.5 text-[10px] font-medium text-blue-700">✓ Nov 1st SIP (early)</span>
+              Executed early/late for another month&apos;s SIP
             </span>
             <span className="flex items-center gap-1.5">
               <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700">Praveen</span>
@@ -1271,7 +1316,7 @@ export default function SIPCalendarClient({
                           {sip.is_active ? "Pause" : "Resume"}
                         </button>
                         <button
-                          onClick={() => deleteSip(sip.id)}
+                          onClick={() => confirmDeleteSip(sip)}
                           className="text-xs font-medium text-red-600 hover:underline"
                         >
                           Delete

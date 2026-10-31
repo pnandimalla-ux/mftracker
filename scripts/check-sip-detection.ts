@@ -85,6 +85,20 @@ check("1st + 16th over two months", [["09-01"], ["09-16"], ["10-01"], ["10-16"]]
   { frequency: "monthly", sip_date: 1 },
   { frequency: "monthly", sip_date: 16 },
 ]);
+// Drift check must be circular: a 1st that executes on the 31st (or 30th)
+// is 1–2 days from the cluster's day, not 30.
+check("T.I.G.E.R. 1st+16th, 1st executed early on 31st", [
+  ["10-01"], ["10-16"], ["10-31"], ["11-16"], ["12-01"], ["12-16"],
+], [
+  { frequency: "monthly", sip_date: 1 },
+  { frequency: "monthly", sip_date: 16 },
+]);
+check("T.I.G.E.R. 1st+16th, 1st executed early on 30th", [
+  ["10-01"], ["10-16"], ["10-31"], ["11-16"], ["11-30"], ["12-16"],
+], [
+  { frequency: "monthly", sip_date: 1 },
+  { frequency: "monthly", sip_date: 16 },
+]);
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);
