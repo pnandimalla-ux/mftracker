@@ -10,6 +10,7 @@ export interface SipDetectionLot {
 
 export interface SipDetectionFund {
   key: string;
+  isin?: string;
   scheme_name: string;
   scheme_code: string | null;
   owner: Owner;
@@ -173,4 +174,43 @@ export function detectActiveSips(funds: SipDetectionFund[]): DetectedSip[] {
     }
   }
   return results;
+}
+
+// A not-yet-settled SIP order (Coin PROCESSING row) — counts as SIP evidence
+// for detection exactly like a completed SIP lot.
+export interface PendingSipInput {
+  isin: string;
+  scheme_name: string;
+  scheme_code: string | null;
+  owner: Owner;
+  category: string;
+  amount: number;
+  trade_date: string;
+  lot_type: string;
+}
+
+// Folds pending SIP orders into the funds' lots (matched by isin + owner).
+// A pending SIP whose fund has no entry gets its own detection fund, so a
+// fund whose only SIP evidence is pending still yields a candidate.
+export function withPendingSips(funds: SipDetectionFund[], pending: PendingSipInput[]): SipDetectionFund[] {
+  const out = funds.map((f) => ({ ...f, lots: [...f.lots] }));
+  for (const p of pending) {
+    if (p.lot_type !== "sip") continue;
+    const lot: SipDetectionLot = { trade_date: p.trade_date, amount: p.amount, lot_type: "sip" };
+    const fund = out.find((f) => f.owner === p.owner && !!f.isin && f.isin === p.isin);
+    if (fund) {
+      fund.lots.push(lot);
+      continue;
+    }
+    out.push({
+      key: `pending-${p.isin}-${p.owner}`,
+      isin: p.isin,
+      scheme_name: p.scheme_name,
+      scheme_code: p.scheme_code,
+      owner: p.owner,
+      category: p.category,
+      lots: [lot],
+    });
+  }
+  return out;
 }

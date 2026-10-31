@@ -42,7 +42,12 @@ export async function POST(request: Request) {
 
     const result = await parseCoinCsv(csvText);
 
-    if (result.funds.length === 0 && result.excluded_etfs.length === 0 && result.sell_transactions.length === 0) {
+    if (
+      result.funds.length === 0 &&
+      result.excluded_etfs.length === 0 &&
+      result.sell_transactions.length === 0 &&
+      result.pending_orders.length === 0
+    ) {
       return NextResponse.json(
         {
           error:

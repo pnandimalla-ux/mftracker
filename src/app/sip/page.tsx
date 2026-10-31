@@ -1,6 +1,11 @@
 import { redirect } from "next/navigation";
 import { getAuthedUser } from "@/lib/supabase/getAuthedUser";
-import SIPCalendarClient, { type LumpsumEntry, type SellEntry, type SipLotEntry } from "./SIPCalendarClient";
+import SIPCalendarClient, {
+  type LumpsumEntry,
+  type PendingOrderEntry,
+  type SellEntry,
+  type SipLotEntry,
+} from "./SIPCalendarClient";
 import type { MFSIPSchedule, Owner } from "@/types/mf";
 
 function SIPPageError({ message }: { message: string }) {
@@ -113,6 +118,31 @@ export default async function SIPPage() {
     sipLots = [];
   }
 
+  let pendingOrders: PendingOrderEntry[] = [];
+
+  try {
+    const { data, error } = await supabase
+      .from("mf_pending_orders")
+      .select("trade_date, amount, scheme_code, scheme_name, owner, lot_type, ordered_at, remarks")
+      .eq("user_id", user.id)
+      .order("trade_date", { ascending: false });
+
+    if (error) throw error;
+    pendingOrders = (data ?? []).map((row) => ({
+      trade_date: String(row.trade_date).slice(0, 10),
+      amount: Number(row.amount),
+      scheme_code: (row.scheme_code as string | null) ?? null,
+      scheme_name: row.scheme_name as string,
+      owner: row.owner as Owner,
+      lot_type: row.lot_type === "sip" ? "sip" : "lumpsum",
+      ordered_at: (row.ordered_at as string | null) ?? null,
+      remarks: (row.remarks as string | null) ?? null,
+    }));
+  } catch (err) {
+    console.error("SIP page: failed to load pending orders", err);
+    pendingOrders = [];
+  }
+
   return (
     <SIPCalendarClient
       userEmail={user.email ?? ""}
@@ -120,6 +150,7 @@ export default async function SIPPage() {
       initialLumpsums={lumpsums}
       initialSells={sells}
       initialSipLots={sipLots}
+      initialPendingOrders={pendingOrders}
     />
   );
 }

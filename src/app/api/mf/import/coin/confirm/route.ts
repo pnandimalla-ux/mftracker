@@ -46,6 +46,240 @@ interface RawConfirmSell {
   matched_in_csv?: unknown;
 }
 
+interface PendingOrderInput {
+  isin: string;
+  scheme_code: string | null;
+  scheme_name: string;
+  owner: Owner;
+  category: string | null;
+  lot_type: "sip" | "lumpsum";
+  amount: number;
+  trade_date: string;
+  ordered_at: string | null;
+  remarks: string | null;
+}
+
+interface CancelledOrderInput {
+  isin: string;
+  owner: Owner;
+  amount: number;
+  trade_date: string;
+  lot_type: "sip" | "lumpsum";
+}
+
+// Something that proves an order is no longer pending: a COMPLETE lot (in
+// this CSV or already in mf_holdings) or a FAILED / CANCELLED order.
+interface SettleEvidence {
+  owner: Owner;
+  scheme_code: string | null;
+  isin: string | null;
+  amount: number;
+  trade_date: string;
+  lot_type: string | null;
+}
+
+interface PendingRowLike {
+  owner: string;
+  scheme_code: string | null;
+  isin: string | null;
+  amount: number;
+  trade_date: string;
+  lot_type: string;
+}
+
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const PENDING_MATCH_DAYS = 3;
+const PENDING_CONFLICT_KEY = "user_id,owner,isin,trade_date,amount,lot_type";
+
+function isoToUtcMs(iso: string): number {
+  const [y, m, d] = iso.split("-").map(Number);
+  return Date.UTC(y, m - 1, d);
+}
+
+function shiftIsoDays(iso: string, days: number): string {
+  return new Date(isoToUtcMs(iso) + days * 86400000).toISOString().slice(0, 10);
+}
+
+// Same owner + fund (scheme_code when both sides have a real one, else ISIN)
+// + amount + lot type, with the trade date within ±3 days.
+function evidenceMatchesPending(e: SettleEvidence, p: PendingRowLike): boolean {
+  if (e.owner !== p.owner) return false;
+  const eCode = e.scheme_code && isRealSchemeCode(e.scheme_code) ? e.scheme_code : null;
+  const pCode = p.scheme_code && isRealSchemeCode(p.scheme_code) ? p.scheme_code : null;
+  if (eCode && pCode) {
+    if (eCode !== pCode) return false;
+  } else if (!(e.isin && p.isin && e.isin === p.isin)) {
+    return false;
+  }
+  if (Math.abs(e.amount - p.amount) > 0.01) return false;
+  if (e.lot_type && p.lot_type && e.lot_type !== p.lot_type) return false;
+  if (!ISO_DATE_RE.test(e.trade_date) || !ISO_DATE_RE.test(p.trade_date)) return false;
+  return Math.abs(isoToUtcMs(e.trade_date) - isoToUtcMs(p.trade_date)) / 86400000 <= PENDING_MATCH_DAYS;
+}
+
+function pendingKey(p: { owner: string; isin: string | null; trade_date: string; amount: number; lot_type: string }) {
+  return `${p.owner}|${p.isin ?? ""}|${p.trade_date}|${p.amount.toFixed(2)}|${p.lot_type}`;
+}
+
+function parsePendingOrders(raw: unknown): PendingOrderInput[] {
+  if (!Array.isArray(raw)) return [];
+  const out: PendingOrderInput[] = [];
+  for (const r of raw as Record<string, unknown>[]) {
+    if (!r || typeof r !== "object") continue;
+    const owner = r.owner === "praveen" || r.owner === "geetha" ? r.owner : null;
+    const isin = typeof r.isin === "string" ? r.isin.trim() : "";
+    const schemeName = typeof r.scheme_name === "string" ? r.scheme_name.trim() : "";
+    const amount = Number(r.amount);
+    const tradeDate = typeof r.trade_date === "string" ? r.trade_date.trim() : "";
+    const lotType = r.lot_type === "sip" || r.lot_type === "lumpsum" ? r.lot_type : null;
+    if (!owner || !isin || !schemeName || !lotType) continue;
+    if (!Number.isFinite(amount) || amount <= 0 || !ISO_DATE_RE.test(tradeDate)) continue;
+    out.push({
+      isin,
+      scheme_code: typeof r.scheme_code === "string" && r.scheme_code.trim() ? r.scheme_code.trim() : null,
+      scheme_name: schemeName,
+      owner,
+      category: typeof r.category === "string" && r.category.trim() ? r.category.trim() : null,
+      lot_type: lotType,
+      amount,
+      trade_date: tradeDate,
+      ordered_at: typeof r.ordered_at === "string" && r.ordered_at.trim() ? r.ordered_at.trim() : null,
+      remarks: typeof r.remarks === "string" && r.remarks.trim() ? r.remarks.trim() : null,
+    });
+  }
+  return out;
+}
+
+function parseCancelledOrders(raw: unknown): CancelledOrderInput[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CancelledOrderInput[] = [];
+  for (const r of raw as Record<string, unknown>[]) {
+    if (!r || typeof r !== "object") continue;
+    const owner = r.owner === "praveen" || r.owner === "geetha" ? r.owner : null;
+    const isin = typeof r.isin === "string" ? r.isin.trim() : "";
+    const amount = Number(r.amount);
+    const tradeDate = typeof r.trade_date === "string" ? r.trade_date.trim() : "";
+    const lotType = r.lot_type === "sip" || r.lot_type === "lumpsum" ? r.lot_type : "lumpsum";
+    if (!owner || !isin || !Number.isFinite(amount) || amount <= 0 || !ISO_DATE_RE.test(tradeDate)) continue;
+    out.push({ isin, owner, amount, trade_date: tradeDate, lot_type: lotType });
+  }
+  return out;
+}
+
+interface PendingPlan {
+  enabled: boolean;
+  clearIds: string[];
+  newPending: PendingOrderInput[];
+  remainingExistingAmount: number;
+}
+
+// Works out (read-only) which existing pending orders have settled or been
+// cancelled, and which incoming PROCESSING orders are genuinely new. Writes
+// happen later, once the import is known to proceed. If mf_pending_orders
+// doesn't exist yet (migration_010 not run) the whole feature is skipped so
+// regular imports keep working.
+async function planPendingOrders(
+  serviceClient: ReturnType<typeof createServiceClient>,
+  userId: string,
+  funds: ConfirmFund[],
+  incoming: PendingOrderInput[],
+  cancelled: CancelledOrderInput[]
+): Promise<PendingPlan> {
+  const disabled: PendingPlan = { enabled: false, clearIds: [], newPending: [], remainingExistingAmount: 0 };
+
+  const { data: existingRaw, error: existingError } = await serviceClient
+    .from("mf_pending_orders")
+    .select("id, owner, isin, scheme_code, amount, trade_date, lot_type")
+    .eq("user_id", userId);
+  if (existingError) {
+    console.error("mf_pending_orders unavailable — skipping pending orders (run migration_010?):", existingError.message);
+    return disabled;
+  }
+  const existing = (existingRaw ?? []).map((r) => ({
+    id: r.id as string,
+    owner: r.owner as string,
+    isin: (r.isin as string | null) ?? null,
+    scheme_code: (r.scheme_code as string | null) ?? null,
+    amount: Number(r.amount),
+    trade_date: String(r.trade_date).slice(0, 10),
+    lot_type: r.lot_type as string,
+  }));
+
+  if (existing.length === 0 && incoming.length === 0) {
+    return { enabled: true, clearIds: [], newPending: [], remainingExistingAmount: 0 };
+  }
+
+  // (a) Every COMPLETE BUY lot in this request — inserted or skipped as an
+  // already-imported duplicate — plus every FAILED / CANCELLED order.
+  const csvEvidence: SettleEvidence[] = [];
+  for (const f of funds) {
+    for (const lot of f.lots) {
+      csvEvidence.push({
+        owner: f.owner,
+        scheme_code: f.scheme_code,
+        isin: f.isin || null,
+        amount: Number(lot.amount),
+        trade_date: lot.trade_date,
+        lot_type: lot.lot_type ?? null,
+      });
+    }
+  }
+  for (const c of cancelled) {
+    csvEvidence.push({ owner: c.owner, scheme_code: null, isin: c.isin, amount: c.amount, trade_date: c.trade_date, lot_type: c.lot_type });
+  }
+
+  // (c) COMPLETE lots already in mf_holdings — an order that settled in an
+  // earlier import must not linger as pending.
+  const holdingsEvidence: SettleEvidence[] = [];
+  const allDates = [...existing.map((p) => p.trade_date), ...incoming.map((p) => p.trade_date)].sort();
+  if (allDates.length > 0) {
+    const { data: lots, error: lotsError } = await serviceClient
+      .from("mf_holdings")
+      .select("owner, scheme_code, invested_amount, as_on_date, lot_type")
+      .eq("user_id", userId)
+      .gte("as_on_date", shiftIsoDays(allDates[0], -PENDING_MATCH_DAYS));
+    if (lotsError) {
+      console.error("Failed to load holdings for pending reconciliation:", lotsError.message);
+    }
+    for (const l of lots ?? []) {
+      holdingsEvidence.push({
+        owner: l.owner as Owner,
+        scheme_code: (l.scheme_code as string | null) ?? null,
+        isin: null,
+        amount: Number(l.invested_amount),
+        trade_date: String(l.as_on_date).slice(0, 10),
+        lot_type: (l.lot_type as string | null) ?? null,
+      });
+    }
+  }
+
+  const allEvidence = [...csvEvidence, ...holdingsEvidence];
+  const settled = (p: PendingRowLike) => allEvidence.some((e) => evidenceMatchesPending(e, p));
+
+  const clearIds = existing.filter(settled).map((p) => p.id);
+  const clearSet = new Set(clearIds);
+  const remaining = existing.filter((p) => !clearSet.has(p.id));
+  const remainingKeys = new Set(remaining.map(pendingKey));
+
+  // (b) Incoming PROCESSING orders, minus any already settled / cancelled
+  // and any already stored (same unique key).
+  const seen = new Set<string>();
+  const newPending = incoming.filter((p) => {
+    if (settled(p)) return false;
+    const key = pendingKey(p);
+    if (remainingKeys.has(key) || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  return {
+    enabled: true,
+    clearIds,
+    newPending,
+    remainingExistingAmount: remaining.reduce((sum, p) => sum + p.amount, 0),
+  };
+}
+
 interface SellGroup {
   owner: Owner;
   scheme_code: string;
@@ -176,14 +410,20 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
     }
 
-    const { funds, duplicate_action, check_only, sells } = body as {
+    const { funds, duplicate_action, check_only, sells, pending_orders, cancelled_orders } = body as {
       funds?: unknown;
       duplicate_action?: unknown;
       check_only?: unknown;
       sells?: unknown;
+      pending_orders?: unknown;
+      cancelled_orders?: unknown;
     };
 
-    if (!Array.isArray(funds) || funds.length === 0) {
+    const validPending = parsePendingOrders(pending_orders);
+    const validCancelled = parseCancelledOrders(cancelled_orders);
+    const hasPendingInput = validPending.length > 0 || validCancelled.length > 0;
+
+    if (!Array.isArray(funds) || (funds.length === 0 && (check_only || !hasPendingInput))) {
       return NextResponse.json({ error: "At least one fund is required" }, { status: 400 });
     }
 
@@ -224,7 +464,7 @@ export async function POST(request: Request) {
       });
     }
 
-    if (validFunds.length === 0) {
+    if (validFunds.length === 0 && (check_only || !hasPendingInput)) {
       return NextResponse.json({ error: "No valid funds to import" }, { status: 400 });
     }
 
@@ -443,11 +683,16 @@ export async function POST(request: Request) {
       addToSellGroup(s.owner, s.scheme_code, s.scheme_name, s.total_units);
     }
 
+    const serviceClient = createServiceClient();
+    const pendingPlan = await planPendingOrders(serviceClient, user.id, validFunds, validPending, validCancelled);
+    const hasPendingWork = pendingPlan.newPending.length > 0 || pendingPlan.clearIds.length > 0;
+
     // A fund that's fully bought-and-sold within this CSV, with no prior
     // holdings to reduce, produces neither a row to insert nor a sellGroupMap
     // entry — but its SELL rows still need to reach mf_sell_transactions for
-    // calendar display, so that alone must not trip this guard.
-    if (rows.length === 0 && sellGroupMap.size === 0 && sellsToRecord.length === 0) {
+    // calendar display, so that alone must not trip this guard. Neither do
+    // pending orders to save or clear.
+    if (rows.length === 0 && sellGroupMap.size === 0 && sellsToRecord.length === 0 && !hasPendingWork) {
       const reason =
         lotsSkippedDuplicates > 0
           ? "all lots were already imported"
@@ -463,9 +708,10 @@ export async function POST(request: Request) {
     // carry the batch's id — lets a later delete of the import remove every
     // holding it created. Writes to mf_cas_imports go through the service
     // client per the project's RLS convention for sync/import audit tables.
-    const serviceClient = createServiceClient();
     const importIdMap = new Map<string, string>();
-    const ownersImported = Array.from(new Set(rows.map((r) => r.owner as string)));
+    const ownersImported = Array.from(
+      new Set([...rows.map((r) => r.owner as string), ...pendingPlan.newPending.map((p) => p.owner)])
+    );
     for (const owner of ownersImported) {
       const ownerLots = rows.filter((r) => r.owner === owner).length;
       const { data: importRow, error: importError } = await serviceClient
@@ -591,6 +837,54 @@ export async function POST(request: Request) {
       }
     }
 
+    // Pending (PROCESSING) orders: clear the ones that settled or were
+    // cancelled, then store the new ones under the owner's import_id so
+    // deleting that import removes them too.
+    let pendingCleared = 0;
+    let pendingSaved = 0;
+    let pendingSavedAmount = 0;
+    if (pendingPlan.enabled && pendingPlan.clearIds.length > 0) {
+      const { error: clearError } = await serviceClient
+        .from("mf_pending_orders")
+        .delete()
+        .eq("user_id", user.id)
+        .in("id", pendingPlan.clearIds);
+      if (clearError) {
+        console.error("Failed to clear settled pending orders:", clearError.message);
+      } else {
+        pendingCleared = pendingPlan.clearIds.length;
+      }
+    }
+    if (pendingPlan.enabled && pendingPlan.newPending.length > 0) {
+      const { data: savedRows, error: pendingError } = await serviceClient
+        .from("mf_pending_orders")
+        .upsert(
+          pendingPlan.newPending.map((p) => ({
+            user_id: user.id,
+            import_id: importIdMap.get(p.owner) ?? null,
+            owner: p.owner,
+            isin: p.isin,
+            scheme_code: p.scheme_code,
+            scheme_name: p.scheme_name,
+            category: p.category,
+            lot_type: p.lot_type,
+            amount: p.amount,
+            trade_date: p.trade_date,
+            ordered_at: p.ordered_at,
+            remarks: p.remarks,
+          })),
+          { onConflict: PENDING_CONFLICT_KEY, ignoreDuplicates: true }
+        )
+        .select("amount");
+      if (pendingError) {
+        console.error("Failed to save pending orders:", pendingError.message);
+      } else {
+        pendingSaved = savedRows?.length ?? 0;
+        pendingSavedAmount = (savedRows ?? []).reduce((sum, r) => sum + Number(r.amount), 0);
+      }
+    }
+    const pendingTotalAmount = pendingPlan.remainingExistingAmount + pendingSavedAmount;
+
     // Best-effort background follow-up — never block the response on mfapi.in.
     for (const schemeCode of Array.from(schemeCodeCategories.keys())) {
       refreshNavCache(schemeCode).catch((err) => console.error(`refreshNavCache(${schemeCode}) failed:`, err));
@@ -617,6 +911,9 @@ export async function POST(request: Request) {
       sells_applied: sellsNettedInCsv + validSells.length,
       funds_exited: fundsExitedViaCsv + fundsExitedViaDb,
       lots_reduced,
+      pending_saved: pendingSaved,
+      pending_cleared: pendingCleared,
+      pending_total_amount: pendingTotalAmount,
     });
   } catch (err) {
     console.error("POST /api/mf/import/coin/confirm failed:", err);

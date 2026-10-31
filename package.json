@@ -11,7 +11,8 @@
     "migrate": "npx ts-node src/lib/db/runMigration.ts",
     "test:xirr": "npx ts-node scripts/check-xirr.ts",
     "recategorise": "npx ts-node -r tsconfig-paths/register scripts/recategorise-holdings.ts",
-    "test:sip": "npx ts-node -r tsconfig-paths/register scripts/check-sip-detection.ts"
+    "test:sip": "npx ts-node -r tsconfig-paths/register scripts/check-sip-detection.ts",
+    "test:pending": "npx ts-node -r tsconfig-paths/register scripts/check-coin-pending.ts"
   },
   "dependencies": {
     "@google/genai": "^2.21.0",

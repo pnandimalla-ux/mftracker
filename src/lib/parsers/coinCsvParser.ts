@@ -72,10 +72,39 @@ export interface SellRow {
   matched_in_csv: boolean;
 }
 
+// A BUY order Coin hasn't settled yet (status PROCESSING, units/nav = 0).
+// Kept out of funds[] / totals entirely — stored as mf_pending_orders until
+// a later import shows it COMPLETE.
+export interface PendingOrder {
+  isin: string;
+  scheme_name: string;
+  scheme_code: string | null;
+  owner: Owner;
+  category: string;
+  amc: string;
+  lot_type: "sip" | "lumpsum";
+  amount: number;
+  trade_date: string; // ISO yyyy-mm-dd
+  ordered_at: string;
+  remarks: string;
+}
+
+// A BUY order that FAILED / was REJECTED / CANCELLED — only used to clear a
+// matching pending order.
+export interface CancelledOrder {
+  isin: string;
+  owner: Owner;
+  amount: number;
+  trade_date: string;
+  lot_type: "sip" | "lumpsum";
+}
+
 export interface CoinParseResult {
   funds: CoinFund[];
   excluded_etfs: ExcludedRow[];
   sell_transactions: SellRow[];
+  pending_orders: PendingOrder[];
+  cancelled_orders: CancelledOrder[];
   total_invested: number;
   owner_split: { praveen: number; geetha: number };
   date_range: { from: string; to: string };
@@ -171,6 +200,24 @@ function parseNum(raw: string | undefined): number {
   return Number.isFinite(n) ? n : 0;
 }
 
+const CANCELLED_STATUSES = new Set(["FAILED", "REJECTED", "CANCELLED"]);
+
+// Same tag rule as COMPLETE BUY rows: only "coiniossip" is a SIP.
+function buyLotType(tag: string | undefined): "sip" | "lumpsum" {
+  return (tag ?? "").trim().toLowerCase() === "coiniossip" ? "sip" : "lumpsum";
+}
+
+interface PendingRow {
+  client_id: string;
+  isin: string;
+  scheme_name: string;
+  trade_date: string;
+  amount: number;
+  lot_type: "sip" | "lumpsum";
+  ordered_at: string;
+  remarks: string;
+}
+
 interface TransactionRow {
   client_id: string;
   isin: string;
@@ -186,8 +233,9 @@ interface TransactionRow {
   transactionType: "BUY" | "SELL";
 }
 
-// Parses a Zerodha Coin "Order History" CSV export. Only COMPLETE orders are
-// considered. BUY rows become purchase lots; SELL rows reduce the position —
+// Parses a Zerodha Coin "Order History" CSV export. Only COMPLETE orders
+// become lots; PROCESSING BUY orders are returned separately as
+// `pending_orders` (never in funds[] or totals). BUY rows become purchase lots; SELL rows reduce the position —
 // netted against same-CSV buys where possible (see the grouping pass below),
 // otherwise reported in `sell_transactions` for the confirm route to apply
 // against existing mf_holdings rows.
@@ -206,10 +254,40 @@ export async function parseCoinCsv(csvText: string): Promise<CoinParseResult> {
 
   const transactionRows: TransactionRow[] = [];
   const excluded_etfs: ExcludedRow[] = [];
+  const pendingRows: PendingRow[] = [];
+  const cancelledRaw: { client_id: string; isin: string; amount: number; trade_date: string; lot_type: "sip" | "lumpsum" }[] = [];
 
   for (const r of parsed.data) {
     const status = (r.status ?? "").trim().toUpperCase();
-    if (status !== "COMPLETE") continue;
+
+    // Non-COMPLETE BUY rows: PROCESSING orders become pending orders,
+    // FAILED / REJECTED / CANCELLED ones only clear a matching pending order.
+    // Non-COMPLETE SELL rows and ETFs are still ignored.
+    if (status !== "COMPLETE") {
+      const schemeName = (r.scheme_name ?? "").trim();
+      const mode = (r.transaction_mode ?? "").trim().toUpperCase();
+      const isin = (r.isin ?? "").trim();
+      const amount = parseNum(r.amount);
+      if (!schemeName || mode !== "BUY" || !isin || amount <= 0 || isEtf(schemeName)) continue;
+      const base = {
+        client_id: (r.client_id ?? "").trim(),
+        isin,
+        amount,
+        trade_date: parseCoinDate(r.trade_date ?? ""),
+        lot_type: buyLotType(r.tag),
+      };
+      if (CANCELLED_STATUSES.has(status)) {
+        cancelledRaw.push(base);
+      } else if (status === "PROCESSING" || parseNum(r.units) === 0 || parseNum(r.nav) === 0) {
+        pendingRows.push({
+          ...base,
+          scheme_name: schemeName,
+          ordered_at: (r.ordered_at ?? "").trim(),
+          remarks: (r.remarks ?? "").trim(),
+        });
+      }
+      continue;
+    }
 
     const schemeNameRaw = (r.scheme_name ?? "").trim();
     if (!schemeNameRaw) continue;
@@ -282,11 +360,18 @@ export async function parseCoinCsv(csvText: string): Promise<CoinParseResult> {
   // timeout on a large CSV. A single Promise.all resolves them all in a
   // couple of seconds regardless of how many there are.
   const searchCache = new Map<string, string | null>();
-  const unknownIsinRows = new Map<string, TransactionRow>();
+  const unknownIsinRows = new Map<string, { scheme_name: string }>();
   for (const rows of groupList) {
     const isin = rows[0].isin;
     if (!KNOWN_ISIN_MAP[isin] && !unknownIsinRows.has(isin)) {
       unknownIsinRows.set(isin, rows[0]);
+    }
+  }
+  // Pending orders resolve in the same batch — a fund that only has
+  // PROCESSING rows in this CSV still needs a scheme_code.
+  for (const row of pendingRows) {
+    if (!KNOWN_ISIN_MAP[row.isin] && !unknownIsinRows.has(row.isin)) {
+      unknownIsinRows.set(row.isin, row);
     }
   }
 
@@ -467,6 +552,37 @@ export async function parseCoinCsv(csvText: string): Promise<CoinParseResult> {
     });
   }
 
+  const ownerFor = (clientId: string): Owner => CLIENT_ID_OWNER[clientId] ?? "praveen";
+
+  const pending_orders: PendingOrder[] = pendingRows.map((row) => {
+    const known = KNOWN_ISIN_MAP[row.isin];
+    const cleanedName = known?.scheme_name ?? normalizeSchemeName(row.scheme_name);
+    if (!CLIENT_ID_OWNER[row.client_id]) {
+      errors.push(`Unrecognized client_id "${row.client_id}" for pending ${cleanedName} — defaulted to Praveen`);
+    }
+    return {
+      isin: row.isin,
+      scheme_name: cleanedName,
+      scheme_code: known ? known.scheme_code : searchCache.get(row.isin) ?? null,
+      owner: ownerFor(row.client_id),
+      category: known ? known.category : detectCategory(cleanedName).category,
+      amc: known ? known.amc : extractAmc(cleanedName),
+      lot_type: row.lot_type,
+      amount: row.amount,
+      trade_date: row.trade_date,
+      ordered_at: row.ordered_at,
+      remarks: row.remarks,
+    };
+  });
+
+  const cancelled_orders: CancelledOrder[] = cancelledRaw.map((row) => ({
+    isin: row.isin,
+    owner: ownerFor(row.client_id),
+    amount: row.amount,
+    trade_date: row.trade_date,
+    lot_type: row.lot_type,
+  }));
+
   const total_invested = funds.reduce((s, f) => s + f.total_invested, 0);
   const owner_split = {
     praveen: funds.filter((f) => f.owner === "praveen").reduce((s, f) => s + f.total_invested, 0),
@@ -482,6 +598,8 @@ export async function parseCoinCsv(csvText: string): Promise<CoinParseResult> {
     funds,
     excluded_etfs,
     sell_transactions,
+    pending_orders,
+    cancelled_orders,
     total_invested,
     owner_split,
     date_range: { from: allDates[0] ?? "", to: allDates[allDates.length - 1] ?? "" },

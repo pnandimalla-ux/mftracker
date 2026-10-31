@@ -559,6 +559,26 @@ export default function DashboardClient({
   const [toast, setToast] = useState<string | null>(null);
 
   const [history, setHistory] = useState<{ points: HistoryPoint[]; day_change: DayChange | null } | null>(null);
+
+  // Coin orders not yet settled (mf_pending_orders) — shown beside Invested
+  // only; never part of invested / current value / P&L / XIRR.
+  const [pendingOrders, setPendingOrders] = useState<{ owner: string; amount: number }[]>([]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const { data, error } = await createClient().from("mf_pending_orders").select("owner, amount");
+        if (error) throw error;
+        setPendingOrders((data ?? []).map((r) => ({ owner: r.owner as string, amount: Number(r.amount) })));
+      } catch (err) {
+        console.error("Failed to load pending orders:", err);
+        setPendingOrders([]);
+      }
+    })();
+  }, []);
+  const pendingSummary = useMemo(() => {
+    const list = owner === "family" ? pendingOrders : pendingOrders.filter((p) => p.owner === owner);
+    return { total: list.reduce((sum, p) => sum + p.amount, 0), count: list.length };
+  }, [pendingOrders, owner]);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const historyRequestRef = useRef(0);
@@ -2250,7 +2270,21 @@ export default function DashboardClient({
                 warnings={concentrationWarnings}
               />
               <div className="grid grid-cols-2 gap-3">
-                <StatCard label="Invested" value={formatInrShort(kpis.totalInvested, 2)} sub={formatInrFull(kpis.totalInvested)} />
+                <StatCard
+                  label="Invested"
+                  value={formatInrShort(kpis.totalInvested, 2)}
+                  sub={
+                    <>
+                      {formatInrFull(kpis.totalInvested)}
+                      {pendingSummary.count > 0 && (
+                        <span className="block truncate text-[11px] text-slate-400">
+                          + {formatInrFull(pendingSummary.total)} processing ({pendingSummary.count} order
+                          {pendingSummary.count === 1 ? "" : "s"})
+                        </span>
+                      )}
+                    </>
+                  }
+                />
                 <StatCard
                   label="Funds held"
                   value={groupedHoldings.length}

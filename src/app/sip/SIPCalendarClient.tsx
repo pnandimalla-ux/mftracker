@@ -57,6 +57,18 @@ export interface SipLotEntry {
   owner: Owner;
 }
 
+// A Coin order that hasn't settled yet (mf_pending_orders) — no units yet.
+export interface PendingOrderEntry {
+  trade_date: string;
+  amount: number;
+  scheme_code: string | null;
+  scheme_name: string;
+  owner: Owner;
+  lot_type: "sip" | "lumpsum";
+  ordered_at: string | null;
+  remarks: string | null;
+}
+
 export interface SellEntry {
   trade_date: string;
   amount: number;
@@ -252,7 +264,10 @@ function realSchemeCode(code: string | null | undefined): string | null {
 
 // Same fund + owner: scheme_code when both sides have a real one, else a
 // case-insensitive scheme_name match.
-function lotMatchesSip(lot: SipLotEntry, sip: MFSIPSchedule): boolean {
+function lotMatchesSip(
+  lot: { owner: Owner; scheme_code: string | null; scheme_name: string },
+  sip: MFSIPSchedule
+): boolean {
   if (lot.owner !== sip.owner) return false;
   const lotCode = realSchemeCode(lot.scheme_code);
   const sipCode = realSchemeCode(sip.scheme_code);
@@ -260,7 +275,10 @@ function lotMatchesSip(lot: SipLotEntry, sip: MFSIPSchedule): boolean {
   return lot.scheme_name.trim().toLowerCase() === sip.scheme_name.trim().toLowerCase();
 }
 
-type SipChipStatus = "executed" | "missed" | "upcoming";
+type SipChipStatus = "executed" | "processing" | "missed" | "upcoming";
+
+// A pending order this many days old is probably stuck.
+const PENDING_STALE_DAYS = 7;
 
 interface SipChip {
   key: string;
@@ -269,36 +287,82 @@ interface SipChip {
   scheduled: Date;
   isWeekend: boolean;
   lot: SipLotEntry | null;
-  // Set when the matched lot executed in a different month from the
-  // scheduled occurrence (e.g. 31 Oct for a 1 Nov SIP).
+  pending: PendingOrderEntry | null;
+  // Pending order older than PENDING_STALE_DAYS.
+  stale: boolean;
+  // Set when the matched lot / pending order is in a different month from
+  // the scheduled occurrence (e.g. 31 Oct for a 1 Nov SIP).
   shift: "early" | "late" | null;
   // Which side of a cross-month match this chip represents: the scheduled
   // day in the occurrence's month, or the execution day in the lot's month.
   shownOn: "scheduled" | "lot";
 }
 
+interface UnscheduledPending {
+  order: PendingOrderEntry;
+  stale: boolean;
+}
+
 interface SipCalendarView {
   // Schedule-linked chips, keyed by the day they're shown on: the actual
-  // execution day for executed instalments, the scheduled day otherwise.
+  // execution / order day for executed or processing instalments, the
+  // scheduled day otherwise.
   chipsByDay: Map<number, SipChip[]>;
   // Executed SIP lots in the month that matched no schedule.
   unscheduledByDay: Map<number, SipLotEntry[]>;
+  // Pending orders in the month that matched no schedule (incl. lumpsums).
+  unscheduledPendingByDay: Map<number, UnscheduledPending[]>;
   executedTotal: number;
   executedCount: number;
+  processingTotal: number;
+  processingCount: number;
+}
+
+type Occ = { key: string; sip: MFSIPSchedule; date: Date; isWeekend: boolean };
+
+// Pairs occurrences with items (each side at most once) within ±3 days,
+// greedily by smallest distance. Occurrences already in `taken` are skipped.
+function greedyMatch<T extends { owner: Owner; scheme_code: string | null; scheme_name: string }>(
+  occurrences: Occ[],
+  items: { item: T; date: Date }[],
+  taken: Set<number>
+): Map<number, number> {
+  const pairs: { occIdx: number; itemIdx: number; dist: number }[] = [];
+  occurrences.forEach((occ, occIdx) => {
+    if (taken.has(occIdx)) return;
+    items.forEach(({ item, date }, itemIdx) => {
+      const dist = Math.round(Math.abs(date.getTime() - occ.date.getTime()) / DAY_MS);
+      if (dist <= SIP_MATCH_TOLERANCE_DAYS && lotMatchesSip(item, occ.sip)) {
+        pairs.push({ occIdx, itemIdx, dist });
+      }
+    });
+  });
+  pairs.sort((a, b) => a.dist - b.dist);
+
+  const occToItem = new Map<number, number>();
+  const usedItems = new Set<number>();
+  for (const p of pairs) {
+    if (occToItem.has(p.occIdx) || usedItems.has(p.itemIdx)) continue;
+    occToItem.set(p.occIdx, p.itemIdx);
+    usedItems.add(p.itemIdx);
+  }
+  return occToItem;
 }
 
 // Projects every schedule for the viewed month (plus the neighbouring months,
 // so an instalment executed on the 31st can match a scheduled 1st) and pairs
-// each projected occurrence with at most one executed SIP lot of the same
-// fund within ±3 days — greedily, smallest distance first.
+// each occurrence with an executed SIP lot of the same fund within ±3 days;
+// occurrences still unmatched then pair with a pending (processing) SIP
+// order. Priority: executed lot > pending order > nothing.
 function computeSipCalendarView(
   sips: MFSIPSchedule[],
   sipLots: SipLotEntry[],
+  pendingOrders: PendingOrderEntry[],
   year: number,
   month: number,
   today: Date
 ): SipCalendarView {
-  const occurrences: { key: string; sip: MFSIPSchedule; date: Date; isWeekend: boolean }[] = [];
+  const occurrences: Occ[] = [];
   for (const offset of [-1, 0, 1]) {
     const d = new Date(year, month + offset, 1);
     computeOccurrences(sips, d.getFullYear(), d.getMonth()).forEach((list, day) => {
@@ -311,31 +375,20 @@ function computeSipCalendarView(
 
   const windowStart = new Date(year, month - 1, 1).getTime();
   const windowEnd = new Date(year, month + 2, 0).getTime();
-  const lots = sipLots
-    .map((lot) => ({ lot, date: localDateFromIso(lot.trade_date) }))
-    .filter(({ date }) => date.getTime() >= windowStart && date.getTime() <= windowEnd);
+  const inWindow = ({ date }: { date: Date }) => date.getTime() >= windowStart && date.getTime() <= windowEnd;
 
-  const pairs: { occIdx: number; lotIdx: number; dist: number }[] = [];
-  occurrences.forEach((occ, occIdx) => {
-    lots.forEach(({ lot, date }, lotIdx) => {
-      const dist = Math.round(Math.abs(date.getTime() - occ.date.getTime()) / DAY_MS);
-      if (dist <= SIP_MATCH_TOLERANCE_DAYS && lotMatchesSip(lot, occ.sip)) {
-        pairs.push({ occIdx, lotIdx, dist });
-      }
-    });
-  });
-  pairs.sort((a, b) => a.dist - b.dist);
+  const lots = sipLots.map((item) => ({ item, date: localDateFromIso(item.trade_date) })).filter(inWindow);
+  const pendings = pendingOrders.map((item) => ({ item, date: localDateFromIso(item.trade_date) })).filter(inWindow);
+  const pendingSips = pendings.filter(({ item }) => item.lot_type === "sip");
 
-  const occToLot = new Map<number, number>();
-  const usedLots = new Set<number>();
-  for (const p of pairs) {
-    if (occToLot.has(p.occIdx) || usedLots.has(p.lotIdx)) continue;
-    occToLot.set(p.occIdx, p.lotIdx);
-    usedLots.add(p.lotIdx);
-  }
+  const occToLot = greedyMatch(occurrences, lots, new Set());
+  const occToPending = greedyMatch(occurrences, pendingSips, new Set(occToLot.keys()));
+  const usedLots = new Set(occToLot.values());
+  const usedPendingOrders = new Set(Array.from(occToPending.values()).map((i) => pendingSips[i].item));
 
   const inViewedMonth = (d: Date) => d.getFullYear() === year && d.getMonth() === month;
   const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+  const staleBefore = todayStart.getTime() - PENDING_STALE_DAYS * DAY_MS;
 
   const chipsByDay = new Map<number, SipChip[]>();
   const pushChip = (day: number, chip: SipChip) => {
@@ -344,40 +397,52 @@ function computeSipCalendarView(
     chipsByDay.set(day, list);
   };
 
+  // Shared placement for executed and processing matches: same month → on
+  // the actual day; cross-month → on the scheduled day in the occurrence's
+  // month AND on the actual day in the other month, labelled as such.
+  const placeMatched = (occ: Occ, actual: Date, chip: Omit<SipChip, "key" | "shift" | "shownOn">) => {
+    const sameMonth =
+      actual.getFullYear() === occ.date.getFullYear() && actual.getMonth() === occ.date.getMonth();
+    if (sameMonth) {
+      if (inViewedMonth(actual)) pushChip(actual.getDate(), { ...chip, key: occ.key, shift: null, shownOn: "lot" });
+      return;
+    }
+    const shift = actual < occ.date ? ("early" as const) : ("late" as const);
+    if (inViewedMonth(occ.date)) {
+      pushChip(occ.date.getDate(), { ...chip, key: `${occ.key}-sched`, shift, shownOn: "scheduled" });
+    }
+    if (inViewedMonth(actual)) {
+      pushChip(actual.getDate(), { ...chip, key: `${occ.key}-lot`, shift, shownOn: "lot" });
+    }
+  };
+
   occurrences.forEach((occ, occIdx) => {
+    const base = { sip: occ.sip, scheduled: occ.date, isWeekend: occ.isWeekend };
     const lotIdx = occToLot.get(occIdx);
     if (lotIdx !== undefined) {
-      const { lot, date } = lots[lotIdx];
-      const sameMonth =
-        date.getFullYear() === occ.date.getFullYear() && date.getMonth() === occ.date.getMonth();
-      const base = {
-        key: occ.key,
-        status: "executed" as const,
-        sip: occ.sip,
-        scheduled: occ.date,
-        isWeekend: occ.isWeekend,
-        lot,
-        shift: sameMonth ? null : date < occ.date ? ("early" as const) : ("late" as const),
-      };
-      if (sameMonth) {
-        if (inViewedMonth(date)) pushChip(date.getDate(), { ...base, shownOn: "lot" });
-        return;
-      }
-      // Cross-month: the occurrence's month shows it on the scheduled day;
-      // the lot's month shows it on the execution day, labelled as the other
-      // month's instalment.
-      if (inViewedMonth(occ.date)) pushChip(occ.date.getDate(), { ...base, key: `${occ.key}-sched`, shownOn: "scheduled" });
-      if (inViewedMonth(date)) pushChip(date.getDate(), { ...base, key: `${occ.key}-lot`, shownOn: "lot" });
+      placeMatched(occ, lots[lotIdx].date, { ...base, status: "executed", lot: lots[lotIdx].item, pending: null, stale: false });
+      return;
+    }
+    const pendingIdx = occToPending.get(occIdx);
+    if (pendingIdx !== undefined) {
+      const { item, date } = pendingSips[pendingIdx];
+      placeMatched(occ, date, {
+        ...base,
+        status: "processing",
+        lot: null,
+        pending: item,
+        stale: date.getTime() < staleBefore,
+      });
       return;
     }
     if (!inViewedMonth(occ.date)) return;
     pushChip(occ.date.getDate(), {
+      ...base,
       key: occ.key,
       status: occ.date < todayStart ? "missed" : "upcoming",
-      sip: occ.sip,
-      scheduled: occ.date,
-      isWeekend: occ.isWeekend,
       lot: null,
+      pending: null,
+      stale: false,
       shift: null,
       shownOn: "scheduled",
     });
@@ -386,17 +451,38 @@ function computeSipCalendarView(
   const unscheduledByDay = new Map<number, SipLotEntry[]>();
   let executedTotal = 0;
   let executedCount = 0;
-  lots.forEach(({ lot, date }, lotIdx) => {
+  lots.forEach(({ item, date }, lotIdx) => {
     if (!inViewedMonth(date)) return;
-    executedTotal += lot.amount;
+    executedTotal += item.amount;
     executedCount++;
     if (usedLots.has(lotIdx)) return;
     const list = unscheduledByDay.get(date.getDate()) ?? [];
-    list.push(lot);
+    list.push(item);
     unscheduledByDay.set(date.getDate(), list);
   });
 
-  return { chipsByDay, unscheduledByDay, executedTotal, executedCount };
+  const unscheduledPendingByDay = new Map<number, UnscheduledPending[]>();
+  let processingTotal = 0;
+  let processingCount = 0;
+  pendings.forEach(({ item, date }) => {
+    if (!inViewedMonth(date)) return;
+    processingTotal += item.amount;
+    processingCount++;
+    if (usedPendingOrders.has(item)) return;
+    const list = unscheduledPendingByDay.get(date.getDate()) ?? [];
+    list.push({ order: item, stale: date.getTime() < staleBefore });
+    unscheduledPendingByDay.set(date.getDate(), list);
+  });
+
+  return {
+    chipsByDay,
+    unscheduledByDay,
+    unscheduledPendingByDay,
+    executedTotal,
+    executedCount,
+    processingTotal,
+    processingCount,
+  };
 }
 
 export default function SIPCalendarClient({
@@ -405,12 +491,14 @@ export default function SIPCalendarClient({
   initialLumpsums,
   initialSells,
   initialSipLots,
+  initialPendingOrders,
 }: {
   userEmail: string;
   initialSips: MFSIPSchedule[];
   initialLumpsums: LumpsumEntry[];
   initialSells: SellEntry[];
   initialSipLots: SipLotEntry[];
+  initialPendingOrders: PendingOrderEntry[];
 }) {
   const today = useMemo(() => new Date(), []);
 
@@ -418,6 +506,7 @@ export default function SIPCalendarClient({
   const [lumpsums] = useState<LumpsumEntry[]>(initialLumpsums);
   const [sells] = useState<SellEntry[]>(initialSells);
   const [sipLots] = useState<SipLotEntry[]>(initialSipLots);
+  const [pendingOrders] = useState<PendingOrderEntry[]>(initialPendingOrders);
   const [viewYear, setViewYear] = useState(today.getFullYear());
   const [viewMonth, setViewMonth] = useState(today.getMonth());
   const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>("all");
@@ -485,8 +574,8 @@ export default function SIPCalendarClient({
   );
 
   const sipView = useMemo(
-    () => computeSipCalendarView(sips, sipLots, viewYear, viewMonth, today),
-    [sips, sipLots, viewYear, viewMonth, today]
+    () => computeSipCalendarView(sips, sipLots, pendingOrders, viewYear, viewMonth, today),
+    [sips, sipLots, pendingOrders, viewYear, viewMonth, today]
   );
 
   const lumpsumsByDay = useMemo(
@@ -725,7 +814,7 @@ export default function SIPCalendarClient({
 
       <main className="mx-auto max-w-6xl px-4 py-8">
         {/* Summary bar */}
-        <div className="mb-6 grid grid-cols-1 gap-4 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-5">
+        <div className="mb-6 grid grid-cols-1 gap-4 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-6">
           <div>
             <p className="text-xs font-medium text-slate-500">
               Total SIP this month
@@ -739,6 +828,13 @@ export default function SIPCalendarClient({
             <p className="mt-1 text-xl font-semibold text-slate-900">
               ₹{Math.round(sipView.executedTotal).toLocaleString("en-IN")}{" "}
               <span className="text-sm font-normal text-slate-500">({sipView.executedCount})</span>
+            </p>
+          </div>
+          <div>
+            <p className="text-xs font-medium text-slate-500">Processing</p>
+            <p className="mt-1 text-xl font-semibold text-slate-900">
+              ₹{Math.round(sipView.processingTotal).toLocaleString("en-IN")}{" "}
+              <span className="text-sm font-normal text-slate-500">({sipView.processingCount})</span>
             </p>
           </div>
           <div>
@@ -829,6 +925,11 @@ export default function SIPCalendarClient({
                     (l) => ownerFilter === "all" || l.owner === ownerFilter
                   )
                 : [];
+              const dayPending = day
+                ? (sipView.unscheduledPendingByDay.get(day) ?? []).filter(
+                    (p) => ownerFilter === "all" || p.order.owner === ownerFilter
+                  )
+                : [];
               const dayLumpsums = day
                 ? (lumpsumsByDay.get(day) ?? []).filter(
                     (l) => ownerFilter === "all" || l.owner === ownerFilter
@@ -853,13 +954,23 @@ export default function SIPCalendarClient({
                         {day}
                       </span>
                       <div className="mt-1 flex flex-col gap-1">
-                        {occ.map(({ key, status, sip, scheduled, isWeekend, lot, shift, shownOn }) => {
+                        {occ.map(({ key, status, sip, scheduled, isWeekend, lot, pending, stale, shift, shownOn }) => {
                           const isPraveen = sip.owner === "praveen";
-                          const amount = lot?.amount ?? sip.amount;
+                          const amount = lot?.amount ?? pending?.amount ?? sip.amount;
                           let title = `${sip.scheme_name} — ₹${sip.amount.toLocaleString("en-IN")}`;
                           let chipClass = isPraveen ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700";
                           let label = `${sip.scheme_name} · ₹${amount.toLocaleString("en-IN")}`;
-                          if (status === "executed" && lot && shift) {
+                          if (status === "processing" && pending) {
+                            const orderDate = localDateFromIso(pending.trade_date);
+                            title =
+                              `⏳ ${sip.scheme_name}\nProcessing since ${formatDayMonth(orderDate)} · ₹${pending.amount.toLocaleString("en-IN")} · units not allotted yet` +
+                              (shift ? `\nFor the ${formatShortDate(scheduled)} instalment (${shift})` : "") +
+                              (stale ? "\nStill processing after 7 days — check Coin; re-import once settled" : "");
+                            chipClass = `border border-dashed bg-white ${isPraveen ? "border-blue-400 text-blue-700" : "border-amber-400 text-amber-700"}`;
+                            if (shift && shownOn === "lot") {
+                              label = `${sip.scheme_name} · ${MONTH_NAMES[scheduled.getMonth()].slice(0, 3)} ${ordinal(scheduled.getDate())} SIP (${shift})`;
+                            }
+                          } else if (status === "executed" && lot && shift) {
                             const lotDate = localDateFromIso(lot.trade_date);
                             const detail = `₹${lot.amount.toLocaleString("en-IN")} · ${formatUnits(lot.units)} units`;
                             if (shownOn === "scheduled") {
@@ -891,6 +1002,8 @@ export default function SIPCalendarClient({
                                 className={`block truncate rounded-full px-2 py-0.5 pr-4 text-[10px] font-medium ${chipClass}`}
                               >
                                 {status === "executed" && "✓ "}
+                                {status === "processing" && stale && <span className="font-bold text-amber-500">! </span>}
+                                {status === "processing" && "⏳ "}
                                 {status === "missed" && <span className="font-bold text-red-400">! </span>}
                                 {label}
                               </span>
@@ -922,6 +1035,23 @@ export default function SIPCalendarClient({
                             }`}
                           >
                             ✓ {l.scheme_name} · {formatMoneyAbbrev(l.amount)} · SIP (no schedule)
+                          </span>
+                        ))}
+                        {dayPending.map(({ order, stale }, pi) => (
+                          <span
+                            key={`pending-${pi}`}
+                            title={
+                              `⏳ ${order.scheme_name} (${order.lot_type === "sip" ? "SIP" : "Lumpsum"})\n` +
+                              `Processing since ${formatDayMonth(localDateFromIso(order.trade_date))} · ₹${order.amount.toLocaleString("en-IN")} · units not allotted yet` +
+                              (order.remarks ? `\n${order.remarks}` : "") +
+                              (stale ? "\nStill processing after 7 days — check Coin; re-import once settled" : "")
+                            }
+                            className={`block truncate rounded-full border border-dashed bg-white px-2 py-0.5 text-[10px] font-medium ${
+                              order.owner === "praveen" ? "border-blue-400 text-blue-700" : "border-amber-400 text-amber-700"
+                            }`}
+                          >
+                            {stale && <span className="font-bold text-amber-500">! </span>}⏳ {order.scheme_name} ·{" "}
+                            {formatMoneyAbbrev(order.amount)} · {order.lot_type === "sip" ? "SIP" : "lumpsum"} processing
                           </span>
                         ))}
                         {dayLumpsums.map((l, li) => (
@@ -980,6 +1110,11 @@ export default function SIPCalendarClient({
             <span className="flex items-center gap-1.5">
               <span className="rounded-full border border-blue-400 bg-white px-2 py-0.5 text-[10px] font-medium text-blue-700">✓ Nov 1st SIP (early)</span>
               Executed early/late for another month&apos;s SIP
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="rounded-full border border-dashed border-blue-400 bg-white px-2 py-0.5 text-[10px] font-medium text-blue-700">⏳ SIP</span>
+              Processing (Coin hasn&apos;t settled it yet;{" "}
+              <span className="font-bold text-amber-500">!</span> = over 7 days)
             </span>
             <span className="flex items-center gap-1.5">
               <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700">Praveen</span>

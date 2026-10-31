@@ -1,6 +1,6 @@
 // Assertion script for src/lib/sipDetection.ts — the project has no test
 // framework. Run with `npm run test:sip`.
-import { detectActiveSips, type DetectedSip, type SipDetectionFund } from "@/lib/sipDetection";
+import { detectActiveSips, withPendingSips, type DetectedSip, type SipDetectionFund } from "@/lib/sipDetection";
 import type { SIPFrequency } from "@/types/mf";
 
 let failures = 0;
@@ -99,6 +99,43 @@ check("T.I.G.E.R. 1st+16th, 1st executed early on 30th", [
   { frequency: "monthly", sip_date: 1 },
   { frequency: "monthly", sip_date: 16 },
 ]);
+
+// Pending (PROCESSING) SIP orders count as SIP dates.
+function checkWithPending(name: string, complete: string[], pending: string[], expected: Expected[]) {
+  const base = complete.length > 0 ? [{ ...fund(name, complete.map((d) => [d] as [string])), isin: "INF000TEST" }] : [];
+  const merged = withPendingSips(
+    base,
+    pending.map((d) => ({
+      isin: "INF000TEST",
+      scheme_name: name,
+      scheme_code: null,
+      owner: "geetha" as const,
+      category: "Equity",
+      amount: 10000,
+      trade_date: `2026-${d}`,
+      lot_type: "sip",
+    }))
+  );
+  const got = detectActiveSips(merged);
+  const problems: string[] = [];
+  if (got.length !== expected.length) problems.push(`expected ${expected.length} schedule(s), got ${got.length}`);
+  else {
+    const g = [...got].sort((a, b) => a.sip_date - b.sip_date);
+    expected.forEach((e, i) => {
+      if (g[i].frequency !== e.frequency) problems.push(`#${i} frequency ${g[i].frequency} != ${e.frequency}`);
+      if (e.sip_date !== undefined && g[i].sip_date !== e.sip_date) problems.push(`#${i} day ${g[i].sip_date} != ${e.sip_date}`);
+    });
+  }
+  if (problems.length > 0) failures++;
+  const summary = got.map((x) => `${x.frequency}@${x.sip_date}`).join(", ");
+  console.log(`${problems.length ? "FAIL" : "PASS"}  ${name}: [${summary}]${problems.length ? " — " + problems.join("; ") : ""}`);
+}
+
+checkWithPending("T.I.G.E.R. complete 1st+16th + pending 31st", ["10-01", "10-16"], ["10-31"], [
+  { frequency: "monthly", sip_date: 1 },
+  { frequency: "monthly", sip_date: 16 },
+]);
+checkWithPending("Only a pending SIP on the 31st", [], ["10-31"], [{ frequency: "monthly", sip_date: 31 }]);
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);

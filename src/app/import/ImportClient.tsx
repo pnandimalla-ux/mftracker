@@ -10,11 +10,19 @@ import {
 } from "react";
 import { useRouter } from "next/navigation";
 import AppHeader from "@/components/AppHeader";
-import type { CoinFund, CoinParseResult, ExcludedRow, LotType, SellRow } from "@/lib/parsers/coinCsvParser";
+import type {
+  CancelledOrder,
+  CoinFund,
+  CoinParseResult,
+  ExcludedRow,
+  LotType,
+  PendingOrder,
+  SellRow,
+} from "@/lib/parsers/coinCsvParser";
 import type { MFCASImport, Owner, SIPFrequency } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import { detectCategory, type DetectCategoryResult } from "@/lib/analysis/fundCategoriser";
-import { detectActiveSips, type DetectedSip } from "@/lib/sipDetection";
+import { detectActiveSips, withPendingSips, type DetectedSip } from "@/lib/sipDetection";
 
 type ConfidenceLevel = "high" | "medium" | "low";
 
@@ -126,6 +134,8 @@ export default function ImportClient({
   const [confirming, setConfirming] = useState(false);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
   const [importInfo, setImportInfo] = useState<string | null>(null);
+  const [pendingOrders, setPendingOrders] = useState<PendingOrder[]>([]);
+  const [cancelledOrders, setCancelledOrders] = useState<CancelledOrder[]>([]);
   const [historyToast, setHistoryToast] = useState<string | null>(null);
 
   // --- Step 4: active SIPs detected after import ---
@@ -266,6 +276,8 @@ export default function ImportClient({
     setPreviewFunds([]);
     setExcludedEtfs([]);
     setSellTransactions([]);
+    setPendingOrders([]);
+    setCancelledOrders([]);
     setParseErrorRows([]);
     setDuplicates([]);
     setParseError(null);
@@ -315,10 +327,19 @@ export default function ImportClient({
     }
 
     const funds = Array.from(fundMap.values());
+
+    // The same PROCESSING order can appear in two overlapping exports.
+    const pendingMap = new Map<string, PendingOrder>();
+    for (const o of results.flatMap((r) => r.pending_orders ?? [])) {
+      pendingMap.set(`${o.owner}|${o.isin}|${o.trade_date}|${o.amount}|${o.lot_type}`, o);
+    }
+
     return {
       funds,
       excluded_etfs: results.flatMap((r) => r.excluded_etfs),
       sell_transactions: results.flatMap((r) => r.sell_transactions),
+      pending_orders: Array.from(pendingMap.values()).sort((a, b) => a.trade_date.localeCompare(b.trade_date)),
+      cancelled_orders: results.flatMap((r) => r.cancelled_orders ?? []),
       total_invested: funds.reduce((s, f) => s + f.total_invested, 0),
       owner_split: {
         praveen: funds.filter((f) => f.owner === "praveen").reduce((s, f) => s + f.total_invested, 0),
@@ -339,6 +360,8 @@ export default function ImportClient({
     setPreviewFunds([]);
     setExcludedEtfs([]);
     setSellTransactions([]);
+    setPendingOrders([]);
+    setCancelledOrders([]);
     setParseErrorRows([]);
     setDuplicates([]);
     setShowSipStep(false);
@@ -359,7 +382,7 @@ export default function ImportClient({
       );
 
       const merged = mergeCoinResults(results);
-      if (merged.funds.length === 0) {
+      if (merged.funds.length === 0 && merged.pending_orders.length === 0) {
         setParseError("No importable purchase lots were found in the uploaded file(s).");
       }
       setPreviewFunds(
@@ -372,6 +395,8 @@ export default function ImportClient({
       );
       setExcludedEtfs(merged.excluded_etfs);
       setSellTransactions(merged.sell_transactions);
+      setPendingOrders(merged.pending_orders);
+      setCancelledOrders(merged.cancelled_orders);
       setParseErrorRows(merged.errors);
 
       if (merged.funds.length > 0) {
@@ -498,6 +523,13 @@ export default function ImportClient({
   })();
 
   const selectedFunds = previewFunds.filter((f) => f.selected);
+  // Pending orders follow their fund's checkbox when the fund is in the
+  // preview; a fund with only PROCESSING rows has no checkbox and is kept.
+  const selectedPending = pendingOrders.filter(
+    (p) => !previewFunds.some((f) => f.isin === p.isin && f.owner === p.owner && !f.selected)
+  );
+  const pendingTotal = selectedPending.reduce((sum, p) => sum + p.amount, 0);
+  const canConfirm = selectedFunds.length > 0 || selectedPending.length > 0 || cancelledOrders.length > 0;
   const selectedTotal = selectedFunds.reduce((sum, f) => sum + f.total_invested, 0);
   const selectedLots = selectedFunds.reduce((sum, f) => sum + f.lots.length, 0);
 
@@ -509,7 +541,7 @@ export default function ImportClient({
   };
 
   const handleConfirmImport = async () => {
-    if (selectedFunds.length === 0) return;
+    if (!canConfirm) return;
     setConfirming(true);
     setParseError(null);
     setImportInfo(null);
@@ -532,6 +564,8 @@ export default function ImportClient({
             sell_units_excess: f.sell_units_excess ?? 0,
           })),
           sells: sellTransactions,
+          pending_orders: selectedPending,
+          cancelled_orders: cancelledOrders,
         }),
       });
       const json = await res.json();
@@ -545,7 +579,7 @@ export default function ImportClient({
       }
       if (nothingNew) {
         setImportInfo("All lots were already imported — reviewing SIP schedules");
-        const detected = detectActiveSips(selectedFunds);
+        const detected = detectActiveSips(withPendingSips(selectedFunds, selectedPending));
         if (detected.length > 0) {
           setSipCandidates(detected);
           setSipSelected(Object.fromEntries(detected.map((d) => [d.key, true])));
@@ -559,13 +593,18 @@ export default function ImportClient({
         json.sells_applied > 0 ? `${json.sells_applied} sell${json.sells_applied === 1 ? "" : "s"} applied` : null,
         json.funds_exited > 0 ? `${json.funds_exited} fund${json.funds_exited === 1 ? "" : "s"} fully exited` : null,
         json.lots_reduced > 0 ? `${json.lots_reduced} lot${json.lots_reduced === 1 ? "" : "s"} reduced` : null,
+        json.pending_saved > 0
+          ? `${json.pending_saved} processing order${json.pending_saved === 1 ? "" : "s"} saved`
+          : null,
+        json.pending_cleared > 0 ? `${json.pending_cleared} settled` : null,
       ].filter(Boolean);
-      setImportSuccess(
-        `${json.funds_imported} fund${json.funds_imported === 1 ? "" : "s"} imported (${json.lots_imported} lot${json.lots_imported === 1 ? "" : "s"} total)` +
-          (extras.length > 0 ? ` · ${extras.join(" · ")}` : "")
-      );
+      const lotsPart =
+        json.lots_imported > 0
+          ? `${json.funds_imported} fund${json.funds_imported === 1 ? "" : "s"} imported (${json.lots_imported} lot${json.lots_imported === 1 ? "" : "s"} total)`
+          : "No new lots";
+      setImportSuccess(lotsPart + (extras.length > 0 ? ` · ${extras.join(" · ")}` : ""));
 
-      const detected = detectActiveSips(selectedFunds);
+      const detected = detectActiveSips(withPendingSips(selectedFunds, selectedPending));
       if (detected.length > 0) {
         setSipCandidates(detected);
         setSipSelected(Object.fromEntries(detected.map((d) => [d.key, true])));
@@ -1447,11 +1486,16 @@ export default function ImportClient({
         </div>
 
         {/* Preview & confirm — full width */}
-        {previewFunds.length > 0 && (
+        {(previewFunds.length > 0 || pendingOrders.length > 0) && (
           <div className="mt-6 rounded-xl border border-slate-200 bg-white p-5">
             <h3 className="mb-1 text-base font-semibold text-slate-800">
               Found {previewFunds.length} mutual fund{previewFunds.length === 1 ? "" : "s"} · {foundTotalLots} purchase
               lot{foundTotalLots === 1 ? "" : "s"} · {formatMoney(foundTotalInvested)} total
+              {pendingOrders.length > 0 && (
+                <span className="ml-1 text-sm font-normal text-slate-500">
+                  + {formatMoney(pendingOrders.reduce((sum, p) => sum + p.amount, 0))} processing
+                </span>
+              )}
             </h3>
             <p className="text-sm text-slate-500">
               Praveen: {formatMoney(foundOwnerSplit.praveen)} · Geetha: {formatMoney(foundOwnerSplit.geetha)}
@@ -1710,6 +1754,64 @@ export default function ImportClient({
               </div>
             )}
 
+            {pendingOrders.length > 0 && (
+              <div className="mt-4 rounded-lg border border-dashed border-slate-300 bg-slate-50/60">
+                <p className="px-3 pt-2.5 text-sm font-medium text-slate-700">
+                  ⏳ Processing orders — {pendingOrders.length} order{pendingOrders.length === 1 ? "" : "s"} Coin
+                  hasn&apos;t settled yet
+                </p>
+                <p className="px-3 pb-2 text-xs text-slate-500">
+                  Not counted as invested. Each will be added as a lot when Coin settles it (re-import later).
+                </p>
+                <div className="overflow-x-auto border-t border-slate-200">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="text-slate-500">
+                        <th className="px-3 py-1.5 font-medium">Fund</th>
+                        <th className="px-3 py-1.5 font-medium">Owner</th>
+                        <th className="px-3 py-1.5 font-medium">Type</th>
+                        <th className="px-3 py-1.5 font-medium">Amount</th>
+                        <th className="px-3 py-1.5 font-medium">Date</th>
+                        <th className="px-3 py-1.5 font-medium">Remarks</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {pendingOrders.map((o) => {
+                        const included = selectedPending.includes(o);
+                        return (
+                          <tr
+                            key={`${o.owner}-${o.isin}-${o.trade_date}-${o.amount}-${o.lot_type}`}
+                            className={`border-t border-slate-100 ${included ? "" : "opacity-50"}`}
+                          >
+                            <td className="px-3 py-1.5 text-slate-700">{o.scheme_name}</td>
+                            <td className="px-3 py-1.5">
+                              <span
+                                className={`inline-flex h-5 w-5 items-center justify-center rounded-full text-[10px] font-semibold ${
+                                  o.owner === "praveen" ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700"
+                                }`}
+                              >
+                                {o.owner === "praveen" ? "P" : "G"}
+                              </span>
+                            </td>
+                            <td className="px-3 py-1.5 text-slate-600">{o.lot_type === "sip" ? "SIP" : "Lumpsum"}</td>
+                            <td className="px-3 py-1.5 tabular-nums text-slate-700">{formatMoney(o.amount)}</td>
+                            <td className="px-3 py-1.5 text-slate-600">
+                              {o.trade_date}
+                              {o.ordered_at ? ` · ${o.ordered_at}` : ""}
+                            </td>
+                            <td className="px-3 py-1.5 text-slate-500">
+                              {o.remarks || "—"}
+                              {!included && " (fund deselected — not saved)"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
+
             {excludedEtfs.length > 0 && (
               <div className="mt-3 rounded-lg border border-slate-200">
                 <button
@@ -1734,13 +1836,20 @@ export default function ImportClient({
               <p className="text-sm text-slate-600">
                 {selectedFunds.length} of {previewFunds.length} funds selected · Total invested:{" "}
                 {formatMoney(selectedTotal)}
+                {selectedPending.length > 0 && (
+                  <span className="text-slate-400"> + {formatMoney(pendingTotal)} processing</span>
+                )}
               </p>
               <button
                 onClick={handleConfirmImport}
-                disabled={confirming || selectedFunds.length === 0}
+                disabled={confirming || !canConfirm}
                 className="rounded-lg bg-blue-600 px-5 py-2 text-sm font-bold text-white transition hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {confirming ? "Importing…" : `Import ${selectedFunds.length} fund${selectedFunds.length === 1 ? "" : "s"} (${selectedLots} lot${selectedLots === 1 ? "" : "s"}) →`}
+                {confirming
+                  ? "Importing…"
+                  : selectedFunds.length === 0
+                    ? `Save ${selectedPending.length} processing order${selectedPending.length === 1 ? "" : "s"} →`
+                    : `Import ${selectedFunds.length} fund${selectedFunds.length === 1 ? "" : "s"} (${selectedLots} lot${selectedLots === 1 ? "" : "s"})${selectedPending.length > 0 ? ` + ${selectedPending.length} processing` : ""} →`}
               </button>
             </div>
           </div>
