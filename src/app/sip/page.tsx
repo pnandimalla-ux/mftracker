@@ -1,6 +1,6 @@
 import { redirect } from "next/navigation";
 import { getAuthedUser } from "@/lib/supabase/getAuthedUser";
-import SIPCalendarClient, { type LumpsumEntry, type SellEntry } from "./SIPCalendarClient";
+import SIPCalendarClient, { type LumpsumEntry, type SellEntry, type SipLotEntry } from "./SIPCalendarClient";
 import type { MFSIPSchedule, Owner } from "@/types/mf";
 
 function SIPPageError({ message }: { message: string }) {
@@ -89,12 +89,37 @@ export default async function SIPPage() {
     sells = [];
   }
 
+  let sipLots: SipLotEntry[] = [];
+
+  try {
+    const { data, error } = await supabase
+      .from("mf_holdings")
+      .select("as_on_date, invested_amount, units, scheme_code, scheme_name, owner")
+      .eq("user_id", user.id)
+      .eq("lot_type", "sip")
+      .order("as_on_date", { ascending: false });
+
+    if (error) throw error;
+    sipLots = (data ?? []).map((row) => ({
+      trade_date: row.as_on_date as string,
+      amount: Number(row.invested_amount),
+      units: Number(row.units),
+      scheme_code: (row.scheme_code as string | null) ?? null,
+      scheme_name: row.scheme_name as string,
+      owner: row.owner as Owner,
+    }));
+  } catch (err) {
+    console.error("SIP page: failed to load SIP lots", err);
+    sipLots = [];
+  }
+
   return (
     <SIPCalendarClient
       userEmail={user.email ?? ""}
       initialSips={sips}
       initialLumpsums={lumpsums}
       initialSells={sells}
+      initialSipLots={sipLots}
     />
   );
 }

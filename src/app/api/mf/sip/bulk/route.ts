@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { createClient } from "@/lib/supabase/server";
 import type { Owner, SIPFrequency } from "@/types/mf";
+import { dayDistance, SIP_DAY_TOLERANCE } from "@/lib/sipDetection";
 
 interface BulkSipInput {
   scheme_name: string;
@@ -72,31 +73,44 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "No valid SIPs to add" }, { status: 400 });
     }
 
-    // De-dupe against existing schedules for this user by owner + scheme_code
-    // — a manual/unmatched fund (no scheme_code) can't be deduped this way,
-    // so it's always inserted.
-    const schemeCodes = Array.from(
-      new Set(validItems.map((i) => i.scheme_code).filter((c): c is string => !!c))
-    );
-    const existingKeys = new Set<string>();
-    if (schemeCodes.length > 0) {
-      const { data: existingRows } = await supabase
-        .from("mf_sip_schedules")
-        .select("owner, scheme_code")
-        .eq("user_id", user.id)
-        .in("scheme_code", schemeCodes);
-      for (const row of existingRows ?? []) {
-        existingKeys.add(`${row.owner}:${row.scheme_code}`);
-      }
+    // De-dupe against existing schedules. A fund can legitimately have
+    // several SIPs on different dates (e.g. the 1st and the 16th), so an item
+    // is only a duplicate when the same owner + fund already has a schedule
+    // within SIP_DAY_TOLERANCE days of its sip_date. Funds without a
+    // scheme_code (manual / unmatched) match on scheme_name instead.
+    const { data: existingRows, error: existingError } = await supabase
+      .from("mf_sip_schedules")
+      .select("owner, scheme_code, scheme_name, sip_date, frequency")
+      .eq("user_id", user.id);
+    if (existingError) {
+      return NextResponse.json({ error: existingError.message }, { status: 500 });
+    }
+
+    const fundKey = (owner: string, scheme_code: string | null, scheme_name: string) =>
+      scheme_code ? `${owner}:code:${scheme_code}` : `${owner}:name:${scheme_name.trim().toLowerCase()}`;
+
+    const existingDays = new Map<string, number[]>();
+    const addExisting = (key: string, day: number) => {
+      const list = existingDays.get(key) ?? [];
+      list.push(day);
+      existingDays.set(key, list);
+    };
+    for (const row of existingRows ?? []) {
+      const day = Number(row.sip_date);
+      if (!Number.isFinite(day)) continue;
+      addExisting(fundKey(row.owner, row.scheme_code, row.scheme_name ?? ""), day);
+      // Let a manual item also collide with a coded schedule of the same name.
+      if (row.scheme_code && row.scheme_name) addExisting(fundKey(row.owner, null, row.scheme_name), day);
     }
 
     const rowsToInsert: Record<string, unknown>[] = [];
-    let skipped = 0;
+    const skippedItems: { scheme_name: string; owner: Owner; sip_date: number }[] = [];
 
     for (const item of validItems) {
-      const key = item.scheme_code ? `${item.owner}:${item.scheme_code}` : null;
-      if (key && existingKeys.has(key)) {
-        skipped++;
+      const key = fundKey(item.owner, item.scheme_code, item.scheme_name);
+      const days = existingDays.get(key) ?? [];
+      if (days.some((d) => dayDistance(d, item.sip_date) <= SIP_DAY_TOLERANCE)) {
+        skippedItems.push({ scheme_name: item.scheme_name, owner: item.owner, sip_date: item.sip_date });
         continue;
       }
 
@@ -115,12 +129,15 @@ export async function POST(request: Request) {
         notify_sms: false,
       });
 
-      // Avoid inserting the same owner+scheme_code twice within one batch.
-      if (key) existingKeys.add(key);
+      // Avoid inserting near-duplicates within one batch.
+      addExisting(key, item.sip_date);
+      if (item.scheme_code) addExisting(fundKey(item.owner, null, item.scheme_name), item.sip_date);
     }
 
+    const skipped = skippedItems.length;
+
     if (rowsToInsert.length === 0) {
-      return NextResponse.json({ created: 0, skipped });
+      return NextResponse.json({ created: 0, skipped, skipped_items: skippedItems });
     }
 
     const { data: inserted, error } = await supabase
@@ -132,7 +149,11 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: error.message }, { status: 500 });
     }
 
-    return NextResponse.json({ created: inserted?.length ?? rowsToInsert.length, skipped });
+    return NextResponse.json({
+      created: inserted?.length ?? rowsToInsert.length,
+      skipped,
+      skipped_items: skippedItems,
+    });
   } catch (err) {
     console.error("POST /api/mf/sip/bulk failed:", err);
     return NextResponse.json(

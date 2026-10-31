@@ -14,6 +14,7 @@ import type { CoinFund, CoinParseResult, ExcludedRow, LotType, SellRow } from "@
 import type { MFCASImport, Owner, SIPFrequency } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import { detectCategory, type DetectCategoryResult } from "@/lib/analysis/fundCategoriser";
+import { detectActiveSips, type DetectedSip } from "@/lib/sipDetection";
 
 type ConfidenceLevel = "high" | "medium" | "low";
 
@@ -55,77 +56,6 @@ interface DuplicateInfo {
 }
 
 type DuplicateAction = "skip" | "add_lots" | "replace";
-
-interface DetectedSip {
-  key: string;
-  scheme_name: string;
-  scheme_code: string | null;
-  owner: Owner;
-  amount: number;
-  sip_date: number;
-  category: string;
-  frequency: SIPFrequency;
-  start_date: string;
-}
-
-// Parses a "yyyy-mm-dd" string as a local date — never `new Date(iso)`,
-// which parses date-only strings as UTC midnight and causes off-by-one
-// day errors under IST (UTC+5:30).
-function parseLocalDate(iso: string): Date {
-  const [y, m, d] = iso.split("-").map(Number);
-  return new Date(y, m - 1, d);
-}
-
-function medianGapDays(datesAsc: string[]): number {
-  const gaps: number[] = [];
-  for (let i = 1; i < datesAsc.length; i++) {
-    const prev = parseLocalDate(datesAsc[i - 1]);
-    const curr = parseLocalDate(datesAsc[i]);
-    gaps.push(Math.round((curr.getTime() - prev.getTime()) / (24 * 60 * 60 * 1000)));
-  }
-  const sorted = [...gaps].sort((a, b) => a - b);
-  const mid = Math.floor(sorted.length / 2);
-  return sorted.length % 2 !== 0 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
-}
-
-// Detects each fund's SIP cadence from the spacing between its SIP-tagged
-// lots — a single lot defaults to monthly (there's no interval to measure),
-// otherwise the median gap between consecutive lots picks the frequency.
-function detectActiveSips(funds: PreviewFund[]): DetectedSip[] {
-  const results: DetectedSip[] = [];
-  for (const fund of funds) {
-    const sipLots = fund.lots.filter((l) => l.lot_type === "sip");
-    if (sipLots.length < 1) continue;
-
-    const sorted = [...sipLots].sort((a, b) => a.trade_date.localeCompare(b.trade_date));
-    const mostRecent = sorted[sorted.length - 1];
-
-    const day = Number(mostRecent.trade_date.split("-")[2]);
-    if (!Number.isInteger(day) || day < 1 || day > 31) continue;
-
-    let frequency: SIPFrequency = "monthly";
-    if (sorted.length >= 2) {
-      const gap = medianGapDays(sorted.map((l) => l.trade_date));
-      if (gap <= 10) frequency = "weekly";
-      else if (gap <= 20) frequency = "bi-weekly";
-      else if (gap <= 50) frequency = "monthly";
-      else frequency = "quarterly";
-    }
-
-    results.push({
-      key: fund.key,
-      scheme_name: fund.scheme_name,
-      scheme_code: fund.scheme_code,
-      owner: fund.owner,
-      amount: mostRecent.amount,
-      sip_date: day,
-      category: fund.category,
-      frequency,
-      start_date: sorted[0].trade_date,
-    });
-  }
-  return results;
-}
 
 function ordinalSuffix(n: number): string {
   const v = n % 100;
@@ -195,6 +125,7 @@ export default function ImportClient({
   const [deletingImportId, setDeletingImportId] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
   const [importSuccess, setImportSuccess] = useState<string | null>(null);
+  const [importInfo, setImportInfo] = useState<string | null>(null);
   const [historyToast, setHistoryToast] = useState<string | null>(null);
 
   // --- Step 4: active SIPs detected after import ---
@@ -339,6 +270,7 @@ export default function ImportClient({
     setDuplicates([]);
     setParseError(null);
     setImportSuccess(null);
+    setImportInfo(null);
   };
 
   const handleFileInputChange = (e: ChangeEvent<HTMLInputElement>) => {
@@ -413,6 +345,7 @@ export default function ImportClient({
     setSipCandidates([]);
     setSipSelected({});
     setSipAddResult(null);
+    setImportInfo(null);
     try {
       const results = await Promise.all(
         coinFiles.map(async (f) => {
@@ -579,6 +512,7 @@ export default function ImportClient({
     if (selectedFunds.length === 0) return;
     setConfirming(true);
     setParseError(null);
+    setImportInfo(null);
     try {
       const res = await fetch("/api/mf/import/coin/confirm", {
         method: "POST",
@@ -601,8 +535,24 @@ export default function ImportClient({
         }),
       });
       const json = await res.json();
-      if (!res.ok) {
+      // A re-import with nothing new still needs the SIP review step, so
+      // missing schedules (e.g. a second SIP date) can be added.
+      const nothingNew =
+        res.status === 400 && typeof json.error === "string" && json.error.includes("already imported");
+      if (!res.ok && !nothingNew) {
         setParseError(json.error ?? "Import failed.");
+        return;
+      }
+      if (nothingNew) {
+        setImportInfo("All lots were already imported — reviewing SIP schedules");
+        const detected = detectActiveSips(selectedFunds);
+        if (detected.length > 0) {
+          setSipCandidates(detected);
+          setSipSelected(Object.fromEntries(detected.map((d) => [d.key, true])));
+          setShowSipStep(true);
+        } else {
+          setImportInfo("All lots were already imported — no SIP lots found to review.");
+        }
         return;
       }
       const extras = [
@@ -666,7 +616,14 @@ export default function ImportClient({
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error ?? "Failed to add SIPs");
-      setSipAddResult(`${json.created} SIP(s) added, ${json.skipped} already existed`);
+      const skippedItems: { scheme_name: string; sip_date: number }[] = Array.isArray(json.skipped_items)
+        ? json.skipped_items
+        : [];
+      const skippedDetail =
+        skippedItems.length > 0
+          ? ` (${skippedItems.map((i) => `${i.scheme_name} · ${i.sip_date}${ordinalSuffix(i.sip_date)}`).join("; ")})`
+          : "";
+      setSipAddResult(`${json.created} SIP(s) added, ${json.skipped} already existed${skippedDetail}`);
     } catch (err) {
       console.error("Failed to add detected SIPs:", err);
       setSipAddResult("Failed to add SIPs. Please try again.");
@@ -992,6 +949,12 @@ export default function ImportClient({
             {importSuccess && (
               <p className="mt-3 rounded-lg bg-green-50 px-3 py-2 text-sm text-green-700">
                 {importSuccess} — redirecting to dashboard…
+              </p>
+            )}
+
+            {importInfo && (
+              <p className="mt-3 rounded-lg bg-blue-50 px-3 py-2 text-sm text-blue-700">
+                {importInfo}
               </p>
             )}
           </div>
@@ -1814,10 +1777,13 @@ export default function ImportClient({
                     {c.owner === "praveen" ? "P" : "G"}
                   </span>
                   <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-medium text-slate-800">{c.scheme_name}</p>
+                    <p className="truncate text-sm font-medium text-slate-800">
+                      {c.scheme_name} · {c.sip_date}
+                      {ordinalSuffix(c.sip_date)} · {FREQUENCY_LABELS[c.frequency].toLowerCase()} ·{" "}
+                      {formatMoney(c.amount)}
+                    </p>
                     <p className="text-xs text-slate-500">
-                      {formatMoney(c.amount)} · starts {c.start_date} · SIP date {c.sip_date}
-                      {ordinalSuffix(c.sip_date)} · {c.category}
+                      starts {c.start_date} · {c.category}
                     </p>
                   </div>
                   <select

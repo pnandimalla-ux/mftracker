@@ -47,6 +47,16 @@ export interface LumpsumEntry {
   owner: Owner;
 }
 
+// An executed SIP instalment — one mf_holdings lot with lot_type = 'sip'.
+export interface SipLotEntry {
+  trade_date: string;
+  amount: number;
+  units: number;
+  scheme_code: string | null;
+  scheme_name: string;
+  owner: Owner;
+}
+
 export interface SellEntry {
   trade_date: string;
   amount: number;
@@ -207,22 +217,185 @@ function computeOccurrences(
   return map;
 }
 
+// --- Executed vs pending SIP instalments ---
+
+// A SIP can execute a few days off its scheduled date (holidays/weekends).
+const SIP_MATCH_TOLERANCE_DAYS = 3;
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+function localDateFromIso(iso: string): Date {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+function isoFromLocal(d: Date): string {
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${mm}-${dd}`;
+}
+
+function formatShortDate(d: Date): string {
+  return `${d.getDate()} ${MONTH_NAMES[d.getMonth()].slice(0, 3)} ${d.getFullYear()}`;
+}
+
+function formatUnits(n: number): string {
+  return n.toLocaleString("en-IN", { maximumFractionDigits: 3 });
+}
+
+function realSchemeCode(code: string | null | undefined): string | null {
+  return code && !code.startsWith("manual-") ? code : null;
+}
+
+// Same fund + owner: scheme_code when both sides have a real one, else a
+// case-insensitive scheme_name match.
+function lotMatchesSip(lot: SipLotEntry, sip: MFSIPSchedule): boolean {
+  if (lot.owner !== sip.owner) return false;
+  const lotCode = realSchemeCode(lot.scheme_code);
+  const sipCode = realSchemeCode(sip.scheme_code);
+  if (lotCode && sipCode) return lotCode === sipCode;
+  return lot.scheme_name.trim().toLowerCase() === sip.scheme_name.trim().toLowerCase();
+}
+
+type SipChipStatus = "executed" | "missed" | "upcoming";
+
+interface SipChip {
+  key: string;
+  status: SipChipStatus;
+  sip: MFSIPSchedule;
+  scheduled: Date;
+  isWeekend: boolean;
+  lot: SipLotEntry | null;
+}
+
+interface SipCalendarView {
+  // Schedule-linked chips, keyed by the day they're shown on: the actual
+  // execution day for executed instalments, the scheduled day otherwise.
+  chipsByDay: Map<number, SipChip[]>;
+  // Executed SIP lots in the month that matched no schedule.
+  unscheduledByDay: Map<number, SipLotEntry[]>;
+  executedTotal: number;
+  executedCount: number;
+}
+
+// Projects every schedule for the viewed month (plus the neighbouring months,
+// so an instalment executed on the 31st can match a scheduled 1st) and pairs
+// each projected occurrence with at most one executed SIP lot of the same
+// fund within ±3 days — greedily, smallest distance first.
+function computeSipCalendarView(
+  sips: MFSIPSchedule[],
+  sipLots: SipLotEntry[],
+  year: number,
+  month: number,
+  today: Date
+): SipCalendarView {
+  const occurrences: { key: string; sip: MFSIPSchedule; date: Date; isWeekend: boolean }[] = [];
+  for (const offset of [-1, 0, 1]) {
+    const d = new Date(year, month + offset, 1);
+    computeOccurrences(sips, d.getFullYear(), d.getMonth()).forEach((list, day) => {
+      for (const o of list) {
+        const date = new Date(d.getFullYear(), d.getMonth(), day);
+        occurrences.push({ key: `${o.sip.id}-${isoFromLocal(date)}`, sip: o.sip, date, isWeekend: o.isWeekend });
+      }
+    });
+  }
+
+  const windowStart = new Date(year, month - 1, 1).getTime();
+  const windowEnd = new Date(year, month + 2, 0).getTime();
+  const lots = sipLots
+    .map((lot) => ({ lot, date: localDateFromIso(lot.trade_date) }))
+    .filter(({ date }) => date.getTime() >= windowStart && date.getTime() <= windowEnd);
+
+  const pairs: { occIdx: number; lotIdx: number; dist: number }[] = [];
+  occurrences.forEach((occ, occIdx) => {
+    lots.forEach(({ lot, date }, lotIdx) => {
+      const dist = Math.round(Math.abs(date.getTime() - occ.date.getTime()) / DAY_MS);
+      if (dist <= SIP_MATCH_TOLERANCE_DAYS && lotMatchesSip(lot, occ.sip)) {
+        pairs.push({ occIdx, lotIdx, dist });
+      }
+    });
+  });
+  pairs.sort((a, b) => a.dist - b.dist);
+
+  const occToLot = new Map<number, number>();
+  const usedLots = new Set<number>();
+  for (const p of pairs) {
+    if (occToLot.has(p.occIdx) || usedLots.has(p.lotIdx)) continue;
+    occToLot.set(p.occIdx, p.lotIdx);
+    usedLots.add(p.lotIdx);
+  }
+
+  const inViewedMonth = (d: Date) => d.getFullYear() === year && d.getMonth() === month;
+  const todayStart = new Date(today.getFullYear(), today.getMonth(), today.getDate());
+
+  const chipsByDay = new Map<number, SipChip[]>();
+  const pushChip = (day: number, chip: SipChip) => {
+    const list = chipsByDay.get(day) ?? [];
+    list.push(chip);
+    chipsByDay.set(day, list);
+  };
+
+  occurrences.forEach((occ, occIdx) => {
+    const lotIdx = occToLot.get(occIdx);
+    if (lotIdx !== undefined) {
+      const { lot, date } = lots[lotIdx];
+      if (inViewedMonth(date)) {
+        pushChip(date.getDate(), {
+          key: occ.key,
+          status: "executed",
+          sip: occ.sip,
+          scheduled: occ.date,
+          isWeekend: occ.isWeekend,
+          lot,
+        });
+      }
+      return;
+    }
+    if (!inViewedMonth(occ.date)) return;
+    pushChip(occ.date.getDate(), {
+      key: occ.key,
+      status: occ.date < todayStart ? "missed" : "upcoming",
+      sip: occ.sip,
+      scheduled: occ.date,
+      isWeekend: occ.isWeekend,
+      lot: null,
+    });
+  });
+
+  const unscheduledByDay = new Map<number, SipLotEntry[]>();
+  let executedTotal = 0;
+  let executedCount = 0;
+  lots.forEach(({ lot, date }, lotIdx) => {
+    if (!inViewedMonth(date)) return;
+    executedTotal += lot.amount;
+    executedCount++;
+    if (usedLots.has(lotIdx)) return;
+    const list = unscheduledByDay.get(date.getDate()) ?? [];
+    list.push(lot);
+    unscheduledByDay.set(date.getDate(), list);
+  });
+
+  return { chipsByDay, unscheduledByDay, executedTotal, executedCount };
+}
+
 export default function SIPCalendarClient({
   userEmail,
   initialSips,
   initialLumpsums,
   initialSells,
+  initialSipLots,
 }: {
   userEmail: string;
   initialSips: MFSIPSchedule[];
   initialLumpsums: LumpsumEntry[];
   initialSells: SellEntry[];
+  initialSipLots: SipLotEntry[];
 }) {
   const today = useMemo(() => new Date(), []);
 
   const [sips, setSips] = useState<MFSIPSchedule[]>(initialSips);
   const [lumpsums] = useState<LumpsumEntry[]>(initialLumpsums);
   const [sells] = useState<SellEntry[]>(initialSells);
+  const [sipLots] = useState<SipLotEntry[]>(initialSipLots);
   const [viewYear, setViewYear] = useState(today.getFullYear());
   const [viewMonth, setViewMonth] = useState(today.getMonth());
   const [ownerFilter, setOwnerFilter] = useState<OwnerFilter>("all");
@@ -287,6 +460,11 @@ export default function SIPCalendarClient({
   const occurrencesThisView = useMemo(
     () => computeOccurrences(sips, viewYear, viewMonth),
     [sips, viewYear, viewMonth]
+  );
+
+  const sipView = useMemo(
+    () => computeSipCalendarView(sips, sipLots, viewYear, viewMonth, today),
+    [sips, sipLots, viewYear, viewMonth, today]
   );
 
   const lumpsumsByDay = useMemo(
@@ -516,13 +694,20 @@ export default function SIPCalendarClient({
 
       <main className="mx-auto max-w-6xl px-4 py-8">
         {/* Summary bar */}
-        <div className="mb-6 grid grid-cols-1 gap-4 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="mb-6 grid grid-cols-1 gap-4 rounded-xl border border-slate-200 bg-white p-4 sm:grid-cols-2 lg:grid-cols-5">
           <div>
             <p className="text-xs font-medium text-slate-500">
               Total SIP this month
             </p>
             <p className="mt-1 text-xl font-semibold text-slate-900">
               ₹{totalThisMonth.toLocaleString("en-IN")}
+            </p>
+          </div>
+          <div>
+            <p className="text-xs font-medium text-slate-500">SIPs executed</p>
+            <p className="mt-1 text-xl font-semibold text-slate-900">
+              ₹{Math.round(sipView.executedTotal).toLocaleString("en-IN")}{" "}
+              <span className="text-sm font-normal text-slate-500">({sipView.executedCount})</span>
             </p>
           </div>
           <div>
@@ -604,8 +789,13 @@ export default function SIPCalendarClient({
             {cells.map((day, i) => {
               const weekendCol = i % 7 === 0 || i % 7 === 6;
               const occ = day
-                ? (occurrencesThisView.get(day) ?? []).filter(
-                    (o) => ownerFilter === "all" || o.sip.owner === ownerFilter
+                ? (sipView.chipsByDay.get(day) ?? []).filter(
+                    (c) => ownerFilter === "all" || c.sip.owner === ownerFilter
+                  )
+                : [];
+              const dayUnscheduled = day
+                ? (sipView.unscheduledByDay.get(day) ?? []).filter(
+                    (l) => ownerFilter === "all" || l.owner === ownerFilter
                   )
                 : [];
               const dayLumpsums = day
@@ -632,37 +822,66 @@ export default function SIPCalendarClient({
                         {day}
                       </span>
                       <div className="mt-1 flex flex-col gap-1">
-                        {occ.map(({ sip, isWeekend }) => (
-                          <div key={sip.id} className="group relative">
-                            <span
-                              title={`${sip.scheme_name} — ₹${sip.amount.toLocaleString("en-IN")}`}
-                              className={`block truncate rounded-full px-2 py-0.5 pr-4 text-[10px] font-medium ${
-                                sip.owner === "praveen"
-                                  ? "bg-blue-100 text-blue-700"
-                                  : "bg-amber-100 text-amber-700"
-                              }`}
-                            >
-                              {sip.scheme_name} · ₹{sip.amount.toLocaleString("en-IN")}
-                            </span>
-                            <button
-                              type="button"
-                              onClick={() => {
-                                if (window.confirm("Delete this SIP?")) {
-                                  deleteSip(sip.id);
-                                }
-                              }}
-                              aria-label="Delete SIP"
-                              title="Delete SIP"
-                              className="absolute -right-1 -top-1 hidden h-3.5 w-3.5 items-center justify-center rounded-full bg-red-600 text-[9px] font-bold leading-none text-white group-hover:flex"
-                            >
-                              ×
-                            </button>
-                            {isWeekend && (
-                              <span className="mt-0.5 block text-[9px] text-slate-400">
-                                → next trading day
+                        {occ.map(({ key, status, sip, scheduled, isWeekend, lot }) => {
+                          const isPraveen = sip.owner === "praveen";
+                          const amount = lot?.amount ?? sip.amount;
+                          let title = `${sip.scheme_name} — ₹${sip.amount.toLocaleString("en-IN")}`;
+                          let chipClass = isPraveen ? "bg-blue-100 text-blue-700" : "bg-amber-100 text-amber-700";
+                          if (status === "executed" && lot) {
+                            title =
+                              `✓ Executed — ${sip.scheme_name}\n` +
+                              `${formatShortDate(localDateFromIso(lot.trade_date))} · ₹${lot.amount.toLocaleString("en-IN")} · ${formatUnits(lot.units)} units\n` +
+                              `Scheduled ${formatShortDate(scheduled)}`;
+                            chipClass = isPraveen ? "bg-blue-600 text-white" : "bg-amber-500 text-white";
+                          } else if (status === "missed") {
+                            title =
+                              `${sip.scheme_name} — ₹${sip.amount.toLocaleString("en-IN")} (scheduled ${formatShortDate(scheduled)})\n` +
+                              "No SIP purchase found in imported data — re-import Coin CSV if it executed";
+                            chipClass = `border border-dashed bg-white text-slate-400 ${isPraveen ? "border-blue-200" : "border-amber-200"}`;
+                          }
+                          return (
+                            <div key={key} className="group relative">
+                              <span
+                                title={title}
+                                className={`block truncate rounded-full px-2 py-0.5 pr-4 text-[10px] font-medium ${chipClass}`}
+                              >
+                                {status === "executed" && "✓ "}
+                                {status === "missed" && <span className="font-bold text-red-400">! </span>}
+                                {sip.scheme_name} · ₹{amount.toLocaleString("en-IN")}
                               </span>
-                            )}
-                          </div>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  if (window.confirm("Delete this SIP?")) {
+                                    deleteSip(sip.id);
+                                  }
+                                }}
+                                aria-label="Delete SIP"
+                                title="Delete SIP"
+                                className="absolute -right-1 -top-1 hidden h-3.5 w-3.5 items-center justify-center rounded-full bg-red-600 text-[9px] font-bold leading-none text-white group-hover:flex"
+                              >
+                                ×
+                              </button>
+                              {isWeekend && status === "upcoming" && (
+                                <span className="mt-0.5 block text-[9px] text-slate-400">
+                                  → next trading day
+                                </span>
+                              )}
+                            </div>
+                          );
+                        })}
+                        {dayUnscheduled.map((l, ui) => (
+                          <span
+                            key={`unscheduled-${ui}`}
+                            title={`SIP (no schedule) — ${l.scheme_name}\n${formatShortDate(localDateFromIso(l.trade_date))} · ₹${l.amount.toLocaleString("en-IN")} · ${formatUnits(l.units)} units`}
+                            className={`block truncate rounded-full border px-2 py-0.5 text-[10px] font-medium ${
+                              l.owner === "praveen"
+                                ? "border-blue-300 bg-blue-50 text-blue-700"
+                                : "border-amber-300 bg-amber-50 text-amber-700"
+                            }`}
+                          >
+                            ✓ {l.scheme_name} · {formatMoneyAbbrev(l.amount)} · SIP (no schedule)
+                          </span>
                         ))}
                         {dayLumpsums.map((l, li) => (
                           <div key={`lumpsum-${li}`} className="flex items-center gap-1">
@@ -708,6 +927,38 @@ export default function SIPCalendarClient({
                 </div>
               );
             })}
+          </div>
+
+          {/* Legend */}
+          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] text-slate-500">
+            <span className="flex items-center gap-1.5">
+              <span className="rounded-full bg-blue-600 px-2 py-0.5 text-[10px] font-medium text-white">✓ Praveen</span>
+              <span className="rounded-full bg-amber-500 px-2 py-0.5 text-[10px] font-medium text-white">✓ Geetha</span>
+              SIP executed (on actual date)
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="rounded-full bg-blue-100 px-2 py-0.5 text-[10px] font-medium text-blue-700">Praveen</span>
+              <span className="rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-medium text-amber-700">Geetha</span>
+              SIP upcoming
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="rounded-full border border-dashed border-slate-300 bg-white px-2 py-0.5 text-[10px] font-medium text-slate-400">
+                <span className="font-bold text-red-400">!</span> SIP
+              </span>
+              Missed / not found in imported data
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="rounded-full border border-slate-300 bg-slate-50 px-2 py-0.5 text-[10px] font-medium text-slate-600">✓ SIP</span>
+              SIP (no schedule)
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="rounded-full border border-slate-300 bg-slate-100 px-2 py-0.5 text-[10px] font-medium text-slate-600">Fund</span>
+              Lumpsum
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="rounded-full border border-red-200 bg-red-100 px-2 py-0.5 text-[10px] font-medium text-red-700">↓ Fund</span>
+              Sell
+            </span>
           </div>
         </div>
 
