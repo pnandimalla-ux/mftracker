@@ -6,6 +6,9 @@ export interface SipDetectionLot {
   trade_date: string; // ISO yyyy-mm-dd
   amount: number;
   lot_type: string;
+  // A SIP instalment that was due but REJECTED / CANCELLED: it shows the
+  // schedule's day and cadence, but its amount never becomes the schedule's.
+  evidence_only?: boolean;
 }
 
 export interface SipDetectionFund {
@@ -129,7 +132,9 @@ export function detectActiveSips(funds: SipDetectionFund[]): DetectedSip[] {
         return Number.isInteger(d) && d >= 1 && d <= 31;
       })
       .sort((a, b) => a.trade_date.localeCompare(b.trade_date));
-    if (sorted.length === 0) continue;
+    // Rejected / cancelled instalments alone never make a schedule.
+    if (!sorted.some((l) => !l.evidence_only)) continue;
+    const lastReal = (lots: SipDetectionLot[]) => [...lots].reverse().find((l) => !l.evidence_only);
 
     const base = {
       scheme_name: fund.scheme_name,
@@ -149,7 +154,7 @@ export function detectActiveSips(funds: SipDetectionFund[]): DetectedSip[] {
       results.push({
         ...base,
         key: fund.key,
-        amount: mostRecent.amount,
+        amount: (lastReal(sorted) ?? mostRecent).amount,
         sip_date: dayOf(mostRecent.trade_date),
         frequency: overallGap <= 10 ? "weekly" : "bi-weekly",
         start_date: sorted[0].trade_date,
@@ -158,6 +163,8 @@ export function detectActiveSips(funds: SipDetectionFund[]): DetectedSip[] {
     }
 
     for (const cluster of clusters) {
+      const realLot = lastReal(cluster);
+      if (!realLot) continue;
       const day = modeDay(cluster);
       let frequency: SIPFrequency = "monthly";
       if (cluster.length >= 2 && medianGapDays(cluster.map((l) => l.trade_date)) > 50) {
@@ -166,7 +173,7 @@ export function detectActiveSips(funds: SipDetectionFund[]): DetectedSip[] {
       results.push({
         ...base,
         key: clusters.length === 1 ? fund.key : `${fund.key}::day${day}`,
-        amount: cluster[cluster.length - 1].amount,
+        amount: realLot.amount,
         sip_date: day,
         frequency,
         start_date: cluster[0].trade_date,
@@ -211,6 +218,30 @@ export function withPendingSips(funds: SipDetectionFund[], pending: PendingSipIn
       category: p.category,
       lots: [lot],
     });
+  }
+  return out;
+}
+
+// A SIP order that Coin REJECTED / CANCELLED (or that FAILED).
+export interface CancelledSipInput {
+  isin: string;
+  owner: Owner;
+  amount: number;
+  trade_date: string;
+  lot_type: string;
+}
+
+// Adds rejected / cancelled SIP instalments to their fund's lots as
+// evidence-only dates, so one failed month doesn't turn a monthly SIP into
+// a 61-day "quarterly" gap. Only funds that already have SIP lots are
+// touched — a rejection alone never creates a candidate.
+export function withCancelledSips(funds: SipDetectionFund[], cancelled: CancelledSipInput[]): SipDetectionFund[] {
+  const out = funds.map((f) => ({ ...f, lots: [...f.lots] }));
+  for (const c of cancelled) {
+    if (c.lot_type !== "sip") continue;
+    const fund = out.find((f) => f.owner === c.owner && !!f.isin && f.isin === c.isin);
+    if (!fund) continue;
+    fund.lots.push({ trade_date: c.trade_date, amount: c.amount, lot_type: "sip", evidence_only: true });
   }
   return out;
 }

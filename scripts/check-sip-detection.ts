@@ -1,6 +1,12 @@
 // Assertion script for src/lib/sipDetection.ts — the project has no test
 // framework. Run with `npm run test:sip`.
-import { detectActiveSips, withPendingSips, type DetectedSip, type SipDetectionFund } from "@/lib/sipDetection";
+import {
+  detectActiveSips,
+  withCancelledSips,
+  withPendingSips,
+  type DetectedSip,
+  type SipDetectionFund,
+} from "@/lib/sipDetection";
 import type { SIPFrequency } from "@/types/mf";
 
 let failures = 0;
@@ -136,6 +142,29 @@ checkWithPending("T.I.G.E.R. complete 1st+16th + pending 31st", ["10-01", "10-16
   { frequency: "monthly", sip_date: 16 },
 ]);
 checkWithPending("Only a pending SIP on the 31st", [], ["10-31"], [{ frequency: "monthly", sip_date: 31 }]);
+
+// Rejected / cancelled SIP instalments count as dates, never as amounts.
+{
+  const invesco = { ...fund("Invesco Focused", [["08-08", 16500], ["10-08", 16500]]), owner: "praveen" as const, isin: "INF205K013T3" };
+  const rejected = [{ isin: "INF205K013T3", owner: "praveen" as const, amount: 99999, trade_date: "2026-09-08", lot_type: "sip" }];
+
+  const without = detectActiveSips([invesco]);
+  const ok1 = without.length === 1 && without[0].frequency === "quarterly";
+  if (!ok1) failures++;
+  console.log(`${ok1 ? "PASS" : "FAIL"}  Invesco 08-08 + 10-08 alone: [${without.map((x) => `${x.frequency}@${x.sip_date}`).join(", ")}] (gap 61d reads as quarterly)`);
+
+  const got = detectActiveSips(withCancelledSips([invesco], rejected));
+  const ok2 = got.length === 1 && got[0].frequency === "monthly" && got[0].sip_date === 8 && got[0].amount === 16500;
+  if (!ok2) failures++;
+  console.log(`${ok2 ? "PASS" : "FAIL"}  Invesco + rejected 09-08: [${got.map((x) => `${x.frequency}@${x.sip_date} ₹${x.amount}`).join(", ")}] (want monthly@8 ₹16500)`);
+
+  const onlyRejected = detectActiveSips(
+    withCancelledSips([{ ...fund("Rejected only", []), isin: "INF000REJ" }], [{ ...rejected[0], owner: "geetha", isin: "INF000REJ" }])
+  );
+  const ok3 = onlyRejected.length === 0;
+  if (!ok3) failures++;
+  console.log(`${ok3 ? "PASS" : "FAIL"}  Fund with only a rejected SIP: ${onlyRejected.length} candidate(s) (want 0)`);
+}
 
 if (failures > 0) {
   console.error(`\n${failures} check(s) failed`);

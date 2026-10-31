@@ -22,7 +22,7 @@ import type {
 import type { MFCASImport, Owner, SIPFrequency } from "@/types/mf";
 import { CATEGORY_OPTIONS } from "@/lib/categoryOptions";
 import { detectCategory, type DetectCategoryResult } from "@/lib/analysis/fundCategoriser";
-import { detectActiveSips, withPendingSips, type DetectedSip } from "@/lib/sipDetection";
+import { detectActiveSips, withCancelledSips, withPendingSips, type DetectedSip } from "@/lib/sipDetection";
 
 type ConfidenceLevel = "high" | "medium" | "low";
 
@@ -579,7 +579,7 @@ export default function ImportClient({
       }
       if (nothingNew) {
         setImportInfo("All lots were already imported — reviewing SIP schedules");
-        const detected = detectActiveSips(withPendingSips(selectedFunds, selectedPending));
+        const detected = detectActiveSips(withCancelledSips(withPendingSips(selectedFunds, selectedPending), cancelledOrders));
         if (detected.length > 0) {
           setSipCandidates(detected);
           setSipSelected(Object.fromEntries(detected.map((d) => [d.key, true])));
@@ -604,7 +604,7 @@ export default function ImportClient({
           : "No new lots";
       setImportSuccess(lotsPart + (extras.length > 0 ? ` · ${extras.join(" · ")}` : ""));
 
-      const detected = detectActiveSips(withPendingSips(selectedFunds, selectedPending));
+      const detected = detectActiveSips(withCancelledSips(withPendingSips(selectedFunds, selectedPending), cancelledOrders));
       if (detected.length > 0) {
         setSipCandidates(detected);
         setSipSelected(Object.fromEntries(detected.map((d) => [d.key, true])));
