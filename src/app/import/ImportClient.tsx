@@ -106,18 +106,61 @@ const FREQUENCY_LABELS: Record<SIPFrequency, string> = {
 
 const SIP_FREQUENCY_OPTIONS: SIPFrequency[] = ["weekly", "bi-weekly", "monthly", "quarterly"];
 
+// Rows imported before file names were recorded all carry this name.
+const GENERIC_COIN_FILENAME = "Zerodha Coin order history";
+// Two owners' rows from one upload are inserted moments apart.
+const SAME_UPLOAD_WINDOW_MS = 5000;
+
+function importSourceLabel(filename: string | null): string {
+  if (!filename) return "—";
+  return filename === GENERIC_COIN_FILENAME || filename.toLowerCase().includes(".csv") ? "Zerodha Coin" : "CAS";
+}
+
+// "31/10/2026, 5:42 PM" in IST, whatever the browser's timezone.
+function formatImportedAt(iso: string): string {
+  return new Date(iso).toLocaleString("en-IN", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "2-digit",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    hour12: true,
+  }).replace(/\b(am|pm)\b/, (m) => m.toUpperCase());
+}
+
+// Ids of rows that share an upload with another owner's row: same file name,
+// imported within SAME_UPLOAD_WINDOW_MS of each other.
+function sameUploadIds(imports: MFCASImport[]): Set<string> {
+  const ids = new Set<string>();
+  for (const a of imports) {
+    for (const b of imports) {
+      if (a.id === b.id || a.owner === b.owner || a.filename !== b.filename) continue;
+      if (Math.abs(new Date(a.imported_at).getTime() - new Date(b.imported_at).getTime()) <= SAME_UPLOAD_WINDOW_MS) {
+        ids.add(a.id);
+      }
+    }
+  }
+  return ids;
+}
+
 export default function ImportClient({
   userEmail,
   initialImportHistory,
+  initialPendingCounts = {},
 }: {
   userEmail: string;
   initialImportHistory: MFCASImport[];
+  initialPendingCounts?: Record<string, number>;
 }) {
   const router = useRouter();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // --- Coin CSV import state ---
   const [coinFiles, setCoinFiles] = useState<File[]>([]);
+  // Name(s) of the CSV(s) behind the current preview, sent with the confirm
+  // so Import history can tell uploads apart.
+  const [parsedFileName, setParsedFileName] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const [parsing, setParsing] = useState(false);
   const [parseError, setParseError] = useState<string | null>(null);
@@ -369,6 +412,7 @@ export default function ImportClient({
     setSipSelected({});
     setSipAddResult(null);
     setImportInfo(null);
+    setParsedFileName(coinFiles.map((f) => f.name).join(", "));
     try {
       const results = await Promise.all(
         coinFiles.map(async (f) => {
@@ -449,8 +493,16 @@ export default function ImportClient({
     );
   };
 
-  const handleDeleteImport = async (importId: string) => {
-    if (!window.confirm("Delete this import and all holdings it created? This cannot be undone.")) {
+  const handleDeleteImport = async (imp: MFCASImport) => {
+    const importId = imp.id;
+    const ownerName = imp.owner === "praveen" ? "Praveen" : "Geetha";
+    const lots = `${imp.rows_imported} lot${imp.rows_imported === 1 ? "" : "s"}`;
+    const name = imp.filename ?? GENERIC_COIN_FILENAME;
+    if (
+      !window.confirm(
+        `Delete import '${name}' (${ownerName}, ${lots})? This removes its holdings, transactions and processing orders.`
+      )
+    ) {
       return;
     }
     setDeletingImportId(importId);
@@ -523,6 +575,8 @@ export default function ImportClient({
   })();
 
   const selectedFunds = previewFunds.filter((f) => f.selected);
+  const sortedImportHistory = [...importHistory].sort((a, b) => b.imported_at.localeCompare(a.imported_at));
+  const sharedUploadIds = sameUploadIds(importHistory);
   // Pending orders follow their fund's checkbox when the fund is in the
   // preview; a fund with only PROCESSING rows has no checkbox and is kept.
   const selectedPending = pendingOrders.filter(
@@ -551,6 +605,7 @@ export default function ImportClient({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           duplicate_action: duplicateAction,
+          filename: parsedFileName,
           funds: selectedFunds.map((f) => ({
             isin: f.isin,
             scheme_code: f.scheme_code,
@@ -1416,7 +1471,7 @@ export default function ImportClient({
                 <tr className="border-b border-slate-200 bg-slate-50 text-xs text-slate-500">
                   <th className="px-3 py-2 font-medium">Date</th>
                   <th className="px-3 py-2 font-medium">Owner</th>
-                  <th className="px-3 py-2 font-medium">Source</th>
+                  <th className="px-3 py-2 font-medium">File</th>
                   <th className="px-3 py-2 font-medium">Rows</th>
                   <th className="px-3 py-2 font-medium">Status</th>
                   <th className="px-3 py-2 font-medium text-right">Actions</th>
@@ -1430,10 +1485,18 @@ export default function ImportClient({
                     </td>
                   </tr>
                 ) : (
-                  importHistory.map((imp) => (
+                  sortedImportHistory.map((imp) => {
+                    const sharedUpload = sharedUploadIds.has(imp.id);
+                    const genericName = imp.filename === GENERIC_COIN_FILENAME;
+                    const pendingCount = initialPendingCounts[imp.id] ?? 0;
+                    return (
                     <tr key={imp.id} className="border-b border-slate-100 last:border-0">
-                      <td className="px-3 py-2 text-slate-600">
-                        {new Date(imp.imported_at).toLocaleDateString("en-IN")}
+                      <td
+                        className={`whitespace-nowrap px-3 py-2 text-slate-600 ${
+                          sharedUpload ? "border-l-2 border-l-indigo-300" : ""
+                        }`}
+                      >
+                        {formatImportedAt(imp.imported_at)}
                       </td>
                       <td className="px-3 py-2">
                         <span
@@ -1446,11 +1509,32 @@ export default function ImportClient({
                           {imp.owner === "praveen" ? "P" : "G"}
                         </span>
                       </td>
-                      <td className="px-3 py-2 text-slate-600">
-                        {imp.filename ?? "—"}
+                      <td className="max-w-[16rem] px-3 py-2">
+                        <p
+                          className={`truncate ${genericName ? "italic text-slate-400" : "text-slate-700"}`}
+                          title={
+                            genericName
+                              ? "File name not recorded (imported before this was tracked)"
+                              : imp.filename ?? undefined
+                          }
+                        >
+                          {imp.filename ?? "—"}
+                        </p>
+                        <p className="text-[11px] text-slate-400">
+                          {importSourceLabel(imp.filename)}
+                          {sharedUpload && (
+                            <span title="One upload created an import row for each owner"> · same file</span>
+                          )}
+                        </p>
                       </td>
-                      <td className="px-3 py-2 text-slate-600">
-                        {imp.rows_imported}
+                      <td className="whitespace-nowrap px-3 py-2 text-slate-600">
+                        {imp.rows_imported === 0 && pendingCount > 0 ? (
+                          <span title="Deleting this import also removes its processing orders.">
+                            0 lots · {pendingCount} processing
+                          </span>
+                        ) : (
+                          imp.rows_imported
+                        )}
                       </td>
                       <td className="px-3 py-2">
                         <span
@@ -1468,7 +1552,7 @@ export default function ImportClient({
                       <td className="px-3 py-2 text-right">
                         <button
                           type="button"
-                          onClick={() => handleDeleteImport(imp.id)}
+                          onClick={() => handleDeleteImport(imp)}
                           disabled={deletingImportId === imp.id}
                           aria-label="Delete import"
                           title="Delete import and all its holdings"
@@ -1478,7 +1562,8 @@ export default function ImportClient({
                         </button>
                       </td>
                     </tr>
-                  ))
+                    );
+                  })
                 )}
               </tbody>
             </table>

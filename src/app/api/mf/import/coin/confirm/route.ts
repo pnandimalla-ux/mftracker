@@ -326,6 +326,22 @@ async function findDuplicates(
   return counts;
 }
 
+// Name of the uploaded CSV(s) as sent by the client ("a.csv, b.csv" for a
+// multi-file upload). Any directory part is dropped from each name; rows
+// imported before this was tracked carry DEFAULT_IMPORT_FILENAME.
+const DEFAULT_IMPORT_FILENAME = "Zerodha Coin order history";
+function cleanImportFilename(raw: unknown): string {
+  if (typeof raw !== "string") return DEFAULT_IMPORT_FILENAME;
+  const cleaned = raw
+    .split(",")
+    .map((part) => part.trim().split(/[\\/]/).pop() ?? "")
+    .filter(Boolean)
+    .join(", ")
+    .slice(0, 200)
+    .trim();
+  return cleaned || DEFAULT_IMPORT_FILENAME;
+}
+
 // A fund the parser couldn't resolve (mfapi.in name search missed or timed
 // out) arrives with scheme_code null. Minting a fresh manual-* code for it on
 // every import defeated the duplicate check above, so each re-upload of the
@@ -467,7 +483,8 @@ export async function POST(request: Request) {
       return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
     }
 
-    const { funds, duplicate_action, check_only, sells, pending_orders, cancelled_orders } = body as {
+    const { funds, duplicate_action, check_only, sells, pending_orders, cancelled_orders, filename } = body as {
+      filename?: unknown;
       funds?: unknown;
       duplicate_action?: unknown;
       check_only?: unknown;
@@ -476,6 +493,7 @@ export async function POST(request: Request) {
       cancelled_orders?: unknown;
     };
 
+    const importFilename = cleanImportFilename(filename);
     const validPending = parsePendingOrders(pending_orders);
     const validCancelled = parseCancelledOrders(cancelled_orders);
     const hasPendingInput = validPending.length > 0 || validCancelled.length > 0;
@@ -857,7 +875,7 @@ export async function POST(request: Request) {
         .insert({
           user_id: user.id,
           owner,
-          filename: "Zerodha Coin order history",
+          filename: importFilename,
           status: "success",
           rows_imported: ownerLots,
         })

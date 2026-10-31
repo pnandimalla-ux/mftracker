@@ -38,7 +38,29 @@ export default async function ImportPage() {
     importHistory = [];
   }
 
+  // Processing (pending) orders per import — an import with 0 lots may still
+  // have saved some. Missing table/migration just means no counts.
+  const pendingCounts: Record<string, number> = {};
+  try {
+    const { data, error } = await supabase
+      .from("mf_pending_orders")
+      .select("import_id")
+      .eq("user_id", user.id)
+      .not("import_id", "is", null);
+    if (error) throw error;
+    for (const row of data ?? []) {
+      const id = row.import_id as string;
+      pendingCounts[id] = (pendingCounts[id] ?? 0) + 1;
+    }
+  } catch (err) {
+    console.error("Import page: failed to load pending order counts", err);
+  }
+
   return (
-    <ImportClient userEmail={user.email ?? ""} initialImportHistory={importHistory} />
+    <ImportClient
+      userEmail={user.email ?? ""}
+      initialImportHistory={importHistory}
+      initialPendingCounts={pendingCounts}
+    />
   );
 }
