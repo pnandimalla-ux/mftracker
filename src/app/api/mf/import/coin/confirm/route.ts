@@ -280,6 +280,19 @@ async function planPendingOrders(
   };
 }
 
+// Identity of one SELL order. Settlement ID alone isn't unique — Coin gives
+// a whole day's orders the same settlement ID — so date + units are part of
+// the key too.
+function sellKey(s: {
+  owner: string;
+  scheme_code: string | null;
+  settlement_id: string | null;
+  trade_date: string;
+  units: number;
+}): string {
+  return `${s.owner}:${s.scheme_code ?? ""}:${s.settlement_id ?? ""}:${s.trade_date.slice(0, 10)}:${s.units.toFixed(4)}`;
+}
+
 interface SellGroup {
   owner: Owner;
   scheme_code: string;
@@ -624,7 +637,14 @@ export async function POST(request: Request) {
 
     // SELL rows whose fund had no BUY rows in this CSV — apply against
     // existing mf_holdings (FIFO, oldest lot first) rather than importing.
-    const validSells: { owner: Owner; scheme_code: string; scheme_name: string; units: number }[] = [];
+    const validSells: {
+      owner: Owner;
+      scheme_code: string;
+      scheme_name: string;
+      units: number;
+      trade_date: string;
+      key: string;
+    }[] = [];
     // Every parseable SELL row, netted or not — recorded for calendar/history
     // display only (mf_sell_transactions is never read by any balance math).
     const sellsToRecord: {
@@ -635,6 +655,8 @@ export async function POST(request: Request) {
       amount: number;
       units: number;
       settlement_id: string | null;
+      matched_in_csv: boolean;
+      key: string;
     }[] = [];
     if (Array.isArray(sells)) {
       for (const raw of sells as RawConfirmSell[]) {
@@ -651,8 +673,19 @@ export async function POST(request: Request) {
 
         if (!owner || !Number.isFinite(units) || units <= 0) continue;
 
+        const key = sellKey({ owner, scheme_code: schemeCode, settlement_id: settlementId, trade_date: tradeDate, units });
         if (tradeDate && Number.isFinite(amount)) {
-          sellsToRecord.push({ owner, scheme_code: schemeCode, scheme_name: schemeName, trade_date: tradeDate, amount, units, settlement_id: settlementId });
+          sellsToRecord.push({
+            owner,
+            scheme_code: schemeCode,
+            scheme_name: schemeName,
+            trade_date: tradeDate,
+            amount,
+            units,
+            settlement_id: settlementId,
+            matched_in_csv: raw.matched_in_csv === true,
+            key,
+          });
         }
 
         if (raw.matched_in_csv === true) continue;
@@ -662,9 +695,70 @@ export async function POST(request: Request) {
           );
           continue;
         }
-        validSells.push({ owner, scheme_code: schemeCode, scheme_name: schemeName, units });
+        validSells.push({ owner, scheme_code: schemeCode, scheme_name: schemeName, units, trade_date: tradeDate, key });
       }
     }
+
+    const serviceClient = createServiceClient();
+
+    // SELL orders already recorded by an earlier import have already been
+    // applied to holdings — re-uploading a CSV that contains them must not
+    // subtract the units again. Recording uses the same key.
+    const recordedSellKeys = new Set<string>();
+    {
+      const { data: recordedSells, error: recordedError } = await serviceClient
+        .from("mf_sell_transactions")
+        .select("owner, scheme_code, settlement_id, trade_date, units")
+        .eq("user_id", user.id);
+      if (recordedError) {
+        console.error("Failed to load recorded sells for re-apply check:", recordedError.message);
+      }
+      for (const row of recordedSells ?? []) {
+        recordedSellKeys.add(
+          sellKey({
+            owner: row.owner as string,
+            scheme_code: (row.scheme_code as string | null) ?? null,
+            settlement_id: (row.settlement_id as string | null) ?? null,
+            trade_date: String(row.trade_date),
+            units: Number(row.units),
+          })
+        );
+      }
+    }
+
+    // Exception: the fund had NO holdings before this upload and this upload
+    // re-inserts a lot dated on/before the sale — holdings were rebuilt from
+    // scratch (e.g. its import was deleted), so the sale must apply again.
+    // If the fund still has lots, the sale is already reflected in them.
+    const rebuiltBefore = (owner: Owner, schemeCode: string, tradeDate: string) =>
+      !duplicateCounts.has(`${owner}:${schemeCode}`) &&
+      rows.some((r) => r.owner === owner && r.scheme_code === schemeCode && String(r.as_on_date) <= tradeDate);
+
+    let sellsSkippedAlreadyApplied = 0;
+    const sellsToApply = validSells.filter((s) => {
+      if (!recordedSellKeys.has(s.key) || rebuiltBefore(s.owner, s.scheme_code, s.trade_date)) return true;
+      sellsSkippedAlreadyApplied++;
+      return false;
+    });
+
+    // A fully-exited fund's excess sell units come out of pre-existing
+    // holdings; if every one of its sells in this CSV was already recorded,
+    // that reduction already happened on the earlier import.
+    const excessToApply = excessSellsFromCsv.filter((e) => {
+      const fundSells = sellsToRecord.filter(
+        (r) => r.matched_in_csv && r.owner === e.owner && r.scheme_code === e.scheme_code
+      );
+      const alreadyApplied = fundSells.length > 0 && fundSells.every((r) => recordedSellKeys.has(r.key));
+      if (alreadyApplied) sellsSkippedAlreadyApplied++;
+      return !alreadyApplied;
+    });
+
+    // Only sells not yet recorded need recording (also dedupes within this batch).
+    const newSellsToRecord = sellsToRecord.filter((r) => {
+      if (recordedSellKeys.has(r.key)) return false;
+      recordedSellKeys.add(r.key);
+      return true;
+    });
 
     const sellGroupMap = new Map<string, SellGroup>();
     const addToSellGroup = (owner: Owner, scheme_code: string, scheme_name: string, units: number) => {
@@ -676,14 +770,13 @@ export async function POST(request: Request) {
         sellGroupMap.set(key, { owner, scheme_code, scheme_name, total_units: units });
       }
     };
-    for (const s of validSells) {
+    for (const s of sellsToApply) {
       addToSellGroup(s.owner, s.scheme_code, s.scheme_name, s.units);
     }
-    for (const s of excessSellsFromCsv) {
+    for (const s of excessToApply) {
       addToSellGroup(s.owner, s.scheme_code, s.scheme_name, s.total_units);
     }
 
-    const serviceClient = createServiceClient();
     const pendingPlan = await planPendingOrders(serviceClient, user.id, validFunds, validPending, validCancelled);
     const hasPendingWork = pendingPlan.newPending.length > 0 || pendingPlan.clearIds.length > 0;
 
@@ -692,7 +785,7 @@ export async function POST(request: Request) {
     // entry — but its SELL rows still need to reach mf_sell_transactions for
     // calendar display, so that alone must not trip this guard. Neither do
     // pending orders to save or clear.
-    if (rows.length === 0 && sellGroupMap.size === 0 && sellsToRecord.length === 0 && !hasPendingWork) {
+    if (rows.length === 0 && sellGroupMap.size === 0 && newSellsToRecord.length === 0 && !hasPendingWork) {
       const reason =
         lotsSkippedDuplicates > 0
           ? "all lots were already imported"
@@ -776,26 +869,12 @@ export async function POST(request: Request) {
       Array.from(sellGroupMap.values())
     );
 
-    // Persist every parsed SELL row (netted-in-CSV or applied-to-DB) purely
-    // for calendar/history display — dedup by settlement_id per
-    // owner+scheme_code so re-importing the same CSV doesn't duplicate rows,
-    // mirroring the mf_holdings dedup above. Nothing else reads this table.
-    if (sellsToRecord.length > 0) {
-      const existingSellSettlementIds = new Set<string>();
-      const { data: existingSells } = await serviceClient
-        .from("mf_sell_transactions")
-        .select("owner, scheme_code, settlement_id")
-        .eq("user_id", user.id)
-        .not("settlement_id", "is", null);
-      for (const row of existingSells ?? []) {
-        existingSellSettlementIds.add(`${row.owner}:${row.scheme_code ?? ""}:${row.settlement_id}`);
-      }
-
-      const sellRows = sellsToRecord
-        .filter((s) => {
-          if (!s.settlement_id) return true;
-          return !existingSellSettlementIds.has(`${s.owner}:${s.scheme_code ?? ""}:${s.settlement_id}`);
-        })
+    // Persist every new SELL row (netted-in-CSV or applied-to-DB) for
+    // calendar/history display — and, via sellKey, as the record that the
+    // sale has been applied, so re-importing the same CSV neither duplicates
+    // rows nor subtracts the units again.
+    if (newSellsToRecord.length > 0) {
+      const sellRows = newSellsToRecord
         .map((s) => ({
           user_id: user.id,
           owner: s.owner,
@@ -908,7 +987,8 @@ export async function POST(request: Request) {
       lots_imported: inserted?.length ?? rows.length,
       lots_skipped_duplicates: lotsSkippedDuplicates,
       import_ids,
-      sells_applied: sellsNettedInCsv + validSells.length,
+      sells_applied: sellsNettedInCsv + sellsToApply.length,
+      sells_skipped_already_applied: sellsSkippedAlreadyApplied,
       funds_exited: fundsExitedViaCsv + fundsExitedViaDb,
       lots_reduced,
       pending_saved: pendingSaved,
